@@ -461,6 +461,7 @@ void GraphicsPipeline::Build(const BuildInputs& in) {
         .pDynamicState = &dynamic_info,
         .layout = *pipeline_layout,
     };
+    const MetalShadow::GameBuildScope metal_scope; // bbport: not the generic translation
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
@@ -495,7 +496,7 @@ void GraphicsPipeline::Build(const BuildInputs& in) {
             inputs.push_back(input);
         }
         MetalShadow::Graphics(key, modules, infos, inputs,
-                              !infos[u32(Shader::SwStage::Fragment)] && in.clip_emulation);
+                              !infos[u32(Shader::SwStage::Fragment)] && in.clip_emulation, *pipeline);
     }
 }
 

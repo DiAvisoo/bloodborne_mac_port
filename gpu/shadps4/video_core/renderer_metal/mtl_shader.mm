@@ -424,6 +424,8 @@ std::string Convert(std::span<const u32> spirv, const SpirvScan& scan,
     options.platform = sc::CompilerMSL::Options::macOS;
     options.set_msl_version(3, 1);
     options.argument_buffers = false;
+    // bbport: 1D images as 2D, as MoltenVK compiles them (its 1D images are 2D textures).
+    options.texture_1D_as_2D = true;
     options.buffer_size_buffer_index = size_buffer_slot;
     using VariantKind = CompileVariant::Kind;
     if (variant.kind != VariantKind::Plain && variant.kind != VariantKind::GeometryKernel) {

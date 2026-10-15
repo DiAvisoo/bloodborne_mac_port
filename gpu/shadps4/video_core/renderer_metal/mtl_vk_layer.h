@@ -16,6 +16,10 @@ void Install(void* dispatcher);
 /// The device and queue (handles as void*: VkDevice, VkQueue) whose Metal objects the layer uses.
 void SetDevice(void* device, void* queue);
 
+/// id<MTLDevice> / id<MTLCommandQueue> of MoltenVK's queue (null while the Metal path is off).
+void* MtlDevice();
+void* MtlQueue();
+
 /// Step B (BB_METAL_PRESENT=1): the presenter's command buffer is encoded in Metal.
 bool PresentEnabled();
 

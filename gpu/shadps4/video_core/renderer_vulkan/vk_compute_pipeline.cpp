@@ -110,6 +110,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             .layout = *pipeline_layout,
         };
         const vk::Device device = this->instance.GetDevice();
+        const MetalShadow::GameBuildScope metal_scope; // bbport: not the generic translation
         auto [pipeline_result, pipe] =
             device.createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
         ASSERT_MSG(pipeline_result == vk::Result::eSuccess,
@@ -117,7 +118,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         pipeline = std::move(pipe);
         SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
         if (MetalShadow::Enabled()) {
-            MetalShadow::Compute(compute_key, module);
+            MetalShadow::Compute(compute_key, module, *pipeline);
         }
     });
 }

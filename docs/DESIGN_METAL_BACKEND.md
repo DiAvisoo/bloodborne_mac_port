@@ -119,6 +119,21 @@ which is not where the time goes. So, in stages:
   correct. With the overlay showing, the pass stays on MoltenVK (ImGui records Vulkan).
   *Next:* step C, the frame's commands: bound pipelines (from the shadow builder), push
   descriptors and push constants to our slots, render passes, draws, dispatches, copies.
+  *Step C (2026-10-16 night): the whole frame in Metal.* `BB_METAL_FRAME=1` owns every command
+  buffer at `vkBeginCommandBuffer`. `mtl_frame.mm` encodes render passes (attachments rendered into
+  the image's own texture at the view's level/slice), draws (rect lists as the rewritten
+  triangles), compute dispatches, copies, fills, updates, clears and blits; push descriptors are
+  bound per draw by (set, binding) through each shader's slot map, push constants as bytes;
+  buffers come from MoltenVK's `vkGetMTLBufferMVK` plus the device-address offset, views from
+  `VK_EXT_metal_objects`, samplers rebuilt at `vkCreateSampler`; buffers whose device address is
+  taken are declared on every encoder (`useResources`). Pipelines: the game's from the shadow
+  builder (by `VkPipeline`), every other one (post-processing, detiling, copy shader, fault
+  buffer, camera motion, blits) translated from its Vulkan create info (`GraphicsCreated`,
+  `ComputeCreated`; specialization constants folded into plain constants). 1D images compile as
+  2D, as in MoltenVK. **Result: the game renders correctly through it** (Hunter's Dream, same
+  image as MoltenVK), 0 unsupported commands, 0 draws without a pipeline; tessellated draws
+  (~40/frame) still skipped. First speed: **85.7 FPS vs 94.8 through MoltenVK**, before any
+  optimisation (a lock per command, per-bind object lookups, all state set per draw).
 - **M3, pass merging:** load/store actions from what we know is read later; merge passes split by
   copies/uploads; one compute encoder for consecutive dispatches.
 - **M4, tessellation:** Metal tessellation (control stage as a compute kernel, post-tessellation

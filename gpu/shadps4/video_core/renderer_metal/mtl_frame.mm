@@ -1,0 +1,1221 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include "video_core/renderer_metal/mtl_frame.h"
+#include <vulkan/vulkan_metal.h>
+#include "video_core/renderer_metal/mtl_pso_cache.h"
+#include "video_core/renderer_metal/mtl_raster_util.h"
+#include "video_core/renderer_metal/mtl_shader.h"
+#include "video_core/renderer_metal/mtl_shadow.h"
+#include "video_core/renderer_metal/vk_to_mtl.h"
+
+namespace MetalFrame {
+namespace {
+
+VkDevice vk_device;
+id<MTLCommandQueue> queue;
+id<MTLDevice> device;
+PFN_vkExportMetalObjectsEXT export_objects;
+PFN_vkGetBufferDeviceAddress get_address;
+using GetMTLBuffer = void (*)(VkBuffer, id<MTLBuffer>*);
+GetMTLBuffer get_mtl_buffer;
+Stats stats;
+
+id<MTLBuffer> null_buffer;
+id<MTLTexture> null_texture;
+id<MTLSamplerState> null_sampler;
+
+std::mutex maps_mutex;
+std::unordered_map<VkSampler, id<MTLSamplerState>> samplers;
+std::unordered_map<VkImageView, id<MTLTexture>> views;
+/// What each image view shows (for attachments: Metal renders into the image's own texture, the
+/// exported view texture may lack render-target usage).
+struct ViewInfo {
+    VkImage image;
+    VkFormat format;
+    VkImageSubresourceRange range;
+};
+std::unordered_map<VkImageView, ViewInfo> view_infos;
+/// Buffers the shaders reach by device address (the guest arena, the BDA page table, ...): every
+/// encoder declares them (useResources), which makes them resident and hazard-tracked, as MoltenVK
+/// does for buffers with device addresses.
+std::vector<id<MTLBuffer>> address_buffers;
+std::atomic<u32> address_generation{0};
+
+void Log(const char* what) {
+    static std::mutex mutex;
+    static std::vector<std::string> seen;
+    std::scoped_lock lock{mutex};
+    if (std::find(seen.begin(), seen.end(), what) == seen.end()) {
+        seen.emplace_back(what);
+        std::printf("Metal frame: %s\n", what);
+    }
+}
+
+/// MoltenVK's vkGetMTLBufferMVK (its private API, not reachable through the Vulkan loader).
+GetMTLBuffer FindGetMTLBuffer() {
+    for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+        const char* name = _dyld_get_image_name(i);
+        if (name && std::strstr(name, "libMoltenVK")) {
+            if (void* handle = dlopen(name, RTLD_NOLOAD | RTLD_LAZY)) {
+                return reinterpret_cast<GetMTLBuffer>(dlsym(handle, "vkGetMTLBufferMVK"));
+            }
+        }
+    }
+    return nullptr;
+}
+
+struct BufferRef {
+    id<MTLBuffer> buffer;
+    u64 offset{};
+};
+
+/// The MTLBuffer behind a VkBuffer and where the VkBuffer starts in it (MoltenVK suballocates
+/// buffers from device memory; the device address gives the offset). Resolved per use: VMA
+/// destroys buffers without the dispatcher, so a cache could outlive its handle.
+BufferRef ResolveBuffer(VkBuffer buffer) {
+    BufferRef ref;
+    if (!buffer || !get_mtl_buffer) {
+        return ref;
+    }
+    id<MTLBuffer> mtl = nil;
+    get_mtl_buffer(buffer, &mtl);
+    if (!mtl) {
+        return ref;
+    }
+    ref.buffer = mtl;
+    if (get_address && mtl.gpuAddress) {
+        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        info.buffer = buffer;
+        const u64 address = get_address(vk_device, &info);
+        if (address >= mtl.gpuAddress && address < mtl.gpuAddress + mtl.length) {
+            ref.offset = address - mtl.gpuAddress;
+        }
+    }
+    return ref;
+}
+
+id<MTLTexture> ExportTexture(VkImage image, VkImageView view) {
+    VkExportMetalTextureInfoEXT texture{VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT};
+    texture.image = image;
+    texture.imageView = view;
+    texture.plane = VK_IMAGE_ASPECT_PLANE_0_BIT;
+    VkExportMetalObjectsInfoEXT info{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, &texture};
+    export_objects(vk_device, &info);
+    return texture.mtlTexture;
+}
+
+id<MTLTexture> TextureOfView(VkImageView view) {
+    if (!view) {
+        return nil;
+    }
+    {
+        std::scoped_lock lock{maps_mutex};
+        if (auto it = views.find(view); it != views.end()) {
+            return it->second;
+        }
+    }
+    id<MTLTexture> texture = ExportTexture(VK_NULL_HANDLE, view);
+    std::scoped_lock lock{maps_mutex};
+    views[view] = texture;
+    return texture;
+}
+
+id<MTLTexture> TextureOfImage(VkImage image) {
+    return image ? ExportTexture(image, VK_NULL_HANDLE) : nil;
+}
+
+// ---- Encoders ----
+
+void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
+    std::scoped_lock lock{maps_mutex};
+    if (address_buffers.empty()) {
+        return;
+    }
+    std::vector<id<MTLResource>> resources(address_buffers.begin(), address_buffers.end());
+    if (render) {
+        [(id<MTLRenderCommandEncoder>)encoder
+            useResources:resources.data()
+                   count:resources.size()
+                   usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                  stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    } else {
+        [(id<MTLComputeCommandEncoder>)encoder useResources:resources.data()
+                                                      count:resources.size()
+                                                      usage:MTLResourceUsageRead |
+                                                            MTLResourceUsageWrite];
+    }
+}
+
+id<MTLComputeCommandEncoder> ComputeEncoder(Owned& o) {
+    if (o.compute) {
+        return o.compute;
+    }
+    EndEncoders(o);
+    o.compute = [o.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    UseAddressBuffers(o.compute, false);
+    return o.compute;
+}
+
+id<MTLBlitCommandEncoder> BlitEncoder(Owned& o) {
+    if (o.blit) {
+        return o.blit;
+    }
+    EndEncoders(o);
+    o.blit = [o.cmd blitCommandEncoder];
+    return o.blit;
+}
+
+// ---- Resource binding ----
+
+enum class Stage { Vertex, Fragment, Compute };
+
+void SetBuffer(Owned& o, Stage stage, id<MTLBuffer> buffer, u64 offset, u32 index) {
+    switch (stage) {
+    case Stage::Vertex:
+        [o.render setVertexBuffer:buffer offset:offset atIndex:index];
+        break;
+    case Stage::Fragment:
+        [o.render setFragmentBuffer:buffer offset:offset atIndex:index];
+        break;
+    case Stage::Compute:
+        [o.compute setBuffer:buffer offset:offset atIndex:index];
+        break;
+    }
+}
+
+void SetBytes(Owned& o, Stage stage, const void* bytes, u64 length, u32 index) {
+    switch (stage) {
+    case Stage::Vertex:
+        [o.render setVertexBytes:bytes length:length atIndex:index];
+        break;
+    case Stage::Fragment:
+        [o.render setFragmentBytes:bytes length:length atIndex:index];
+        break;
+    case Stage::Compute:
+        [o.compute setBytes:bytes length:length atIndex:index];
+        break;
+    }
+}
+
+void SetTexture(Owned& o, Stage stage, id<MTLTexture> texture, u32 index) {
+    switch (stage) {
+    case Stage::Vertex:
+        [o.render setVertexTexture:texture atIndex:index];
+        break;
+    case Stage::Fragment:
+        [o.render setFragmentTexture:texture atIndex:index];
+        break;
+    case Stage::Compute:
+        [o.compute setTexture:texture atIndex:index];
+        break;
+    }
+}
+
+void SetSampler(Owned& o, Stage stage, id<MTLSamplerState> sampler, u32 index) {
+    switch (stage) {
+    case Stage::Vertex:
+        [o.render setVertexSamplerState:sampler atIndex:index];
+        break;
+    case Stage::Fragment:
+        [o.render setFragmentSamplerState:sampler atIndex:index];
+        break;
+    case Stage::Compute:
+        [o.compute setSamplerState:sampler atIndex:index];
+        break;
+    }
+}
+
+/// Binds a stage's resources from the push descriptors (by the shader's binding map) and its
+/// push constants.
+void BindStage(Owned& o, Stage stage, const Metal::CompiledShader* shader,
+               const std::unordered_map<u32, Binding>& bindings) {
+    if (!shader) {
+        return;
+    }
+    using Kind = Metal::ShaderBinding::Kind;
+    std::array<u32, Metal::kMaxBuffers> sizes{};
+    for (const auto& b : shader->bindings) {
+        if (b.kind == Kind::PushConstants) {
+            continue;
+        }
+        const auto found = bindings.find((b.set << 16) | b.binding);
+        const Binding* binding = found == bindings.end() ? nullptr : &found->second;
+        for (u32 e = 0; e < b.count; ++e) {
+            const Bound* bound =
+                binding && e < binding->elements.size() ? &binding->elements[e] : nullptr;
+            const u32 slot = b.msl_index + e;
+            switch (b.kind) {
+            case Kind::Buffer:
+                if (bound && bound->buffer) {
+                    SetBuffer(o, stage, bound->buffer, bound->offset, slot);
+                    if (slot < sizes.size()) {
+                        sizes[slot] = u32(std::min<u64>(bound->size, 0xffffffffu));
+                    }
+                } else {
+                    SetBuffer(o, stage, null_buffer, 0, slot);
+                    if (slot < sizes.size()) {
+                        sizes[slot] = u32(null_buffer.length);
+                    }
+                }
+                break;
+            case Kind::Texture:
+            case Kind::StorageTexture:
+            case Kind::TexelBuffer:
+                SetTexture(o, stage, bound && bound->texture ? bound->texture : null_texture, slot);
+                break;
+            case Kind::Sampler:
+                SetSampler(o, stage, bound && bound->sampler ? bound->sampler : null_sampler, slot);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    if (shader->uses_push_constants) {
+        SetBytes(o, stage, o.push.data(), o.push.size(), shader->push_constant_buffer);
+    }
+    if (shader->buffer_size_buffer != ~0u) {
+        SetBytes(o, stage, sizes.data(), sizeof(u32) * shader->num_buffers,
+                 shader->buffer_size_buffer);
+    }
+}
+
+u32 IndexSize(VkIndexType type) {
+    return type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+}
+
+/// Draw state from the pipeline and the dynamic state; false: skip the draw.
+bool PrepareDraw(Owned& o) {
+    if (!o.render) {
+        Log("a draw outside a render pass (skipped)");
+        return false;
+    }
+    const auto* entry = o.graphics;
+    if (!entry || !entry->render) {
+        ++stats.skipped_no_pipeline;
+        return false;
+    }
+    if (entry->tess) {
+        ++stats.skipped_tess;
+        Log("tessellated draws are not encoded yet (skipped)");
+        return false;
+    }
+    const Metal::RenderPipeline& p = *entry->render;
+    if (p.primitive_emulated && !entry->rect_list) {
+        ++stats.skipped_emulated;
+        Log("a topology Metal lacks (fan, quad list, adjacency) is not expanded yet (skipped)");
+        return false;
+    }
+    if (o.rasterizer_discard) {
+        ++stats.skipped_discard;
+        return false;
+    }
+    // Generic (host pass) pipelines fix part of the state at creation.
+    const auto& fixed = entry->fixed;
+    const bool generic = entry->generic;
+    const VkCullModeFlags cull_mode = generic && fixed.cull ? fixed.cull_mode : o.cull_mode;
+    const VkFrontFace front_face = generic && fixed.front_face ? fixed.front : o.front_face;
+    const bool depth_test = generic && fixed.depth ? fixed.depth_test : o.depth_test;
+    const bool depth_write = generic && fixed.depth ? fixed.depth_write : o.depth_write;
+    const VkCompareOp depth_compare = generic && fixed.depth ? fixed.depth_compare : o.depth_compare;
+    const bool stencil_test = generic && fixed.stencil ? fixed.stencil_test : o.stencil_test;
+    const bool depth_bias_enable =
+        generic && fixed.depth_bias ? fixed.depth_bias_enable : o.depth_bias_enable;
+    const auto cull = Metal::VkToMtl::CullMode(vk::CullModeFlags(cull_mode));
+    if (cull.cull_all) {
+        ++stats.skipped_discard;
+        return false;
+    }
+    id<MTLRenderCommandEncoder> enc = o.render;
+    [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)p.state];
+    [enc setTriangleFillMode:MTLTriangleFillMode(p.fill_mode)];
+    [enc setDepthClipMode:p.depth_clip ? MTLDepthClipModeClip : MTLDepthClipModeClamp];
+    [enc setCullMode:MTLCullMode(cull.mode)];
+    [enc setFrontFacingWinding:MTLWinding(
+                                   Metal::RasterUtil::FrontWinding(vk::FrontFace(front_face)))];
+
+    // Viewports and scissors (Metal: negative-height viewports keep Vulkan's y; scissors clamped).
+    std::array<MTLViewport, 16> viewports;
+    const u32 nv = u32(std::min<size_t>(o.viewports.size(), viewports.size()));
+    for (u32 i = 0; i < nv; ++i) {
+        const VkViewport& v = o.viewports[i];
+        const auto m = Metal::RasterUtil::ToMetalViewport(v.x, v.y, v.width, v.height, v.minDepth,
+                                                          v.maxDepth);
+        viewports[i] = {m.origin_x, m.origin_y, m.width, m.height, m.znear, m.zfar};
+    }
+    if (nv) {
+        [enc setViewports:viewports.data() count:nv];
+    }
+    std::array<MTLScissorRect, 16> scissors;
+    const u32 ns = u32(std::min<size_t>(o.scissors.size(), scissors.size()));
+    for (u32 i = 0; i < ns; ++i) {
+        const VkRect2D& s = o.scissors[i];
+        Metal::RasterUtil::ScissorRect r;
+        if (!Metal::RasterUtil::ClampScissor(s.offset.x, s.offset.y, s.extent.width,
+                                             s.extent.height, o.target_width, o.target_height,
+                                             r)) {
+            ++stats.skipped_discard;
+            return false;
+        }
+        scissors[i] = {r.x, r.y, r.width, r.height};
+    }
+    if (ns) {
+        [enc setScissorRects:scissors.data() count:ns];
+    }
+
+    // Depth and stencil.
+    Metal::DepthStencilKey ds;
+    ds.depth_test = depth_test && p.depth_pixel_format;
+    ds.depth_write = depth_write && p.depth_pixel_format;
+    ds.depth_compare = vk::CompareOp(depth_compare);
+    ds.stencil_test = stencil_test && p.stencil_pixel_format;
+    const auto face = [](const Owned::Face& f) {
+        Metal::DepthStencilKey::Face out;
+        out.fail_op = vk::StencilOp(f.fail);
+        out.pass_op = vk::StencilOp(f.pass);
+        out.depth_fail_op = vk::StencilOp(f.depth_fail);
+        out.compare_op = vk::CompareOp(f.compare);
+        out.compare_mask = u8(f.compare_mask);
+        out.write_mask = u8(f.write_mask);
+        return out;
+    };
+    ds.front = face(o.front);
+    ds.back = face(o.back);
+    if (void* state = MetalShadow::DepthStencil(ds)) {
+        [enc setDepthStencilState:(__bridge id<MTLDepthStencilState>)state];
+    }
+    if (ds.stencil_test) {
+        [enc setStencilFrontReferenceValue:o.front.reference backReferenceValue:o.back.reference];
+    }
+    if (depth_bias_enable) {
+        [enc setDepthBias:o.depth_bias[0] slopeScale:o.depth_bias[2] clamp:o.depth_bias[1]];
+    } else {
+        [enc setDepthBias:0 slopeScale:0 clamp:0];
+    }
+    [enc setBlendColorRed:o.blend_constants[0]
+                    green:o.blend_constants[1]
+                     blue:o.blend_constants[2]
+                    alpha:o.blend_constants[3]];
+
+    // Resources and vertex buffers.
+    BindStage(o, Stage::Vertex, p.vs, o.graphics_bindings);
+    BindStage(o, Stage::Fragment, p.fs, o.graphics_bindings);
+    for (u32 i = 0; i < p.num_vertex_slots; ++i) {
+        const auto& slot = p.vertex_slots[i];
+        const auto& vb = slot.location < o.vertex_buffers.size() ? o.vertex_buffers[slot.location]
+                                                                 : Owned::VertexBuffer{};
+        u64 stride = vb.stride;
+        if (!stride && generic && slot.location < entry->strides.size()) {
+            stride = entry->strides[slot.location];
+        }
+        if (slot.constant || !stride) {
+            stride = 16;
+        }
+        [enc setVertexBuffer:vb.buffer ? vb.buffer : null_buffer
+                      offset:vb.buffer ? vb.offset : 0
+             attributeStride:stride
+                     atIndex:slot.slot];
+    }
+    return true;
+}
+
+MTLPrimitiveType PrimitiveOf(const Owned& o) {
+    return o.graphics->rect_list ? MTLPrimitiveTypeTriangle
+                                 : MTLPrimitiveType(o.graphics->render->primitive_type);
+}
+
+/// Bytes and block size of a pixel format, for buffer <-> texture copies.
+struct Block {
+    u32 bytes{}, width{1}, height{1};
+};
+Block BlockOf(MTLPixelFormat f) {
+    switch (f) {
+    case MTLPixelFormatA8Unorm: case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Snorm:
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatStencil8:
+        return {1};
+    case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm: case MTLPixelFormatR16Uint:
+    case MTLPixelFormatR16Sint: case MTLPixelFormatR16Float: case MTLPixelFormatRG8Unorm:
+    case MTLPixelFormatRG8Snorm: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
+    case MTLPixelFormatB5G6R5Unorm: case MTLPixelFormatA1BGR5Unorm: case MTLPixelFormatABGR4Unorm:
+    case MTLPixelFormatBGR5A1Unorm: case MTLPixelFormatDepth16Unorm:
+        return {2};
+    case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatR32Float:
+    case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm: case MTLPixelFormatRG16Uint:
+    case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA8Unorm:
+    case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatRGBA8Snorm: case MTLPixelFormatRGBA8Uint:
+    case MTLPixelFormatRGBA8Sint: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG11B10Float:
+    case MTLPixelFormatRGB9E5Float: case MTLPixelFormatBGR10A2Unorm: case MTLPixelFormatDepth32Float:
+        return {4};
+    case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float:
+    case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float:
+        return {8};
+    case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float:
+        return {16};
+    case MTLPixelFormatBC1_RGBA: case MTLPixelFormatBC1_RGBA_sRGB: case MTLPixelFormatBC4_RUnorm:
+    case MTLPixelFormatBC4_RSnorm:
+        return {8, 4, 4};
+    case MTLPixelFormatBC2_RGBA: case MTLPixelFormatBC2_RGBA_sRGB: case MTLPixelFormatBC3_RGBA:
+    case MTLPixelFormatBC3_RGBA_sRGB: case MTLPixelFormatBC5_RGUnorm: case MTLPixelFormatBC5_RGSnorm:
+    case MTLPixelFormatBC6H_RGBFloat: case MTLPixelFormatBC6H_RGBUfloat: case MTLPixelFormatBC7_RGBAUnorm:
+    case MTLPixelFormatBC7_RGBAUnorm_sRGB:
+        return {16, 4, 4};
+    default:
+        return {};
+    }
+}
+
+void BufferImageCopy(Owned& o, BufferRef buffer, id<MTLTexture> texture,
+                     const VkBufferImageCopy& r, bool to_image) {
+    MTLPixelFormat format = texture.pixelFormat;
+    MTLBlitOption option = MTLBlitOptionNone;
+    if (r.imageSubresource.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) {
+        option = MTLBlitOptionStencilFromDepthStencil;
+        format = MTLPixelFormatStencil8;
+    } else if ((r.imageSubresource.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+               format == MTLPixelFormatDepth32Float_Stencil8) {
+        option = MTLBlitOptionDepthFromDepthStencil;
+        format = MTLPixelFormatDepth32Float;
+    }
+    const Block block = BlockOf(format);
+    if (!block.bytes) {
+        Log("a buffer/image copy with a pixel format without a size table entry (skipped)");
+        return;
+    }
+    const u32 row_texels = r.bufferRowLength ? r.bufferRowLength : r.imageExtent.width;
+    const u32 image_rows = r.bufferImageHeight ? r.bufferImageHeight : r.imageExtent.height;
+    const u64 bytes_per_row = u64((row_texels + block.width - 1) / block.width) * block.bytes;
+    const u64 bytes_per_image = bytes_per_row * ((image_rows + block.height - 1) / block.height);
+    const MTLSize size = MTLSizeMake(r.imageExtent.width, r.imageExtent.height, r.imageExtent.depth);
+    const MTLOrigin origin = MTLOriginMake(r.imageOffset.x, r.imageOffset.y, r.imageOffset.z);
+    id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    for (u32 layer = 0; layer < r.imageSubresource.layerCount; ++layer) {
+        const u64 offset = buffer.offset + r.bufferOffset + layer * bytes_per_image;
+        if (to_image) {
+            [blit copyFromBuffer:buffer.buffer
+                       sourceOffset:offset
+                  sourceBytesPerRow:bytes_per_row
+                sourceBytesPerImage:bytes_per_image
+                         sourceSize:size
+                          toTexture:texture
+                   destinationSlice:r.imageSubresource.baseArrayLayer + layer
+                   destinationLevel:r.imageSubresource.mipLevel
+                  destinationOrigin:origin
+                            options:option];
+        } else {
+            [blit copyFromTexture:texture
+                             sourceSlice:r.imageSubresource.baseArrayLayer + layer
+                             sourceLevel:r.imageSubresource.mipLevel
+                            sourceOrigin:origin
+                              sourceSize:size
+                                toBuffer:buffer.buffer
+                       destinationOffset:offset
+                  destinationBytesPerRow:bytes_per_row
+                destinationBytesPerImage:bytes_per_image
+                                 options:option];
+        }
+    }
+}
+
+} // namespace
+
+Stats& GetStats() {
+    return stats;
+}
+
+void Init(VkDevice dev, id<MTLCommandQueue> q, PFN_vkExportMetalObjectsEXT export_fn,
+          PFN_vkGetBufferDeviceAddress address_fn) {
+    vk_device = dev;
+    queue = q;
+    device = q.device;
+    export_objects = export_fn;
+    get_address = address_fn;
+    get_mtl_buffer = FindGetMTLBuffer();
+    if (!get_mtl_buffer) {
+        std::printf("Metal frame: vkGetMTLBufferMVK not found in MoltenVK: buffers cannot be "
+                    "bound\n");
+    }
+    null_buffer = [device newBufferWithLength:65536 options:MTLResourceStorageModePrivate];
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:1
+                                                          height:1
+                                                       mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    td.storageMode = MTLStorageModePrivate;
+    null_texture = [device newTextureWithDescriptor:td];
+    null_sampler = [device newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
+}
+
+void EndEncoders(Owned& o) {
+    if (o.render) {
+        [o.render endEncoding];
+        o.render = nil;
+    }
+    if (o.compute) {
+        [o.compute endEncoding];
+        o.compute = nil;
+    }
+    if (o.blit) {
+        [o.blit endEncoding];
+        o.blit = nil;
+    }
+}
+
+void SamplerCreated(VkSampler sampler, const VkSamplerCreateInfo* info) {
+    using namespace Metal::VkToMtl;
+    MTLSamplerDescriptor* d = [MTLSamplerDescriptor new];
+    d.minFilter = MTLSamplerMinMagFilter(SamplerFilter(vk::Filter(info->minFilter)));
+    d.magFilter = MTLSamplerMinMagFilter(SamplerFilter(vk::Filter(info->magFilter)));
+    d.mipFilter = info->maxLod <= info->minLod && info->minLod == 0.0f
+                      ? MTLSamplerMipFilterNotMipmapped
+                      : MTLSamplerMipFilter(MipFilter(vk::SamplerMipmapMode(info->mipmapMode)));
+    d.sAddressMode = MTLSamplerAddressMode(AddressMode(vk::SamplerAddressMode(info->addressModeU)));
+    d.tAddressMode = MTLSamplerAddressMode(AddressMode(vk::SamplerAddressMode(info->addressModeV)));
+    d.rAddressMode = MTLSamplerAddressMode(AddressMode(vk::SamplerAddressMode(info->addressModeW)));
+    d.lodMinClamp = info->minLod;
+    d.lodMaxClamp = info->maxLod;
+    d.maxAnisotropy = info->anisotropyEnable ? NSUInteger(std::clamp(info->maxAnisotropy, 1.0f, 16.0f)) : 1;
+    if (info->compareEnable) {
+        d.compareFunction = MTLCompareFunction(SamplerCompare(vk::CompareOp(info->compareOp)));
+    }
+    d.borderColor = MTLSamplerBorderColor(BorderColor(vk::BorderColor(info->borderColor)).color);
+    d.normalizedCoordinates = !info->unnormalizedCoordinates;
+    if (info->mipLodBias != 0.0f) {
+        Log("sampler LOD bias is not applied (Metal samplers have none)");
+    }
+    id<MTLSamplerState> state = [device newSamplerStateWithDescriptor:d];
+    std::scoped_lock lock{maps_mutex};
+    samplers[sampler] = state;
+}
+
+void SamplerDestroyed(VkSampler sampler) {
+    std::scoped_lock lock{maps_mutex};
+    samplers.erase(sampler);
+}
+
+void ImageViewCreated(VkImageView view, const VkImageViewCreateInfo* info) {
+    std::scoped_lock lock{maps_mutex};
+    view_infos[view] = {info->image, info->format, info->subresourceRange};
+    views.erase(view);
+}
+
+void ImageViewDestroyed(VkImageView view) {
+    std::scoped_lock lock{maps_mutex};
+    views.erase(view);
+    view_infos.erase(view);
+}
+
+void DeviceAddressTaken(VkBuffer buffer) {
+    const BufferRef ref = ResolveBuffer(buffer);
+    if (!ref.buffer) {
+        return;
+    }
+    std::scoped_lock lock{maps_mutex};
+    if (std::find(address_buffers.begin(), address_buffers.end(), ref.buffer) ==
+        address_buffers.end()) {
+        address_buffers.push_back(ref.buffer);
+        ++address_generation;
+    }
+}
+
+void Barrier(Owned& o) {
+    // Tracked resources order the encoders; inside a compute encoder dispatches are serial.
+    // A blit encoder is ended so the next command sees its writes.
+    if (o.blit) {
+        [o.blit endEncoding];
+        o.blit = nil;
+    }
+}
+
+namespace {
+/// The texture, level and slice to render into for an attachment view: the image's own texture
+/// when it has the view's pixel format (MoltenVK's exported view textures can lack render-target
+/// usage), else the view's.
+struct Attachment {
+    id<MTLTexture> texture;
+    u32 level{}, slice{};
+};
+Attachment AttachmentOf(VkImageView view) {
+    ViewInfo vi{};
+    bool known = false;
+    {
+        std::scoped_lock lock{maps_mutex};
+        if (auto it = view_infos.find(view); it != view_infos.end()) {
+            vi = it->second;
+            known = true;
+        }
+    }
+    id<MTLTexture> view_texture = TextureOfView(view);
+    if (known) {
+        id<MTLTexture> image = TextureOfImage(vi.image);
+        if (image && (!view_texture || image.pixelFormat == view_texture.pixelFormat)) {
+            return {image, vi.range.baseMipLevel, vi.range.baseArrayLayer};
+        }
+    }
+    return {view_texture, 0, 0};
+}
+} // namespace
+
+void BeginRendering(Owned& o, const VkRenderingInfo* info) {
+    EndEncoders(o);
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    const auto load = [](VkAttachmentLoadOp op) {
+        return op == VK_ATTACHMENT_LOAD_OP_CLEAR       ? MTLLoadActionClear
+               : op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ? MTLLoadActionDontCare
+                                                       : MTLLoadActionLoad;
+    };
+    const auto store = [](VkAttachmentStoreOp op) {
+        return op == VK_ATTACHMENT_STORE_OP_DONT_CARE ? MTLStoreActionDontCare
+                                                      : MTLStoreActionStore;
+    };
+    u32 width = info->renderArea.offset.x + info->renderArea.extent.width;
+    u32 height = info->renderArea.offset.y + info->renderArea.extent.height;
+    bool any = false;
+    for (u32 i = 0; i < info->colorAttachmentCount; ++i) {
+        const VkRenderingAttachmentInfo& a = info->pColorAttachments[i];
+        const Attachment at = a.imageView ? AttachmentOf(a.imageView) : Attachment{};
+        id<MTLTexture> texture = at.texture;
+        if (!texture) {
+            continue;
+        }
+        any = true;
+        rp.colorAttachments[i].texture = texture;
+        rp.colorAttachments[i].level = at.level;
+        rp.colorAttachments[i].slice = at.slice;
+        rp.colorAttachments[i].loadAction = load(a.loadOp);
+        rp.colorAttachments[i].storeAction = store(a.storeOp);
+        const auto& c = a.clearValue.color.float32;
+        rp.colorAttachments[i].clearColor = MTLClearColorMake(c[0], c[1], c[2], c[3]);
+        width = u32(std::max<NSUInteger>(1, texture.width >> at.level));
+        height = u32(std::max<NSUInteger>(1, texture.height >> at.level));
+    }
+    const VkRenderingAttachmentInfo* depth = info->pDepthAttachment;
+    const VkRenderingAttachmentInfo* stencil = info->pStencilAttachment;
+    if (depth && depth->imageView) {
+        const Attachment at = AttachmentOf(depth->imageView);
+        if (id<MTLTexture> texture = at.texture) {
+            any = true;
+            rp.depthAttachment.texture = texture;
+            rp.depthAttachment.level = at.level;
+            rp.depthAttachment.slice = at.slice;
+            rp.depthAttachment.loadAction = load(depth->loadOp);
+            rp.depthAttachment.storeAction = store(depth->storeOp);
+            rp.depthAttachment.clearDepth = depth->clearValue.depthStencil.depth;
+            width = u32(std::max<NSUInteger>(1, texture.width >> at.level));
+            height = u32(std::max<NSUInteger>(1, texture.height >> at.level));
+        }
+    }
+    if (stencil && stencil->imageView) {
+        const Attachment at = AttachmentOf(stencil->imageView);
+        if (id<MTLTexture> texture = at.texture) {
+            any = true;
+            rp.stencilAttachment.texture = texture;
+            rp.stencilAttachment.level = at.level;
+            rp.stencilAttachment.slice = at.slice;
+            rp.stencilAttachment.loadAction = load(stencil->loadOp);
+            rp.stencilAttachment.storeAction = store(stencil->storeOp);
+            rp.stencilAttachment.clearStencil = stencil->clearValue.depthStencil.stencil;
+        }
+    }
+    if (!any) {
+        rp.renderTargetWidth = std::max(1u, width);
+        rp.renderTargetHeight = std::max(1u, height);
+        rp.defaultRasterSampleCount = 1;
+    }
+    if (info->layerCount > 1) {
+        rp.renderTargetArrayLength = info->layerCount;
+    }
+    o.target_width = width;
+    o.target_height = height;
+    o.render = [o.cmd renderCommandEncoderWithDescriptor:rp];
+    o.rendering = true;
+    if (!o.render) {
+        Log("a render pass Metal refused (its draws are skipped)");
+        return;
+    }
+    UseAddressBuffers(o.render, true);
+}
+
+void EndRendering(Owned& o) {
+    if (o.render) {
+        [o.render endEncoding];
+        o.render = nil;
+    }
+    o.rendering = false;
+}
+
+void BindPipeline(Owned& o, VkPipelineBindPoint point, VkPipeline pipeline) {
+    if (point == VK_PIPELINE_BIND_POINT_COMPUTE) {
+        o.compute_pipeline = MetalShadow::FindCompute(pipeline);
+    } else {
+        o.graphics = MetalShadow::FindGraphics(pipeline);
+        o.graphics_bound = true;
+    }
+}
+
+void PushDescriptorSet(Owned& o, VkPipelineBindPoint point, u32 set, u32 count,
+                       const VkWriteDescriptorSet* writes) {
+    auto& bindings = point == VK_PIPELINE_BIND_POINT_COMPUTE ? o.compute_bindings
+                                                             : o.graphics_bindings;
+    for (u32 w = 0; w < count; ++w) {
+        const VkWriteDescriptorSet& write = writes[w];
+        auto& elements = bindings[(set << 16) | write.dstBinding].elements;
+        if (elements.size() < write.dstArrayElement + write.descriptorCount) {
+            elements.resize(write.dstArrayElement + write.descriptorCount);
+        }
+        for (u32 i = 0; i < write.descriptorCount; ++i) {
+            Bound& b = elements[write.dstArrayElement + i];
+            b = {};
+            switch (write.descriptorType) {
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: {
+                const VkDescriptorBufferInfo& info = write.pBufferInfo[i];
+                const BufferRef ref = ResolveBuffer(info.buffer);
+                b.buffer = ref.buffer;
+                b.offset = ref.offset + info.offset;
+                b.size = info.range == VK_WHOLE_SIZE && ref.buffer
+                             ? ref.buffer.length - b.offset
+                             : info.range;
+                break;
+            }
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                b.texture = TextureOfView(write.pImageInfo[i].imageView);
+                break;
+            case VK_DESCRIPTOR_TYPE_SAMPLER: {
+                std::scoped_lock lock{maps_mutex};
+                auto it = samplers.find(write.pImageInfo[i].sampler);
+                b.sampler = it == samplers.end() ? nil : it->second;
+                break;
+            }
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
+                b.texture = TextureOfView(write.pImageInfo[i].imageView);
+                std::scoped_lock lock{maps_mutex};
+                auto it = samplers.find(write.pImageInfo[i].sampler);
+                b.sampler = it == samplers.end() ? nil : it->second;
+                break;
+            }
+            default:
+                Log("a descriptor type the Metal path does not bind yet");
+                break;
+            }
+        }
+    }
+}
+
+void PushConstants(Owned& o, u32 offset, u32 size, const void* values) {
+    if (offset + size <= o.push.size()) {
+        std::memcpy(o.push.data() + offset, values, size);
+    }
+}
+
+void BindVertexBuffers(Owned& o, u32 first, u32 count, const VkBuffer* buffers,
+                       const VkDeviceSize* offsets, const VkDeviceSize* strides) {
+    for (u32 i = 0; i < count && first + i < o.vertex_buffers.size(); ++i) {
+        const BufferRef ref = ResolveBuffer(buffers[i]);
+        auto& vb = o.vertex_buffers[first + i];
+        vb.buffer = ref.buffer;
+        vb.offset = ref.offset + offsets[i];
+        if (strides) {
+            vb.stride = strides[i];
+        }
+    }
+}
+
+void BindIndexBuffer(Owned& o, VkBuffer buffer, VkDeviceSize offset, VkIndexType type) {
+    const BufferRef ref = ResolveBuffer(buffer);
+    o.index_buffer = ref.buffer;
+    o.index_offset = ref.offset + offset;
+    o.index_type = type;
+    if (type == VK_INDEX_TYPE_UINT8_EXT) {
+        Log("8-bit indices are not widened yet (drawn as 16-bit)");
+    }
+}
+
+void SetViewports(Owned& o, u32 count, const VkViewport* viewports) {
+    o.viewports.assign(viewports, viewports + count);
+}
+
+void SetScissors(Owned& o, u32 count, const VkRect2D* scissors) {
+    o.scissors.assign(scissors, scissors + count);
+}
+
+void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 first_instance) {
+    if (!PrepareDraw(o)) {
+        return;
+    }
+    u32 start = first_vertex, count = vertex_count;
+    if (o.graphics->rect_list) {
+        // Two triangles (6 vertices) per rectangle of 3 (mtl_spirv_rectlist.h).
+        start = first_vertex / 3 * 6;
+        count = vertex_count / 3 * 6;
+    }
+    [o.render drawPrimitives:PrimitiveOf(o)
+                 vertexStart:start
+                 vertexCount:count
+               instanceCount:instance_count
+                baseInstance:first_instance];
+    ++stats.draws;
+}
+
+void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
+                 s32 vertex_offset, u32 first_instance) {
+    if (!PrepareDraw(o)) {
+        return;
+    }
+    if (o.graphics->rect_list) {
+        Log("indexed rect list draws are not encoded (skipped)");
+        return;
+    }
+    if (!o.index_buffer) {
+        Log("an indexed draw without an index buffer (skipped)");
+        return;
+    }
+    const u32 size = IndexSize(o.index_type);
+    [o.render drawIndexedPrimitives:PrimitiveOf(o)
+                         indexCount:index_count
+                          indexType:size == 4 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                        indexBuffer:o.index_buffer
+                  indexBufferOffset:o.index_offset + u64(first_index) * size
+                      instanceCount:instance_count
+                         baseVertex:vertex_offset
+                       baseInstance:first_instance];
+    ++stats.draws;
+}
+
+void DrawIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset, u32 count, u32 stride,
+                  bool indexed) {
+    if (!PrepareDraw(o)) {
+        return;
+    }
+    if (o.graphics->rect_list) {
+        Log("indirect rect list draws are not encoded (skipped)");
+        return;
+    }
+    const BufferRef ref = ResolveBuffer(buffer);
+    if (!ref.buffer) {
+        return;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        const u64 at = ref.offset + offset + u64(i) * stride;
+        if (indexed) {
+            const u32 size = IndexSize(o.index_type);
+            [o.render drawIndexedPrimitives:PrimitiveOf(o)
+                                  indexType:size == 4 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                                indexBuffer:o.index_buffer
+                          indexBufferOffset:o.index_offset
+                             indirectBuffer:ref.buffer
+                       indirectBufferOffset:at];
+        } else {
+            [o.render drawPrimitives:PrimitiveOf(o) indirectBuffer:ref.buffer indirectBufferOffset:at];
+        }
+        ++stats.draws;
+    }
+}
+
+void Dispatch(Owned& o, u32 x, u32 y, u32 z) {
+    const Metal::ComputePipeline* p = o.compute_pipeline;
+    if (!p) {
+        ++stats.skipped_no_pipeline;
+        return;
+    }
+    id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
+    [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)p->state];
+    BindStage(o, Stage::Compute, p->shader, o.compute_bindings);
+    [enc dispatchThreadgroups:MTLSizeMake(x, y, z)
+        threadsPerThreadgroup:MTLSizeMake(p->threads_per_group[0], p->threads_per_group[1],
+                                          p->threads_per_group[2])];
+    ++stats.dispatches;
+}
+
+void DispatchIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset) {
+    const Metal::ComputePipeline* p = o.compute_pipeline;
+    const BufferRef ref = ResolveBuffer(buffer);
+    if (!p || !ref.buffer) {
+        ++stats.skipped_no_pipeline;
+        return;
+    }
+    id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
+    [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)p->state];
+    BindStage(o, Stage::Compute, p->shader, o.compute_bindings);
+    [enc dispatchThreadgroupsWithIndirectBuffer:ref.buffer
+                           indirectBufferOffset:ref.offset + offset
+                          threadsPerThreadgroup:MTLSizeMake(p->threads_per_group[0],
+                                                            p->threads_per_group[1],
+                                                            p->threads_per_group[2])];
+    ++stats.dispatches;
+}
+
+void CopyBuffer(Owned& o, VkBuffer src, VkBuffer dst, u32 count, const VkBufferCopy* regions) {
+    const BufferRef s = ResolveBuffer(src), d = ResolveBuffer(dst);
+    if (!s.buffer || !d.buffer) {
+        return;
+    }
+    id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    for (u32 i = 0; i < count; ++i) {
+        [blit copyFromBuffer:s.buffer
+                 sourceOffset:s.offset + regions[i].srcOffset
+                     toBuffer:d.buffer
+            destinationOffset:d.offset + regions[i].dstOffset
+                         size:regions[i].size];
+    }
+}
+
+void FillBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, u32 data) {
+    const BufferRef d = ResolveBuffer(dst);
+    if (!d.buffer) {
+        return;
+    }
+    const u8 b = u8(data);
+    if (data != u32(b) * 0x01010101u) {
+        Log("vkCmdFillBuffer with a pattern of different bytes (filled with its low byte)");
+    }
+    const u64 length = size == VK_WHOLE_SIZE ? d.buffer.length - d.offset - offset : size;
+    [BlitEncoder(o) fillBuffer:d.buffer range:NSMakeRange(d.offset + offset, length) value:b];
+}
+
+void UpdateBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size,
+                  const void* data) {
+    const BufferRef d = ResolveBuffer(dst);
+    if (!d.buffer) {
+        return;
+    }
+    id<MTLBuffer> staging = [device newBufferWithBytes:data
+                                                length:size
+                                               options:MTLResourceStorageModeShared];
+    [BlitEncoder(o) copyFromBuffer:staging
+                      sourceOffset:0
+                          toBuffer:d.buffer
+                 destinationOffset:d.offset + offset
+                              size:size];
+}
+
+void CopyImage(Owned& o, VkImage src, VkImage dst, u32 count, const VkImageCopy* regions) {
+    id<MTLTexture> s = TextureOfImage(src), d = TextureOfImage(dst);
+    if (!s || !d) {
+        return;
+    }
+    id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    for (u32 i = 0; i < count; ++i) {
+        const VkImageCopy& r = regions[i];
+        for (u32 layer = 0; layer < r.srcSubresource.layerCount; ++layer) {
+            [blit copyFromTexture:s
+                      sourceSlice:r.srcSubresource.baseArrayLayer + layer
+                      sourceLevel:r.srcSubresource.mipLevel
+                     sourceOrigin:MTLOriginMake(r.srcOffset.x, r.srcOffset.y, r.srcOffset.z)
+                       sourceSize:MTLSizeMake(r.extent.width, r.extent.height, r.extent.depth)
+                        toTexture:d
+                 destinationSlice:r.dstSubresource.baseArrayLayer + layer
+                 destinationLevel:r.dstSubresource.mipLevel
+                destinationOrigin:MTLOriginMake(r.dstOffset.x, r.dstOffset.y, r.dstOffset.z)];
+        }
+    }
+}
+
+void CopyBufferToImage(Owned& o, VkBuffer src, VkImage dst, u32 count,
+                       const VkBufferImageCopy* regions) {
+    const BufferRef s = ResolveBuffer(src);
+    id<MTLTexture> d = TextureOfImage(dst);
+    if (!s.buffer || !d) {
+        return;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        BufferImageCopy(o, s, d, regions[i], true);
+    }
+}
+
+void CopyImageToBuffer(Owned& o, VkImage src, VkBuffer dst, u32 count,
+                       const VkBufferImageCopy* regions) {
+    id<MTLTexture> s = TextureOfImage(src);
+    const BufferRef d = ResolveBuffer(dst);
+    if (!s || !d.buffer) {
+        return;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        BufferImageCopy(o, d, s, regions[i], false);
+    }
+}
+
+namespace {
+template <typename Each>
+void ForEachSubresource(id<MTLTexture> texture, u32 count, const VkImageSubresourceRange* ranges,
+                        Each&& each) {
+    for (u32 r = 0; r < count; ++r) {
+        const auto& range = ranges[r];
+        const u32 levels = range.levelCount == VK_REMAINING_MIP_LEVELS
+                               ? u32(texture.mipmapLevelCount) - range.baseMipLevel
+                               : range.levelCount;
+        const u32 layers = range.layerCount == VK_REMAINING_ARRAY_LAYERS
+                               ? u32(texture.arrayLength) - range.baseArrayLayer
+                               : range.layerCount;
+        for (u32 level = 0; level < levels; ++level) {
+            for (u32 layer = 0; layer < layers; ++layer) {
+                each(range.aspectMask, range.baseMipLevel + level, range.baseArrayLayer + layer);
+            }
+        }
+    }
+}
+} // namespace
+
+void ClearColorImage(Owned& o, VkImage image, const VkClearColorValue* color, u32 count,
+                     const VkImageSubresourceRange* ranges) {
+    id<MTLTexture> texture = TextureOfImage(image);
+    if (!texture) {
+        return;
+    }
+    EndEncoders(o);
+    ForEachSubresource(texture, count, ranges, [&](u32, u32 level, u32 layer) {
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = texture;
+        rp.colorAttachments[0].level = level;
+        rp.colorAttachments[0].slice = layer;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(
+            color->float32[0], color->float32[1], color->float32[2], color->float32[3]);
+        [[o.cmd renderCommandEncoderWithDescriptor:rp] endEncoding];
+    });
+}
+
+void ClearDepthStencilImage(Owned& o, VkImage image, const VkClearDepthStencilValue* value,
+                            u32 count, const VkImageSubresourceRange* ranges) {
+    id<MTLTexture> texture = TextureOfImage(image);
+    if (!texture) {
+        return;
+    }
+    EndEncoders(o);
+    const bool has_stencil = Metal::VkToMtl::HasStencilPixelFormat(u32(texture.pixelFormat));
+    ForEachSubresource(texture, count, ranges, [&](u32 aspects, u32 level, u32 layer) {
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+            rp.depthAttachment.texture = texture;
+            rp.depthAttachment.level = level;
+            rp.depthAttachment.slice = layer;
+            rp.depthAttachment.loadAction = MTLLoadActionClear;
+            rp.depthAttachment.storeAction = MTLStoreActionStore;
+            rp.depthAttachment.clearDepth = value->depth;
+        }
+        if ((aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && has_stencil) {
+            rp.stencilAttachment.texture = texture;
+            rp.stencilAttachment.level = level;
+            rp.stencilAttachment.slice = layer;
+            rp.stencilAttachment.loadAction = MTLLoadActionClear;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            rp.stencilAttachment.clearStencil = value->stencil;
+        }
+        [[o.cmd renderCommandEncoderWithDescriptor:rp] endEncoding];
+    });
+}
+
+namespace {
+id<MTLLibrary> blit_library;
+id<MTLSamplerState> blit_linear, blit_nearest;
+std::vector<std::pair<MTLPixelFormat, id<MTLRenderPipelineState>>> blit_pipelines;
+std::mutex blit_mutex;
+
+/// Fullscreen-triangle copy of a source rectangle (normalized) into the viewport, for
+/// vkCmdBlitImage: Metal's blit encoder neither scales nor filters.
+id<MTLRenderPipelineState> BlitPipeline(MTLPixelFormat format) {
+    std::scoped_lock lock{blit_mutex};
+    for (const auto& [known, state] : blit_pipelines) {
+        if (known == format) {
+            return state;
+        }
+    }
+    NSError* error = nil;
+    if (!blit_library) {
+        NSString* source =
+            @"#include <metal_stdlib>\n"
+             "using namespace metal;\n"
+             "struct V { float4 pos [[position]]; float2 uv; };\n"
+             "vertex V blit_vs(uint id [[vertex_id]], constant float4& src [[buffer(0)]]) {\n"
+             "    float2 p = float2((id << 1) & 2, id & 2);\n"
+             "    V v; v.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+             "    float2 t = float2(p.x, 1.0 - p.y);\n" // Metal NDC y up, texture y down
+             "    v.uv = mix(src.xy, src.zw, t); return v; }\n"
+             "fragment float4 blit_fs(V in [[stage_in]], texture2d<float> tex [[texture(0)]],\n"
+             "                        sampler s [[sampler(0)]]) { return tex.sample(s, in.uv); }\n";
+        blit_library = [device newLibraryWithSource:source options:nil error:&error];
+        if (!blit_library) {
+            std::printf("Metal frame: blit shader: %s\n", error.localizedDescription.UTF8String);
+            return nil;
+        }
+        MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+        sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        blit_linear = [device newSamplerStateWithDescriptor:sd];
+        sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+        blit_nearest = [device newSamplerStateWithDescriptor:sd];
+    }
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [blit_library newFunctionWithName:@"blit_vs"];
+    d.fragmentFunction = [blit_library newFunctionWithName:@"blit_fs"];
+    d.colorAttachments[0].pixelFormat = format;
+    id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!state) {
+        std::printf("Metal frame: blit pipeline for format %lu: %s\n", (unsigned long)format,
+                    error.localizedDescription.UTF8String);
+    }
+    blit_pipelines.emplace_back(format, state);
+    return state;
+}
+} // namespace
+
+void BlitImage(Owned& o, VkImage src_image, VkImage dst_image, u32 count,
+               const VkImageBlit* regions, VkFilter filter) {
+    id<MTLTexture> src = TextureOfImage(src_image);
+    id<MTLTexture> dst = TextureOfImage(dst_image);
+    id<MTLRenderPipelineState> pipeline = dst ? BlitPipeline(dst.pixelFormat) : nil;
+    if (!src || !dst || !pipeline) {
+        return;
+    }
+    EndEncoders(o);
+    for (u32 r = 0; r < count; ++r) {
+        const VkImageBlit& b = regions[r];
+        const float sw = float(std::max<NSUInteger>(1, src.width >> b.srcSubresource.mipLevel));
+        const float sh = float(std::max<NSUInteger>(1, src.height >> b.srcSubresource.mipLevel));
+        float uv[4] = {b.srcOffsets[0].x / sw, b.srcOffsets[0].y / sh, b.srcOffsets[1].x / sw,
+                       b.srcOffsets[1].y / sh};
+        // Destination rectangle; a mirrored destination swaps the source edges instead.
+        int x0 = b.dstOffsets[0].x, x1 = b.dstOffsets[1].x, y0 = b.dstOffsets[0].y,
+            y1 = b.dstOffsets[1].y;
+        if (x1 < x0) {
+            std::swap(x0, x1);
+            std::swap(uv[0], uv[2]);
+        }
+        if (y1 < y0) {
+            std::swap(y0, y1);
+            std::swap(uv[1], uv[3]);
+        }
+        if (x1 == x0 || y1 == y0) {
+            continue;
+        }
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = dst;
+        rp.colorAttachments[0].level = b.dstSubresource.mipLevel;
+        rp.colorAttachments[0].slice = b.dstSubresource.baseArrayLayer;
+        rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [o.cmd renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:pipeline];
+        [enc setViewport:(MTLViewport){double(x0), double(y0), double(x1 - x0), double(y1 - y0),
+                                       0.0, 1.0}];
+        [enc setVertexBytes:uv length:sizeof uv atIndex:0];
+        [enc setFragmentTexture:src atIndex:0];
+        [enc setFragmentSamplerState:filter == VK_FILTER_NEAREST ? blit_nearest : blit_linear
+                             atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+    }
+}
+
+} // namespace MetalFrame
