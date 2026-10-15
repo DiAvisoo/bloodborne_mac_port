@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_metal_shadow.h"
 
 namespace Vulkan {
 
@@ -15,6 +16,9 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
     auto [module_result, module] = device.createShaderModule(shader_info);
     ASSERT_MSG(module_result == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}",
                vk::to_string(module_result));
+    if (MetalShadow::Enabled()) {
+        MetalShadow::RegisterModule(module, code);
+    }
     return module;
 }
 

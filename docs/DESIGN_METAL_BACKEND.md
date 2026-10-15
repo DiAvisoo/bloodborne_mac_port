@@ -74,8 +74,16 @@ which is not where the time goes. So, in stages:
   vertex, fragment and compute modules of our shader cache compile** (2.4 s on 8 threads); the 22
   tessellation modules wait for their variants (M4). Fragment MSL has no `optnone` helpers (our
   2026-10-13 fix carries over); vertex shaders keep them by design.
-  *Next:* pipeline states (vertex descriptors from the fetch shader, blend/depth/raster state,
-  render-target formats) and a binary archive.
+  *Pipeline states (2026-10-15):* their PSO builder (`mtl_pso_cache`, `vk_to_mtl`,
+  `mtl_tessellation` minus the draw encoding) works on our `GraphicsPipelineKey` unchanged (the
+  same struct); the blend rules moved into `Vulkan::AttachmentBlendState` and both renderers use
+  it (no change to the Vulkan image or speed: 93.7 FPS, same picture). **Shadow check**
+  (`BB_METAL_SHADOW=1`, `vk_metal_shadow.h`, `mtl_shadow.mm`): every pipeline the Vulkan path
+  creates is built again as a Metal pipeline state from the same key and SPIR-V. Loading the save
+  and walking the Hunter's Dream: **~600 pipelines, 525 render + 39 compute built, 0 failures**;
+  not yet covered: 22 tessellation, 14 rect lists (MoltenVK emulates both with tessellation; Metal
+  path: their `mtl_spirv_rectlist` rewrite and the tessellation variants).
+  *Next:* rect lists and tessellation in the shadow check, then M2 (draws).
 - **M2, draws and dispatches:** graphics draws, compute dispatches, copies and clears of the main
   frame through Metal encoders, our own render-pass boundaries; barriers become our fences.
   Correctness by screenshots on the test routes; then speed.

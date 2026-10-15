@@ -193,7 +193,10 @@ if (APPLE)
         target_sources(bbgpu PRIVATE ${METAL_SOURCES})
         foreach(source IN LISTS METAL_SOURCES)
             if (source MATCHES "\\.mm$")
-                set_source_files_properties(${source} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+                # No Vulkan Metal-surface types here: under ARC their CAMetalLayer pointer breaks
+                # vulkan.hpp's constexpr templates.
+                set_source_files_properties(${source} PROPERTIES COMPILE_OPTIONS
+                    "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
             endif()
         endforeach()
         target_link_libraries(bbgpu PRIVATE spirv-cross-msl spirv-cross-glsl spirv-cross-core)

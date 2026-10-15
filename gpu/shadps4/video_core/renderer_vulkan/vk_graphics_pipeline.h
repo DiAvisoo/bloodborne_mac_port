@@ -69,6 +69,19 @@ struct GraphicsPipelineKey {
     bool Deserialize(Serialization::Archive& ar);
 };
 
+/// bbport: the blend state of color attachment `i` as the key asks for it, with the rewrites that
+/// emulate GCN behaviour (min/max with a zeroing factor, the squared self-scaled output, alpha
+/// masked out of the export). Shared by the Vulkan and Metal pipelines (interface as in
+/// Huax-1839/bloodborne-macos, so their Metal pipeline builder uses it unchanged).
+struct AttachmentBlend {
+    bool enable{};
+    vk::BlendFactor src_color{}, dst_color{}, src_alpha{}, dst_alpha{};
+    vk::BlendOp color_op{}, alpha_op{};
+    bool unimplemented_min_max{}; ///< min/max with factors other than one (not emulated)
+    bool self_scaled{};           ///< the shader squares its output (blend_self_scale)
+};
+AttachmentBlend AttachmentBlendState(const GraphicsPipelineKey& key, u32 i);
+
 class GraphicsPipeline : public Pipeline {
 public:
     struct SerializationSupport {

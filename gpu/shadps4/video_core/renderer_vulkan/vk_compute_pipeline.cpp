@@ -7,6 +7,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_metal_shadow.h"
 
 namespace Vulkan {
 
@@ -115,6 +116,9 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                    "Failed to create compute pipeline: {}", vk::to_string(pipeline_result));
         pipeline = std::move(pipe);
         SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
+        if (MetalShadow::Enabled()) {
+            MetalShadow::Compute(compute_key, module);
+        }
     });
 }
 
