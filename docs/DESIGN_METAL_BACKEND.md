@@ -1,6 +1,6 @@
 # Native Metal back end (plan stage 3)
 
-Branch `metal-backend`. Status: design; M0 standalone test passes (2026-10-15).
+Branch `metal-backend`. Status: M0 interop test passes; M1 shader compiler in (2026-10-15).
 
 ## Why
 
@@ -65,6 +65,17 @@ which is not where the time goes. So, in stages:
 - **M1, pipelines:** SPIRV-Cross → MSL with our binding model, background compiles, binary archive;
   validated by building every cached pipeline and comparing MSL with MoltenVK's
   (`MVK_CONFIG_SHADER_DUMP_DIR`).
+  *Started 2026-10-15:* the SPIR-V → MSL compiler of Huax-1839/bloodborne-macos (GPL-2.0-or-later,
+  `renderer_metal/mtl_shader*`, `mtl_spirv_*`; their direct-slot binding model: push constants at
+  buffer 0, buffers from 1, textures/samplers from 0, vertex buffers from 30 down; tessellation and
+  geometry-kernel variants) with our device wrapper (MoltenVK's device and queue) and fast math as
+  MoltenVK uses (`BB_MSL_SAFE_MATH=1`: safe). Built into the arm64 host only, SPIRV-Cross
+  `vulkan-sdk-1.4.363.0` from `bootstrap_deps.sh`. `bbgpu-host --msl-check <cache dir>`: **all 1,087
+  vertex, fragment and compute modules of our shader cache compile** (2.4 s on 8 threads); the 22
+  tessellation modules wait for their variants (M4). Fragment MSL has no `optnone` helpers (our
+  2026-10-13 fix carries over); vertex shaders keep them by design.
+  *Next:* pipeline states (vertex descriptors from the fetch shader, blend/depth/raster state,
+  render-target formats) and a binary archive.
 - **M2, draws and dispatches:** graphics draws, compute dispatches, copies and clears of the main
   frame through Metal encoders, our own render-pass boundaries; barriers become our fences.
   Correctness by screenshots on the test routes; then speed.

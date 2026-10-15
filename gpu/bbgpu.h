@@ -28,6 +28,8 @@ int bbgpu_host_start(const BbGpuConfig *config, void *shared);
 int bbgpu_host_fault(uint64_t address, int write);
 /* GPU host: asks the game to restart (the settings menu's Restart, through runtime_restart). */
 void bbgpu_split_post_restart(void);
+/* Metal back end check (arm64 host): compiles every .spv in spv_dir to Metal; 0 when all did. */
+int bbgpu_msl_check(const char *spv_dir, const char *msl_cache_dir);
 /* GPU host: runs one GnmDriver/VideoOut record from the submit ring (answers requests itself).
  * 0 when the record type is not the GPU library's. */
 int bbgpu_host_dispatch(const void *record);

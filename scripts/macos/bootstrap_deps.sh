@@ -95,6 +95,8 @@ fetch robin-map https://github.com/Tessil/robin-map.git $ROBIN_MAP_TAG
 fetch VulkanMemoryAllocator https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git $VMA_TAG
 [[ $ARCH == x86_64 ]] && fetch xbyak https://github.com/herumi/xbyak.git $XBYAK_TAG
 fetch FFmpeg https://github.com/FFmpeg/FFmpeg.git $FFMPEG_TAG
+# SPIR-V -> MSL for the native Metal back end (docs/DESIGN_METAL_BACKEND.md; arm64 host only).
+[[ $ARCH == arm64 ]] && fetch SPIRV-Cross https://github.com/KhronosGroup/SPIRV-Cross.git $VULKAN_TAG
 
 cmake_dep Vulkan-Headers .
 cmake_dep Vulkan-Loader . -DUPDATE_DEPS=OFF -DBUILD_TESTS=OFF -DVulkanHeaders_DIR="$PREFIX/share/cmake/VulkanHeaders"
@@ -111,6 +113,10 @@ fi
 cmake_dep magic_enum . -DMAGIC_ENUM_OPT_BUILD_EXAMPLES=OFF -DMAGIC_ENUM_OPT_BUILD_TESTS=OFF
 cmake_dep robin-map .
 cmake_dep VulkanMemoryAllocator .
+[[ $ARCH == arm64 ]] && cmake_dep SPIRV-Cross . -DSPIRV_CROSS_SHARED=OFF -DSPIRV_CROSS_STATIC=ON \
+    -DSPIRV_CROSS_CLI=OFF -DSPIRV_CROSS_ENABLE_TESTS=OFF -DSPIRV_CROSS_ENABLE_HLSL=OFF \
+    -DSPIRV_CROSS_ENABLE_CPP=OFF -DSPIRV_CROSS_ENABLE_REFLECT=OFF -DSPIRV_CROSS_ENABLE_C_API=OFF \
+    -DSPIRV_CROSS_ENABLE_UTIL=OFF
 [[ $ARCH == x86_64 ]] && cmake_dep xbyak .
 
 # Boost is used header-only; headers are architecture-independent.

@@ -118,4 +118,10 @@ if [[ ${1:-} == --test ]]; then
         out/metal-interop-test
         MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=2 out/metal-interop-test
     fi
+    # Metal back end M1: every cached game shader through SPIRV-Cross -> MSL -> MTLFunction (needs
+    # a shader cache from a game run; BB_MSL_CHECK_DIR picks another one).
+    msl_dir=${BB_MSL_CHECK_DIR:-out/macdata/user/cache/CUSA03173}
+    if [[ -x out/bbgpu-host && -d $msl_dir ]]; then
+        out/bbgpu-host --msl-check "$msl_dir" 2>&1 | grep -E '^(PASS|FAIL|MSL check: FAILED)'
+    fi
 fi

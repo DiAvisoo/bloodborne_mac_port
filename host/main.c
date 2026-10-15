@@ -335,7 +335,9 @@ static void report_guest_range(void) {
     }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    /* bbgpu-host --msl-check <spv dir> [msl cache dir]: the Metal back end's shader check. */
+    if (argc >= 3 && !strcmp(argv[1], "--msl-check")) return bbgpu_msl_check(argv[2], argc >= 4 ? argv[3] : NULL);
     find_vulkan_driver();
     /* A signal ends the host as a signal, not as SDL's polite quit event (exit status 0). */
     setenv("SDL_NO_SIGNAL_HANDLERS", "1", 1);
