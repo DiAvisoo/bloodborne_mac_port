@@ -83,7 +83,13 @@ which is not where the time goes. So, in stages:
   and walking the Hunter's Dream: **~600 pipelines, 525 render + 39 compute built, 0 failures**;
   not yet covered: 22 tessellation, 14 rect lists (MoltenVK emulates both with tessellation; Metal
   path: their `mtl_spirv_rectlist` rewrite and the tessellation variants).
-  *Next:* rect lists and tessellation in the shadow check, then M2 (draws).
+  *Rect lists and tessellation (2026-10-15):* rect lists through their vertex-shader rewrite
+  (`mtl_spirv_rectlist`: two triangles per rectangle instead of MoltenVK's tessellation
+  emulation), tessellated draws as their three-step form (vertex and control shaders as compute
+  kernels, the evaluation shader as the post-tessellation vertex function). Shadow walk: **all
+  600 pipelines build: 525 render, 40 compute, 14 rect lists, 21 tessellation, 0 failures, none
+  left uncovered.** M1 is complete for the areas walked.
+  *Next:* M2, the first draws through our own encoders.
 - **M2, draws and dispatches:** graphics draws, compute dispatches, copies and clears of the main
   frame through Metal encoders, our own render-pass boundaries; barriers become our fences.
   Correctness by screenshots on the test routes; then speed.
