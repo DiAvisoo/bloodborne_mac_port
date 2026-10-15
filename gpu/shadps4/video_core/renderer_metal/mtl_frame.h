@@ -44,7 +44,8 @@ struct Binding {
 
 /// What the frame encoder keeps for one owned command buffer.
 struct Owned {
-    id<MTLCommandBuffer> cmd;
+    id<MTLCommandBuffer> cmd; ///< unretained references: the Vulkan objects keep resources alive
+    std::vector<id<MTLBuffer>> keep; ///< our temporary buffers, released when the GPU is done
     id<MTLRenderCommandEncoder> render;
     id<MTLComputeCommandEncoder> compute;
     id<MTLBlitCommandEncoder> blit;
@@ -140,6 +141,9 @@ void ClearDepthStencilImage(Owned& o, VkImage image, const VkClearDepthStencilVa
                             u32 count, const VkImageSubresourceRange* ranges);
 void BlitImage(Owned& o, VkImage src, VkImage dst, u32 count, const VkImageBlit* regions,
                VkFilter filter);
+
+/// Buffers declared on every encoder (device-address use), for the reports.
+size_t AddressBufferCount();
 
 /// Counters for BB_FRAME_STATS-style reports (skipped work by reason).
 struct Stats {

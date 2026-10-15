@@ -46,7 +46,13 @@ std::unordered_map<VkImageView, ViewInfo> view_infos;
 /// encoder declares them (useResources), which makes them resident and hazard-tracked, as MoltenVK
 /// does for buffers with device addresses.
 std::vector<id<MTLBuffer>> address_buffers;
+/// The big ones (the guest arena, >= 64 MiB) are what shaders reach through pointers and write:
+/// only they are declared on each encoder (hazard tracking); all of them are kept resident by a
+/// residency set on the queue, which pointer access needs and which costs nothing per encoder.
+std::vector<id<MTLBuffer>> declared_buffers;
+id<MTLResidencySet> residency;
 std::atomic<u32> address_generation{0};
+constexpr NSUInteger kDeclaredMinBytes = 64ull << 20;
 
 void Log(const char* what) {
     static std::mutex mutex;
@@ -135,10 +141,10 @@ id<MTLTexture> TextureOfImage(VkImage image) {
 
 void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
     std::scoped_lock lock{maps_mutex};
-    if (address_buffers.empty()) {
+    if (declared_buffers.empty()) {
         return;
     }
-    std::vector<id<MTLResource>> resources(address_buffers.begin(), address_buffers.end());
+    std::vector<id<MTLResource>> resources(declared_buffers.begin(), declared_buffers.end());
     if (render) {
         [(id<MTLRenderCommandEncoder>)encoder
             useResources:resources.data()
@@ -531,6 +537,11 @@ Stats& GetStats() {
     return stats;
 }
 
+size_t AddressBufferCount() {
+    std::scoped_lock lock{maps_mutex};
+    return declared_buffers.size();
+}
+
 void Init(VkDevice dev, id<MTLCommandQueue> q, PFN_vkExportMetalObjectsEXT export_fn,
           PFN_vkGetBufferDeviceAddress address_fn) {
     vk_device = dev;
@@ -553,6 +564,18 @@ void Init(VkDevice dev, id<MTLCommandQueue> q, PFN_vkExportMetalObjectsEXT expor
     td.storageMode = MTLStorageModePrivate;
     null_texture = [device newTextureWithDescriptor:td];
     null_sampler = [device newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
+    MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
+    rd.label = @"bbport device-address buffers";
+    NSError* error = nil;
+    residency = [device newResidencySetWithDescriptor:rd error:&error];
+    if (residency) {
+        [residency commit];
+        [queue addResidencySet:residency];
+    } else {
+        std::printf("Metal frame: no residency set (%s): every device-address buffer is declared "
+                    "on each encoder instead\n",
+                    error ? error.localizedDescription.UTF8String : "unknown");
+    }
 }
 
 void EndEncoders(Owned& o) {
@@ -623,6 +646,13 @@ void DeviceAddressTaken(VkBuffer buffer) {
     if (std::find(address_buffers.begin(), address_buffers.end(), ref.buffer) ==
         address_buffers.end()) {
         address_buffers.push_back(ref.buffer);
+        if (ref.buffer.length >= kDeclaredMinBytes || !residency) {
+            declared_buffers.push_back(ref.buffer);
+        }
+        if (residency) {
+            [residency addAllocation:ref.buffer];
+            [residency commit];
+        }
         ++address_generation;
     }
 }
@@ -992,6 +1022,7 @@ void UpdateBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size
     id<MTLBuffer> staging = [device newBufferWithBytes:data
                                                 length:size
                                                options:MTLResourceStorageModeShared];
+    o.keep.push_back(staging); // the command buffer does not retain it
     [BlitEncoder(o) copyFromBuffer:staging
                       sourceOffset:0
                           toBuffer:d.buffer

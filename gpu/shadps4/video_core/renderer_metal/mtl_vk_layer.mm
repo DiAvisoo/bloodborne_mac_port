@@ -95,11 +95,11 @@ void Report() {
         auto& s = MetalFrame::GetStats();
         std::printf("Metal frame: per second: %.0f draws, %.0f dispatches; skipped: %.0f without "
                     "a Metal pipeline, %.0f tessellated, %.0f emulated topology, %.0f discarded; "
-                    "%.0f unsupported commands\n",
+                    "%.0f unsupported commands; %zu device-address buffers declared per encoder\n",
                     s.draws.exchange(0) / seconds, s.dispatches.exchange(0) / seconds,
                     s.skipped_no_pipeline.exchange(0) / seconds, s.skipped_tess.exchange(0) / seconds,
                     s.skipped_emulated.exchange(0) / seconds, s.skipped_discard.exchange(0) / seconds,
-                    s.unsupported.exchange(0) / seconds);
+                    s.unsupported.exchange(0) / seconds, MetalFrame::AddressBufferCount());
     }
     if (!trace) {
         return;
@@ -125,18 +125,32 @@ std::mutex owned_mutex;
 std::unordered_map<VkCommandBuffer, Owned*> owned;
 std::atomic<unsigned> owned_count{0}; ///< owned.size(): the lock is skipped while it is zero
 
+/// Bumped whenever an owned command buffer appears or goes: the per-thread lookup cache below is
+/// valid while it is unchanged (a command buffer is recorded by one thread at a time).
+std::atomic<u64> owned_generation{0};
+
 Owned* FindOwned(VkCommandBuffer cb) {
     if (owned_count.load(std::memory_order_acquire) == 0) {
         return nullptr;
     }
+    thread_local VkCommandBuffer cached_cb = VK_NULL_HANDLE;
+    thread_local Owned* cached = nullptr;
+    thread_local u64 cached_generation = ~0ull;
+    const u64 generation = owned_generation.load(std::memory_order_acquire);
+    if (cb == cached_cb && generation == cached_generation) {
+        return cached;
+    }
     std::scoped_lock lock{owned_mutex};
     auto it = owned.find(cb);
-    return it == owned.end() ? nullptr : it->second;
+    cached_cb = cb;
+    cached = it == owned.end() ? nullptr : it->second;
+    cached_generation = owned_generation.load(std::memory_order_acquire);
+    return cached;
 }
 
 void OwnBuffer(VkCommandBuffer cb) {
     auto* o = new Owned;
-    o->cmd = [queue commandBuffer];
+    o->cmd = [queue commandBufferWithUnretainedReferences];
     o->cmd.label = @"bbport Metal path";
     std::scoped_lock lock{owned_mutex};
     if (auto it = owned.find(cb); it != owned.end()) {
@@ -146,6 +160,7 @@ void OwnBuffer(VkCommandBuffer cb) {
         owned[cb] = o;
     }
     owned_count.store(unsigned(owned.size()), std::memory_order_release);
+    ++owned_generation;
 }
 
 void Unsupported(unsigned id) {
@@ -178,8 +193,16 @@ void CommitOwned(uint32_t count, Get&& get) {
             o = it->second;
             owned.erase(it);
             owned_count.store(unsigned(owned.size()), std::memory_order_release);
+            ++owned_generation;
         }
         MetalFrame::EndEncoders(*o);
+        if (!o->keep.empty()) {
+            // Our temporary buffers live until the GPU is done with them.
+            __block std::vector<id<MTLBuffer>> keep = std::move(o->keep);
+            [o->cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+              keep.clear();
+            }];
+        }
         [o->cmd commit];
         static std::atomic<unsigned long long> committed{0};
         const auto n = ++committed;
