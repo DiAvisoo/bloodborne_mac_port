@@ -766,3 +766,19 @@ warm shader caches, runs interleaved. Screenshots: same scene, same image.
 - **Their MoltenVK tip works for us too:** argument buffers off gave 82.6 → 94.0 FPS (+14%),
   image correct. Not yet the default (Backlog: check 1440p, the city, pacing and the
   menus/upscalers first).
+
+### MoltenVK argument buffers off, A/B (2026-10-15 evening)
+
+Same protocol as the head to head (Hunter's Dream, uncapped, alternating), `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS`:
+
+| | on (MoltenVK default) | off |
+|---|---|---|
+| 1080p native | 80.9, 81.1, 82.6 | 94.0 |
+| 1440p native (live) | 58.6, 58.7 | 66.2, 65.9 |
+| 1080p FSR 3.1 Quality | 92.6 | 107.1 |
+| 1080p MetalFX Quality | 91.8 | 106.2 |
+
+Capped at 60 (walk route, 2 runs each): late game frames 0.7–0.9 per 5 s (on) vs 1.0 (off), late
+display frames 6–8 vs 4–6: the same. Screenshots correct (native, FSR, MetalFX). 8 walks with it
+as the default: all clean. **Now the default** (`bbgpu_init`; the environment overrides). 1440p
+native is above 60 FPS uncapped for the first time.

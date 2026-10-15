@@ -266,11 +266,8 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 2. Performance
 
-- **MoltenVK argument buffers off (`MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0`; from the
-  Huax-1839 port, 2026-10-15).** Hunter's Dream 1080p native uncapped: 82.6 → 94.0 FPS, image
-  correct (FINDINGS "head to head"). *To do before making it the default in `bbgpu_init`:* 1440p
-  and the city, frame pacing (prefill), FSR/MetalFX, a 20-walk stability run.
-
+- **MoltenVK argument buffers off: done 2026-10-15** (default in `bbgpu_init`; +13–16% FPS
+  uncapped at 1080p/1440p, native/FSR/MetalFX; FINDINGS).
 - **Native Metal back end (plan stage 3; user priority, 2026-10-15).** *Now:* the arm64 GPU host
   renders through MoltenVK. *Refinement:* a Metal back end in the host behind the renderer
   (pipelines, resource binding, render passes, textures, buffers, sync), keeping the shadPS4

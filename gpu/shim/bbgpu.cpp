@@ -245,6 +245,12 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     if (const char* prefill = std::getenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS")) {
         std::printf("MoltenVK: prefilled command buffers %s\n", prefill);
     }
+    // Push descriptors bound directly instead of through Metal argument buffers: +13-16% FPS
+    // uncapped at 1080p/1440p, native, FSR and MetalFX, same pacing at 60 (FINDINGS "argument
+    // buffers"; the tip came from Huax-1839/bloodborne-macos). The environment overrides.
+    setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
+    std::printf("MoltenVK: Metal argument buffers %s\n",
+                std::getenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS"));
 #endif
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();
