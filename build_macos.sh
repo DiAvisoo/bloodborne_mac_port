@@ -110,4 +110,12 @@ if [[ ${1:-} == --test ]]; then
             -Wl,-rpath,"$ROOT/${walker#*:}" -o "out/srt-walker-test-${walker%%:*}"
         "out/srt-walker-test-${walker%%:*}"
     done
+    # Metal back end M0: our Metal encoders between MoltenVK command buffers (arm64, no window).
+    if [[ -f $ARM64_PREFIX/lib/libMoltenVK.dylib ]]; then
+        /usr/bin/clang++ -arch arm64 -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -std=c++20 -fobjc-arc -O2 -g \
+            -Wall -Wextra -Werror -Wno-missing-field-initializers -I"$ARM64_PREFIX/include" tests/test_metal_interop.mm -L"$ARM64_PREFIX/lib" \
+            -lMoltenVK -Wl,-rpath,"$ARM64_PREFIX/lib" -framework Metal -framework Foundation -o out/metal-interop-test
+        out/metal-interop-test
+        MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=2 out/metal-interop-test
+    fi
 fi
