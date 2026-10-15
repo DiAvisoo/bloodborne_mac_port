@@ -743,3 +743,26 @@ Reading:
 - **Estimate**: removing the idle stalls and merging the needless passes (~1–2 ms) takes 1440p
   from ~17.7 ms to ~13–14 ms per frame (~72–77 FPS uncapped; 60 locked with headroom), and
   1080p from ~13.7 to ~10–11 ms. Fragment shading itself does not change.
+
+## 2026-10-15: head to head with Huax-1839/bloodborne-macos (direct Metal renderer)
+
+Their port (GPL-2.0, single x86-64 process under Rosetta, a ~20k-line Metal back end, default on
+macOS 15+) built here at ee3120a (one local change: two macOS 27 SDK lines guarded for the 26.5
+SDK, frame interpolation only). Same protocol for both (`cmp.sh`): the same test save (Hunter's
+Dream headstone), 1920x1080 native, upscaler off, uncapped (`BB_PRESENT_MODE=Immediate
+BB_FPS_LIMIT=0`), title + 30 s, Cross twice, mean of the last six 5-s windows after 75 s in game,
+warm shader caches, runs interleaved. Screenshots: same scene, same image.
+
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| **Ours** (split mode, MoltenVK, prefill) | 80.9 | 81.1 | 82.6 |
+| Theirs, Metal | 53.1 | 52.7 | |
+| Theirs, Vulkan (MoltenVK) | 44.4 | 44.4 | |
+| Ours, `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0` | 94.0 | | |
+
+- Ours is ~53% faster than their Metal renderer and ~83% faster than their MoltenVK path here.
+  Their shaders keep `NoContraction` on every float op and compile with `MTLMathModeSafe` (the
+  cost we removed on 2026-10-13), and their renderer runs translated in the game process.
+- **Their MoltenVK tip works for us too:** argument buffers off gave 82.6 → 94.0 FPS (+14%),
+  image correct. Not yet the default (Backlog: check 1440p, the city, pacing and the
+  menus/upscalers first).
