@@ -40,6 +40,9 @@
 #include <system_error>
 #include <vector>
 #include <vk_mem_alloc.h>
+#ifdef BB_METAL_BACKEND
+#include "video_core/renderer_metal/mtl_vk_layer.h"
+#endif
 
 namespace Vulkan {
 
@@ -625,6 +628,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
     const vk::Image swapchain_image = swapchain.Image();
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
+#ifdef BB_METAL_BACKEND
+    // bbport: Metal back end step B (BB_METAL_PRESENT=1): this pass is encoded in Metal, except
+    // when the overlay draws (ImGui still records Vulkan).
+    if (MetalLayer::PresentEnabled() && !BbOverlay::Visible()) {
+        MetalLayer::Own(static_cast<VkCommandBuffer>(cmdbuf));
+    }
+#endif
 
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{

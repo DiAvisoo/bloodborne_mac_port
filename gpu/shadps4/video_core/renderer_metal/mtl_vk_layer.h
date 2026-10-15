@@ -10,7 +10,17 @@
 namespace MetalLayer {
 
 /// `dispatcher`: VULKAN_HPP_DEFAULT_DISPATCHER, right after its init(device). Installs only when
-/// BB_METAL_TRACE=1 or the Metal path is on; otherwise the dispatcher is left untouched.
+/// BB_METAL_TRACE=1 or a Metal path is on (BB_METAL_PRESENT=1); otherwise it stays untouched.
 void Install(void* dispatcher);
+
+/// The device and queue (handles as void*: VkDevice, VkQueue) whose Metal objects the layer uses.
+void SetDevice(void* device, void* queue);
+
+/// Step B (BB_METAL_PRESENT=1): the presenter's command buffer is encoded in Metal.
+bool PresentEnabled();
+
+/// From now until it is submitted, `command_buffer` (a VkCommandBuffer, already begun) is encoded
+/// by the Metal path; its commands do not reach MoltenVK.
+void Own(void* command_buffer);
 
 } // namespace MetalLayer

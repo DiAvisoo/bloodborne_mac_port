@@ -653,6 +653,9 @@ bool Instance::CreateDevice() {
 #endif
 
     graphics_queue = device->getQueue(queue_family_index, 0);
+#ifdef BB_METAL_BACKEND
+    MetalLayer::SetDevice(static_cast<VkDevice>(*device), static_cast<VkQueue>(graphics_queue));
+#endif
     present_queue = device->getQueue(queue_family_index, 0);
 
     if (calibrated_timestamps) {

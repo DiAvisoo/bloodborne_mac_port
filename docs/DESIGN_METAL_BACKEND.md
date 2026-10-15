@@ -109,6 +109,16 @@ which is not where the time goes. So, in stages:
   binds, push-descriptor sets and push constants (one per draw or dispatch, never deduplicated),
   ~160 render passes, ~157 buffer copies, ~206 `vkCmdPipelineBarrier2`, ~88 dispatches, ~10
   dynamic-state calls per 6 draws, 4 command buffers and 3 submits.
+  *Step B (2026-10-16): the first command buffer encoded in Metal.* `BB_METAL_PRESENT=1`: the
+  presenter's command buffer is owned by the Metal path (`MetalLayer::Own`); its barriers need
+  nothing (tracked resources), `vkCmdClearColorImage` is a render pass with a clear load action,
+  `vkCmdBlitImage` (scaled, linear) a fullscreen triangle sampling the source (Metal's blit encoder
+  neither scales nor filters). At the submit our command buffer is committed on MoltenVK's queue
+  before MoltenVK gets the submit (its copy is empty; semaphores are queue order in MoltenVK).
+  16,000+ frames presented through it, 5 commands each, 95.1 FPS (95.0 through MoltenVK), image
+  correct. With the overlay showing, the pass stays on MoltenVK (ImGui records Vulkan).
+  *Next:* step C, the frame's commands: bound pipelines (from the shadow builder), push
+  descriptors and push constants to our slots, render passes, draws, dispatches, copies.
 - **M3, pass merging:** load/store actions from what we know is read later; merge passes split by
   copies/uploads; one compute encoder for consecutive dispatches.
 - **M4, tessellation:** Metal tessellation (control stage as a compute kernel, post-tessellation
