@@ -15,6 +15,9 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
+#ifdef BB_METAL_BACKEND
+#include "video_core/renderer_metal/mtl_vk_layer.h"
+#endif
 
 namespace Vulkan {
 
@@ -644,6 +647,10 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+#ifdef BB_METAL_BACKEND
+    // bbport: the Metal back end's layer over the command functions (renderer_metal/mtl_vk_layer.h).
+    MetalLayer::Install(&VULKAN_HPP_DEFAULT_DISPATCHER);
+#endif
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);

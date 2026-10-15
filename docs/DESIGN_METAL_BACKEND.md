@@ -93,6 +93,22 @@ which is not where the time goes. So, in stages:
 - **M2, draws and dispatches:** graphics draws, compute dispatches, copies and clears of the main
   frame through Metal encoders, our own render-pass boundaries; barriers become our fences.
   Correctness by screenshots on the test routes; then speed.
+  *Design (2026-10-15): a command layer.* The renderer records every GPU command as a
+  `vk::CommandBuffer` call through vulkan.hpp's dynamic dispatcher (`VULKAN_HPP_DEFAULT_DISPATCHER`,
+  filled in `Instance::CreateDevice`). `renderer_metal/mtl_vk_layer.mm` replaces the ~45
+  command-buffer and submission functions in it (77 names with extension aliases). For a command
+  buffer the Metal path owns, they encode Metal themselves (pipelines from the shadow builder,
+  textures and buffers exported from MoltenVK's objects, samplers made from their create infos);
+  for every other command buffer they forward to MoltenVK. The renderer stays unchanged, the two
+  paths compare image for image, and command buffers move over one kind at a time: the present
+  pass (its own command buffer), compute-only work, then the frame. Submission: a submit with
+  Metal-owned command buffers is split so MoltenVK's waits come before our command buffer and its
+  signals after.
+  *Step A (2026-10-15):* the layer forwards and counts (`BB_METAL_TRACE=1`): no cost (95.6 FPS).
+  Hunter's Dream, 1080p native, ~95 FPS, per frame: ~820 draws (430 indexed), ~910 pipeline
+  binds, push-descriptor sets and push constants (one per draw or dispatch, never deduplicated),
+  ~160 render passes, ~157 buffer copies, ~206 `vkCmdPipelineBarrier2`, ~88 dispatches, ~10
+  dynamic-state calls per 6 draws, 4 command buffers and 3 submits.
 - **M3, pass merging:** load/store actions from what we know is read later; merge passes split by
   copies/uploads; one compute encoder for consecutive dispatches.
 - **M4, tessellation:** Metal tessellation (control stage as a compute kernel, post-tessellation
