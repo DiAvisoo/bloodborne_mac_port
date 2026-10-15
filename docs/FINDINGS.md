@@ -782,3 +782,20 @@ Capped at 60 (walk route, 2 runs each): late game frames 0.7–0.9 per 5 s (on) 
 display frames 6–8 vs 4–6: the same. Screenshots correct (native, FSR, MetalFX). 8 walks with it
 as the default: all clean. **Now the default** (`bbgpu_init`; the environment overrides). 1440p
 native is above 60 FPS uncapped for the first time.
+
+### Head to head with DiAvisoo/bbport-mac-optimized v0.1.0 (2026-10-15 night)
+
+A fork of bmy/bbport-mac (`macos-native-0.5`: KosmicKrisp, native arm64 GPU process), released as
+"M2 optimised" (tested on an M2 Max: 50–60 FPS at 1080p, 30–40 at 32:9). Their release app's engine
+run headless with their launcher's profile (`BB_NATIVE_GPU=1 BB_SKIP_EMPTY_DRAWS=1
+BB_VK_RECORD_THREADS=1 BB_FRAMES_AHEAD=2 BB_GPU_QOS=1 …`), isolated data folder, same protocol and
+save as the Huax-1839 comparison (1080p native, upscaler off, uncapped, alternating):
+
+| | Run 1 | Run 2 |
+|---|---|---|
+| **Ours** (mac-v0.3.3 code) | 94.2 | 94.4 |
+| DiAvisoo v0.1.0 | 73.3 | 74.4 |
+
+Ours ~28% faster on the M4 Max; same scene, both 1920x1080, image correct in both. Their ~74 here is
+consistent with their 50–60 on an M2 Max, which suggests ours would do ~65–75 there, and that issue
+#2's 2–3 FPS on an M2 Max is a bug in ours, not the hardware.
