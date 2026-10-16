@@ -11,6 +11,7 @@
 #include <vector>
 #include "video_core/renderer_metal/mtl_object.h"
 #include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_encoder.h"
 
 #include <csetjmp>
 
@@ -93,12 +94,119 @@ void TestTicks() {
     Expect(device.ErrorCount() == 0, "no command buffer failed");
 }
 
+id<MTLBuffer> SharedBuffer(Metal::Device& device, NSUInteger length) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    id<MTLBuffer> buffer = [dev newBufferWithLength:length options:MTLResourceStorageModeShared];
+    std::memset(buffer.contents, 0, length);
+    return buffer;
+}
+
+Metal::BufferRef Ref(id<MTLBuffer> buffer, u64 offset = 0) {
+    return {(__bridge void*)buffer, offset};
+}
+
+id<MTLTexture> Texture(Metal::Device& device, u32 width, u32 height) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    MTLTextureDescriptor* desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModePrivate;
+    return [dev newTextureWithDescriptor:desc];
+}
+
+[[maybe_unused]] u32 Pixel(id<MTLBuffer> readback, u32 width, u32 x, u32 y) {
+    u32 value;
+    std::memcpy(&value, static_cast<const u8*>(readback.contents) + (y * width + x) * 4, 4);
+    return value;
+}
+
+void TestBlits() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLBuffer> src = SharedBuffer(device, 256);
+    id<MTLBuffer> dst = SharedBuffer(device, 256);
+    for (u32 i = 0; i < 256; ++i) {
+        static_cast<u8*>(src.contents)[i] = u8(i);
+    }
+    encoder.FillBuffer(Ref(dst), 64, 0x7f7f7f7fu);
+    encoder.CopyBuffer(Ref(src, 16), Ref(dst, 128), 32);
+    // Buffer -> texture -> texture -> buffer round trip, 4x4 RGBA8.
+    id<MTLTexture> a = Texture(device, 4, 4);
+    id<MTLTexture> b = Texture(device, 4, 4);
+    id<MTLBuffer> pixels = SharedBuffer(device, 64);
+    for (u32 i = 0; i < 64; ++i) {
+        static_cast<u8*>(pixels.contents)[i] = u8(200 - i);
+    }
+    id<MTLBuffer> back = SharedBuffer(device, 64);
+    encoder.CopyBufferToTexture(Ref(pixels), 16, 64, (__bridge void*)a, 0, 0, {}, {4, 4, 1});
+    encoder.CopyTexture((__bridge void*)a, 0, 0, {}, (__bridge void*)b, 0, 0, {}, {4, 4, 1});
+    encoder.CopyTextureToBuffer((__bridge void*)b, 0, 0, {}, {4, 4, 1}, Ref(back), 16, 64);
+    const u64 tick = encoder.Submit();
+    device.Wait(tick);
+
+    const u8* d = static_cast<const u8*>(dst.contents);
+    bool filled = true, copied = true;
+    for (u32 i = 0; i < 64; ++i) {
+        filled &= d[i] == 0x7f;
+    }
+    for (u32 i = 0; i < 32; ++i) {
+        copied &= d[128 + i] == u8(16 + i);
+    }
+    Expect(filled, "FillBuffer fills the range");
+    Expect(copied && d[127] == 0 && d[160] == 0, "CopyBuffer copies exactly the range");
+    Expect(std::memcmp(pixels.contents, back.contents, 64) == 0,
+           "buffer -> texture -> texture -> buffer keeps the bytes");
+    Expect(device.ErrorCount() == 0, "blits ran without errors");
+}
+
+void TestKeepAlive() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    @autoreleasepool {
+        encoder.KeepAlive(Metal::Object::Adopt((__bridge_retained void*)[Probe new]));
+    }
+    Expect(probes_alive == 1, "KeepAlive holds the object while recording");
+    const u64 empty = encoder.Submit(); // nothing recorded: still a tick that completes
+    device.Wait(empty);
+    for (int i = 0; i < 100 && probes_alive != 0; ++i) {
+        [NSThread sleepForTimeInterval:0.01]; // the completion handler may run just after the event
+    }
+    Expect(probes_alive == 0, "KeepAlive releases the object once the GPU is done");
+    Expect(encoder.Submit() == empty + 1, "every Submit takes the next tick");
+}
+
+
+/// Completion handlers must never write into a Device that is gone: a new Device (often at the
+/// same address) must start with no known GPU work.
+void TestDeviceLifetime() {
+    bool clean = true;
+    for (int round = 0; round < 50 && clean; ++round) {
+        {
+            Metal::Device old;
+            id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)old.NativeQueue();
+            for (int i = 0; i < 4; ++i) {
+                old.Commit((__bridge void*)[queue commandBuffer]);
+            }
+        }
+        Metal::Device fresh;
+        [NSThread sleepForTimeInterval:0.002]; // let late handlers of `old` run
+        clean = fresh.KnownGpuTick() == 0 && !fresh.IsFree(1);
+    }
+    Expect(clean, "a destroyed Device's completion handlers do not touch a new Device");
+}
+
 } // namespace
 
 int main() {
     @autoreleasepool {
         TestObject();
         TestTicks();
+        TestDeviceLifetime();
+        TestBlits();
+        TestKeepAlive();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);
