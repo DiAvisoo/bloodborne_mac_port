@@ -279,15 +279,22 @@ private:
 };
 
 /// SPIR-V -> MSL; fills the binding map, the flags and the entry name of `out` (not the Metal
-/// objects). Throws spirv_cross::CompilerError, or std::runtime_error for a resource limit.
+/// objects). The entry point is renamed `entry_name`. Throws spirv_cross::CompilerError, or
+/// std::runtime_error for a resource limit.
 std::string Convert(std::span<const u32> spirv, const SpirvScan& scan,
-                    const CompileVariant& variant, CompiledShader& out) {
+                    const CompileVariant& variant, const std::string& entry_name,
+                    CompiledShader& out) {
     TessCompilerMSL comp(spirv.data(), spirv.size());
     const auto entry_points = comp.get_entry_points_and_stages();
     if (entry_points.empty()) {
         throw std::runtime_error("no entry point");
     }
     const auto model = entry_points[0].execution_model;
+    // bbport: one function name per shader, not SPIRV-Cross' `main0` for all. Shaders with
+    // different guest hashes but the same SPIR-V would otherwise be identical functions in
+    // separate libraries, and the binary archive cannot be serialized once it holds both
+    // ("missing 'vertex' stage in pipeline no. N"; tests/test_mtl_archive.mm, case k).
+    comp.rename_entry_point(entry_points[0].name, entry_name, model);
 
     const sc::ShaderResources res = comp.get_shader_resources();
     out.uses_push_constants = !res.push_constant_buffers.empty();
@@ -485,7 +492,7 @@ std::string Convert(std::span<const u32> spirv, const SpirvScan& scan,
 
     std::string msl = comp.compile();
 
-    out.entry = comp.get_cleansed_entry_point_name(entry_points[0].name, model);
+    out.entry = comp.get_cleansed_entry_point_name(entry_name, model);
     out.num_buffers = next_buffer;
     out.num_textures = next_texture;
     out.num_samplers = next_sampler;
@@ -1074,7 +1081,11 @@ CompileResult ShaderCompiler::Compile(std::span<const u32> spirv, u64 hash, std:
             module = rewritten.spirv;
         }
         try {
-            msl = Convert(module, scan, variant, *shader);
+            // Unique per MSL cache file: the binary archive must never see the same function
+            // in two libraries (Convert).
+            const std::string entry_name =
+                fmt::format("{}{}_{:016x}_{:016x}", stage_name, tag, hash, spirv_hash);
+            msl = Convert(module, scan, variant, entry_name, *shader);
         } catch (const std::exception& e) {
             return fail(CompileStatus::Failed, "SPIRV-Cross: " + FirstLine(e.what()));
         }

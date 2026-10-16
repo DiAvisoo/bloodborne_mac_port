@@ -66,7 +66,7 @@ constexpr u32 kTessFirstReservedBuffer = 13;
 constexpr u32 kMaxTextures = 128;
 constexpr u32 kMaxSamplers = 16;
 /// Bump when the MSL options or the slot assignment change: it is part of the disk cache key.
-constexpr u32 kMslCacheVersion = 4; // 4: 1D textures as 2D (bbport) // 3: stage input / export output layouts in the file (P7.1)
+constexpr u32 kMslCacheVersion = 5; // 5: entry point named per shader, not main0 (binary archive) // 4: 1D textures as 2D (bbport) // 3: stage input / export output layouts in the file (P7.1)
 /// (The variants have their own cache files.)
 
 /// Where the vertex buffer of one attribute goes. The layout stride is dynamic
@@ -156,7 +156,7 @@ struct CompiledShader {
     void* function{};
 
     ShaderStage stage{ShaderStage::Unknown};
-    std::string entry; ///< MSL function name ("main" becomes "main0")
+    std::string entry; ///< MSL function name (<stage><variant tag>_<hash>_<SPIR-V hash>)
     /// The push constants entry first, then sorted by (set, binding, kind). A combined image sampler yields a Texture and a Sampler
     /// entry with the same (set, binding). Several SPIR-V variables aliasing one (set, binding)
     /// (the recompiler's U8/U16/U32/U64/F32 views of one buffer) share one entry.

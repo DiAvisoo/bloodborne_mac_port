@@ -295,7 +295,7 @@ const ComputePipeline* PipelineFactory::BuildCompute(const Vulkan::ComputePipeli
 
 void PipelineFactory::Built() {
     if ((built.fetch_add(1, std::memory_order_relaxed) + 1) % kFlushInterval == 0) {
-        psos.Flush();
+        psos.Flush(false); // skipped while a write runs or right after one
     }
 }
 

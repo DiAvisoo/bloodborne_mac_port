@@ -147,6 +147,12 @@ if [[ ${1:-} == --test ]]; then
         out/mtl-present-test
         MTL_DEBUG_LAYER=1 out/mtl-present-test
     fi
+    # Metal-native M4: what an MTLBinaryArchive can serialize (pure Metal), plain and under
+    # validation.
+    /usr/bin/clang++ -arch arm64 -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -std=c++20 -fobjc-arc -O2 -g \
+        -Wall -Wextra -Werror tests/test_mtl_archive.mm -framework Metal -framework Foundation -o out/mtl-archive-test
+    out/mtl-archive-test
+    MTL_DEBUG_LAYER=1 out/mtl-archive-test
     # Metal-native M3: scene targets (scaled copies, depth resample, stencil export) through the
     # linked arm64 library; again writing stencil one bit at a time.
     if [[ -f out/gpu-arm64/libbbgpu.dylib ]]; then

@@ -112,7 +112,8 @@ private:
                                   std::span<const VertexAttribute> attributes);
     GraphicsPsos GeometryPsos(const Vulkan::GraphicsPipelineKey& key, StageModules modules,
                               std::span<const VertexAttribute> attributes);
-    /// Writes the binary archive every kFlushInterval new pipelines (a crash keeps most of it).
+    /// Writes the binary archive every kFlushInterval new pipelines, at most every 10 s (a crash
+    /// keeps most of it).
     void Built();
 
     static constexpr u32 kFlushInterval = 32;

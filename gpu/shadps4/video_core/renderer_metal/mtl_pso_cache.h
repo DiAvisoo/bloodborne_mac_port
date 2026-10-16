@@ -227,10 +227,14 @@ public:
                                                 const GeometryPipelineInput& input,
                                                 const CompiledShader* fs);
 
-    /// Writes the binary archive when pipelines were added since the last write (atomically:
-    /// temp file + rename). Cheap to call when nothing changed; call it every few new pipelines
-    /// and at shutdown (the destructor does).
-    bool Flush();
+    /// Writes the binary archive when pipelines were compiled since the last write: a fresh
+    /// archive of every pipeline this session created or took from the archive (Metal cannot
+    /// serialize one archive again after additions that reuse its functions), atomically (temp
+    /// file + rename). Pipelines of the old file this session never used are left out. Cheap to
+    /// call when nothing changed; call it every few new pipelines, off the recording thread, and
+    /// at shutdown (the destructor does). `wait` false (the periodic writes): skipped (true)
+    /// while another write runs or within 10 s of the last one.
+    bool Flush(bool wait = true);
 
     struct Counters {
         std::atomic<u64> render_pipelines{};   ///< distinct render pipelines built (incl. failed)
@@ -239,7 +243,8 @@ public:
         std::atomic<u64> geometry_pipelines{};     ///< distinct geometry pipelines built (incl. failed)
         std::atomic<u64> failures{};           ///< render + compute builds that failed
         std::atomic<u64> archive_hits{};       ///< pipelines taken from the binary archive
-        std::atomic<u64> archive_adds{};
+        std::atomic<u64> archive_adds{};       ///< pipelines compiled (not from the archive)
+        std::atomic<u64> archive_write_failures{}; ///< Flush calls that could not write the archive
         /// Microseconds spent in the Metal pipeline-state calls.
         std::atomic<u64> render_us{};
         std::atomic<u64> compute_us{};

@@ -150,10 +150,17 @@ struct PsoCache::Impl {
     std::mutex debug_mutex; ///< BB_GS_DEBUG: the magenta fragment functions by source
     std::map<std::string, std::unique_ptr<CompiledShader>> debug_fragments;
 
-    std::mutex archive_mutex; ///< MTLBinaryArchive is not documented as thread-safe
-    id<MTLBinaryArchive> archive; ///< nil: none (yet / any more)
-    bool archive_dirty{};
-    bool archive_error_logged{};
+    // The binary archive. Metal cannot serialize an archive again once pipelines that reuse its
+    // functions were added after a serialization (tests/test_mtl_archive.mm, cases k and l), so
+    // the archive in use is only looked up, and every Flush writes a fresh archive built from the
+    // descriptors of all pipelines this session created or took from the archive.
+    id<MTLBinaryArchive> archive; ///< the archive loaded at startup (or an empty one); nil: none
+    std::mutex archive_mutex;     ///< guards `recorded` and `unwritten`
+    NSMutableArray* recorded = [NSMutableArray array]; ///< one descriptor per PSO key and stage
+    u64 unwritten{};              ///< pipelines compiled since the last successful write
+    std::mutex flush_mutex;       ///< one Flush at a time (it runs on the creation threads)
+    bool archive_error_logged{};  ///< guarded by flush_mutex
+    std::chrono::steady_clock::time_point last_write{}; ///< guarded by flush_mutex
 };
 
 RenderPipeline::~RenderPipeline() {
@@ -227,76 +234,123 @@ PsoCache::~PsoCache() {
     Flush();
 }
 
-bool PsoCache::Flush() {
-    std::scoped_lock lock{impl->archive_mutex};
-    if (!impl->archive || !impl->archive_dirty) {
+bool PsoCache::Flush(bool wait) {
+    // A write costs ~2.5 ms per pipeline (all of them, every time): a periodic Flush (`wait`
+    // false) skips while another one runs or when the last write is recent.
+    constexpr auto kMinPeriodicInterval = std::chrono::seconds{10};
+    std::unique_lock flush_lock{impl->flush_mutex, std::defer_lock};
+    if (wait) {
+        flush_lock.lock();
+    } else if (!flush_lock.try_lock() ||
+               std::chrono::steady_clock::now() - impl->last_write < kMinPeriodicInterval) {
         return true;
     }
-    @autoreleasepool {
-        std::error_code ec;
-        const std::filesystem::path temp = archive_path.string() + ".tmp";
-        std::filesystem::remove(temp, ec);
-        NSError* error = nil;
-        const BOOL ok = [impl->archive
-            serializeToURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:temp.c_str()]]
-                     error:&error];
-        if (ok) {
-            std::filesystem::rename(temp, archive_path, ec);
+    NSArray* descriptors = nil;
+    u64 unwritten = 0;
+    {
+        std::scoped_lock lock{impl->archive_mutex};
+        if (!impl->archive || impl->unwritten == 0) {
+            return true;
         }
-        if (!ok || ec) {
-            if (!impl->archive_error_logged) {
-                impl->archive_error_logged = true;
-                LOG_WARNING(Render, "Metal binary archive {} could not be written: {}",
-                            archive_path.string(), ok ? ec.message() : FirstLine(error));
+        descriptors = [impl->recorded copy];
+        unwritten = impl->unwritten;
+    }
+    std::string error;
+    @autoreleasepool {
+        NSError* ns_error = nil;
+        id<MTLBinaryArchive> fresh =
+            [impl->mtl_device newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new]
+                                                       error:&ns_error];
+        if (!fresh) {
+            error = FirstLine(ns_error);
+        }
+        for (id descriptor in descriptors) {
+            if (!fresh) {
+                break;
             }
+            ns_error = nil;
+            const BOOL added =
+                [descriptor isKindOfClass:[MTLRenderPipelineDescriptor class]]
+                    ? [fresh addRenderPipelineFunctionsWithDescriptor:descriptor error:&ns_error]
+                    : [fresh addComputePipelineFunctionsWithDescriptor:descriptor error:&ns_error];
+            if (!added && !impl->archive_error_logged) {
+                impl->archive_error_logged = true;
+                LOG_WARNING(Render, "Metal binary archive: adding pipeline {} failed ({}), "
+                                    "leaving it out",
+                            [[descriptor label] UTF8String] ?: "?", FirstLine(ns_error));
+            }
+        }
+        if (fresh) {
+            std::error_code ec;
+            const std::filesystem::path temp = archive_path.string() + ".tmp";
             std::filesystem::remove(temp, ec);
-            return false;
+            ns_error = nil;
+            const BOOL ok = [fresh
+                serializeToURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:temp.c_str()]]
+                         error:&ns_error];
+            if (ok) {
+                std::filesystem::rename(temp, archive_path, ec);
+            }
+            if (!ok || ec) {
+                error = ok ? ec.message() : FirstLine(ns_error);
+                std::filesystem::remove(temp, ec);
+            }
         }
     }
-    impl->archive_dirty = false;
+    if (!error.empty()) {
+        ++counters.archive_write_failures;
+        LOG_WARNING(Render, "Metal binary archive {} could not be written: {}",
+                    archive_path.string(), error);
+        return false; // `unwritten` stays: the next Flush tries again
+    }
+    impl->last_write = std::chrono::steady_clock::now();
+    std::scoped_lock lock{impl->archive_mutex};
+    impl->unwritten -= unwritten;
     return true;
 }
 
 namespace {
 
-/// Makes `archive`'s handling of one descriptor uniform for render and compute: a lookup with
-/// FailOnBinaryArchiveMiss first (an archive hit skips the compiler), the regular creation
-/// otherwise, then the descriptor is added to the archive.
-template <typename Descriptor, typename Create, typename Add>
+/// Creates one pipeline state, from the loaded binary archive when it has it
+/// (FailOnBinaryArchiveMiss: an archive hit skips the compiler), else by compiling it. The
+/// descriptor goes to `record` (for the next archive write, RecordPipeline) either way.
+template <typename Descriptor, typename Create>
 id CreateWithArchive(PsoCache::Impl& impl, bool archive_loaded, Descriptor* descriptor,
-                     Create create, Add add, bool& from_archive, std::string& error) {
-    id<MTLBinaryArchive> archive = impl.archive;
+                     Create create, NSMutableArray* record, bool& from_archive,
+                     std::string& error) {
     from_archive = false;
     NSError* ns_error = nil;
-    if (archive) {
-        descriptor.binaryArchives = @[ archive ];
-        if (archive_loaded) {
-            id state = create(MTLPipelineOptionFailOnBinaryArchiveMiss, &ns_error);
-            if (state) {
-                from_archive = true;
-                return state;
-            }
-            ns_error = nil;
-        }
+    id state = nil;
+    if (impl.archive && archive_loaded) {
+        descriptor.binaryArchives = @[ impl.archive ];
+        state = create(MTLPipelineOptionFailOnBinaryArchiveMiss, &ns_error);
+        from_archive = state != nil;
+        ns_error = nil;
     }
-    id state = create(MTLPipelineOptionNone, &ns_error);
+    if (!state) {
+        state = create(MTLPipelineOptionNone, &ns_error);
+    }
+    descriptor.binaryArchives = nil;
     if (!state) {
         error = FirstLine(ns_error);
         return nil;
     }
-    if (archive) {
-        std::scoped_lock lock{impl.archive_mutex};
-        NSError* add_error = nil;
-        if (add(archive, descriptor, &add_error)) {
-            impl.archive_dirty = true;
-        } else if (!impl.archive_error_logged) {
-            impl.archive_error_logged = true;
-            LOG_WARNING(Render, "Metal binary archive: adding a pipeline failed ({}), continuing "
-                                "without further additions",
-                        FirstLine(add_error));
-        }
+    if (impl.archive) {
+        [record addObject:descriptor];
     }
     return state;
+}
+
+/// Keeps the descriptors of a pipeline new in the cache for the archive writes (called once per
+/// PSO key, so the list holds no duplicates); `compiled`: not all from the archive, so the
+/// archive file lacks it.
+void RecordPipeline(PsoCache::Impl& impl, NSArray* descriptors, bool compiled) {
+    if (!impl.archive || descriptors.count == 0) {
+        return;
+    }
+    std::scoped_lock lock{impl.archive_mutex};
+    [impl.recorded addObjectsFromArray:descriptors];
+    impl.unwritten += compiled;
 }
 
 } // namespace
@@ -332,6 +386,7 @@ const RenderPipeline* PsoCache::GetRenderPipeline(const Vulkan::GraphicsPipeline
     std::string error;
     bool from_archive = false;
     u64 elapsed_us = 0;
+    NSMutableArray* record = [NSMutableArray array]; ///< the descriptors for the archive
     @autoreleasepool {
         do {
             // ---- primitive and encoder state ----
@@ -536,10 +591,7 @@ const RenderPipeline* PsoCache::GetRenderPipeline(const Vulkan::GraphicsPipeline
                                                                        reflection:nil
                                                                             error:err];
                 },
-                [](id<MTLBinaryArchive> archive, MTLRenderPipelineDescriptor* d, NSError** err) {
-                    return [archive addRenderPipelineFunctionsWithDescriptor:d error:err];
-                },
-                from_archive, error);
+                record, from_archive, error);
             elapsed_us = UsSince(start);
             if (!state) {
                 break;
@@ -572,6 +624,9 @@ const RenderPipeline* PsoCache::GetRenderPipeline(const Vulkan::GraphicsPipeline
 
     std::unique_lock lock{impl->mutex};
     const auto [it, inserted] = impl->render.try_emplace(map_key, std::move(pipeline));
+    if (inserted && it->second->state) {
+        RecordPipeline(*impl, record, !from_archive);
+    }
     if (!inserted) {
         --counters.render_pipelines; // another thread built it first; this one is dropped
         if (!it->second->state) {
@@ -600,6 +655,7 @@ const ComputePipeline* PsoCache::GetComputePipeline(const Vulkan::ComputePipelin
     std::string error;
     bool from_archive = false;
     u64 elapsed_us = 0;
+    NSMutableArray* record = [NSMutableArray array]; ///< the descriptors for the archive
     @autoreleasepool {
         do {
             const u32 total = cs->local_size[0] * cs->local_size[1] * cs->local_size[2];
@@ -622,10 +678,7 @@ const ComputePipeline* PsoCache::GetComputePipeline(const Vulkan::ComputePipelin
                                                                         reflection:nil
                                                                              error:err];
                 },
-                [](id<MTLBinaryArchive> archive, MTLComputePipelineDescriptor* d, NSError** err) {
-                    return [archive addComputePipelineFunctionsWithDescriptor:d error:err];
-                },
-                from_archive, error);
+                record, from_archive, error);
             elapsed_us = UsSince(start);
             if (!state) {
                 break;
@@ -656,6 +709,9 @@ const ComputePipeline* PsoCache::GetComputePipeline(const Vulkan::ComputePipelin
 
     std::unique_lock lock{impl->mutex};
     const auto [it, inserted] = impl->compute.try_emplace(map_key, std::move(pipeline));
+    if (inserted && it->second->state) {
+        RecordPipeline(*impl, record, !from_archive);
+    }
     if (!inserted) {
         --counters.compute_pipelines;
         if (!it->second->state) {
@@ -671,7 +727,8 @@ namespace {
 /// kernel's attributes. False with `error` set.
 bool MakeKernel(PsoCache::Impl& impl, bool archive_loaded, TessKernel& kernel,
                 const CompiledShader& shader, NSString* label,
-                MTLStageInputOutputDescriptor* stage_in, bool& from_archive, std::string& error) {
+                MTLStageInputOutputDescriptor* stage_in, NSMutableArray* record,
+                bool& from_archive, std::string& error) {
     kernel.shader = &shader;
     kernel.function = (__bridge_retained void*)(__bridge id)shader.function;
     MTLComputePipelineDescriptor* desc = [MTLComputePipelineDescriptor new];
@@ -687,10 +744,7 @@ bool MakeKernel(PsoCache::Impl& impl, bool archive_loaded, TessKernel& kernel,
                                                                reflection:nil
                                                                     error:err];
         },
-        [](id<MTLBinaryArchive> archive, MTLComputePipelineDescriptor* d, NSError** err) {
-            return [archive addComputePipelineFunctionsWithDescriptor:d error:err];
-        },
-        archived, error);
+        record, archived, error);
     from_archive = from_archive && archived;
     if (!state) {
         return false;
@@ -789,6 +843,7 @@ const TessellationPipeline* PsoCache::GetTessellationPipeline(
     std::string error;
     bool from_archive = true;
     u64 elapsed_us = 0;
+    NSMutableArray* record = [NSMutableArray array]; ///< the kernels' descriptors for the archive
     @autoreleasepool {
         do {
             const CompiledShader& tcs = *input.control;
@@ -857,7 +912,7 @@ const TessellationPipeline* PsoCache::GetTessellationPipeline(
                                      index_type];
                 if (!MakeKernel(*impl, archive_loaded, pipeline->vertex[index_type],
                                 *input.vertex[index_type], label, stage_in[index_type],
-                                from_archive, error)) {
+                                record, from_archive, error)) {
                     break;
                 }
             }
@@ -867,7 +922,7 @@ const TessellationPipeline* PsoCache::GetTessellationPipeline(
             NSString* label = [NSString
                 stringWithFormat:@"tess hs %#llx",
                                  (unsigned long long)key.stage_hashes[u32(Shader::SwStage::TessellationControl)]];
-            if (!MakeKernel(*impl, archive_loaded, pipeline->control, tcs, label, nil,
+            if (!MakeKernel(*impl, archive_loaded, pipeline->control, tcs, label, nil, record,
                             from_archive, error)) {
                 break;
             }
@@ -886,6 +941,9 @@ const TessellationPipeline* PsoCache::GetTessellationPipeline(
 
     std::unique_lock lock{impl->mutex};
     const auto [it, inserted] = impl->tessellation.try_emplace(map_key, std::move(pipeline));
+    if (inserted && it->second->render) {
+        RecordPipeline(*impl, record, !from_archive); // the kernels; the render part records itself
+    }
     if (!inserted) {
         --counters.tessellation_pipelines; // another thread built it first; this one is dropped
         if (!it->second->render) {
@@ -988,6 +1046,7 @@ const GeometryPipeline* PsoCache::GetGeometryPipeline(const Vulkan::GraphicsPipe
     std::string error;
     bool from_archive = true;
     u64 elapsed_us = 0;
+    NSMutableArray* record = [NSMutableArray array]; ///< the kernels' descriptors for the archive
     @autoreleasepool {
         do {
             const CompiledShader& gs = *input.gs;
@@ -1030,8 +1089,8 @@ const GeometryPipeline* PsoCache::GetGeometryPipeline(const Vulkan::GraphicsPipe
                                      (unsigned long long)key.stage_hashes[u32(Shader::SwStage::Vertex)],
                                      index_type];
                 if (!MakeKernel(*impl, archive_loaded, pipeline->es[index_type],
-                                *input.es[index_type], label, stage_in[index_type], from_archive,
-                                error)) {
+                                *input.es[index_type], label, stage_in[index_type], record,
+                                from_archive, error)) {
                     break;
                 }
             }
@@ -1041,8 +1100,8 @@ const GeometryPipeline* PsoCache::GetGeometryPipeline(const Vulkan::GraphicsPipe
             NSString* label = [NSString
                 stringWithFormat:@"gs %#llx",
                                  (unsigned long long)key.stage_hashes[u32(Shader::SwStage::Geometry)]];
-            if (!MakeKernel(*impl, archive_loaded, pipeline->gs, gs, label, nil, from_archive,
-                            error)) {
+            if (!MakeKernel(*impl, archive_loaded, pipeline->gs, gs, label, nil, record,
+                            from_archive, error)) {
                 break;
             }
             elapsed_us = UsSince(start);
@@ -1060,6 +1119,9 @@ const GeometryPipeline* PsoCache::GetGeometryPipeline(const Vulkan::GraphicsPipe
 
     std::unique_lock lock{impl->mutex};
     const auto [it, inserted] = impl->geometry.try_emplace(map_key, std::move(pipeline));
+    if (inserted && it->second->render) {
+        RecordPipeline(*impl, record, !from_archive); // the kernels; the render part records itself
+    }
     if (!inserted) {
         --counters.geometry_pipelines; // another thread built it first; this one is dropped
         if (!it->second->render) {

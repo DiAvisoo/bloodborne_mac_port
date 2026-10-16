@@ -2,8 +2,9 @@
 // bbport: the pipeline check of the Metal-native renderer: every pipeline of a stored pipeline
 // cache (<user>/cache/<title>/: PipelineKey, shader metadata and SPIR-V blobs) built through the
 // pipeline cache the renderer uses (Vulkan::PipelineCache -> Metal::PipelineFactory), graphics and
-// compute. Reads the cache only; the MSL cache and binary archive go to a scratch directory.
-// `bbgpu-host --msl-check <cache dir> [msl-cache-dir]`.
+// compute. Reads the cache only; the MSL cache and binary archive go to a scratch directory,
+// emptied first (BB_MSL_CHECK_KEEP=1 keeps it: a second run then takes the pipelines from the
+// binary archive). `bbgpu-host --msl-check <cache dir> [msl-cache-dir]`.
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,7 @@
 #include "shader_recompiler/profile.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_pso_cache.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -83,13 +85,19 @@ extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir)
     const fs::path scratch = msl_cache_dir && *msl_cache_dir
                                  ? fs::path{msl_cache_dir}
                                  : fs::temp_directory_path() / "bb-msl-check";
-    fs::remove_all(scratch, ec); // measure real compiles, not cache hits
+    const char* keep = std::getenv("BB_MSL_CHECK_KEEP");
+    if (!keep || std::string_view{keep} != "1") {
+        fs::remove_all(scratch, ec); // measure real compiles, not cache hits
+    }
     fs::create_directories(scratch, ec);
 
     Storage::DataBase::Instance().OpenReadOnly(cache_dir);
     std::array<unsigned, NumKinds> built{}, failed{}, unsupported{};
     Vulkan::PipelineCache::StoredReport report{};
     unsigned printed = 0;
+    bool archive_loaded = false, archive_written = false;
+    u64 archive_hits = 0, archive_adds = 0, archive_write_failures = 0;
+    fs::path archive_path;
     const auto start = std::chrono::steady_clock::now();
     {
         Vulkan::Scheduler scheduler{device, false};
@@ -112,6 +120,13 @@ extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir)
                             pipeline.GetDebugString().c_str(), why.c_str());
             }
         });
+        Metal::PsoCache& psos = pipelines.Psos();
+        archive_written = psos.Flush();
+        archive_loaded = psos.ArchiveLoaded();
+        archive_hits = psos.GetCounters().archive_hits;
+        archive_adds = psos.GetCounters().archive_adds;
+        archive_write_failures = psos.GetCounters().archive_write_failures;
+        archive_path = psos.ArchivePath();
     } // the factory writes its binary archive into the scratch directory
     Storage::DataBase::Instance().Close();
     const double seconds =
@@ -134,6 +149,14 @@ extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir)
         total_failed += failed[k];
         total_unsupported += unsupported[k];
     }
+    const bool archive_exists = fs::exists(archive_path, ec);
+    std::printf("  binary archive %s: %s, %llu pipelines from it, %llu added, %s, %llu failed "
+                "writes\n",
+                archive_path.string().c_str(), archive_loaded ? "loaded" : "new",
+                static_cast<unsigned long long>(archive_hits),
+                static_cast<unsigned long long>(archive_adds),
+                archive_written && archive_exists ? "written" : "NOT WRITTEN",
+                static_cast<unsigned long long>(archive_write_failures));
     // At least 90% of the stored keys load; permutation conflicts (left to compile at runtime)
     // and duplicates (loaded once, as their twin) are not counted against it.
     const u32 loadable = report.keys - report.conflicts - report.duplicates;
@@ -143,7 +166,15 @@ extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir)
                     "conflicts and duplicates excluded)\n",
                     report.loaded, loadable);
     }
-    const bool pass = total_failed == 0 && enough_loaded;
+    // The pipelines must reach the binary archive, or every start compiles them again; every
+    // write (the factory flushes every few pipelines) must succeed.
+    const bool archive_ok = archive_written && archive_exists && archive_write_failures == 0;
+    if (!archive_ok) {
+        std::printf("MSL check: FAILED: the binary archive could not be written (%llu failed "
+                    "writes, see the Flush warning above)\n",
+                    static_cast<unsigned long long>(archive_write_failures));
+    }
+    const bool pass = total_failed == 0 && enough_loaded && archive_ok;
     std::printf("%s: MSL check, %u pipelines built, %u failed, %u unsupported in Metal (logged)\n",
                 pass ? "PASS" : "FAIL", total_built, total_failed, total_unsupported);
     return pass ? 0 : 1;
