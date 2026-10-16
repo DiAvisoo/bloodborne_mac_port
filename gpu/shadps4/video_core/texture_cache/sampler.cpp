@@ -34,13 +34,9 @@ Sampler::Sampler(Metal::Device& device, const AmdGpu::Sampler& sampler,
     const float max_anisotropy =
         anisotropy_enable ? std::clamp(sampler.MaxAniso(), 1.0f, limits.max_anisotropy) : 1.0f;
 
-    // Metal samplers have no LOD bias and no custom border colours.
+    // Metal has no custom border colours. The LOD bias needs macOS 26 (logged by the core).
     const float lod_bias = std::clamp(sampler.LodBias() + extra_lod_bias, -limits.max_lod_bias,
                                       limits.max_lod_bias);
-    if (lod_bias != 0.0f) {
-        static std::atomic<bool> logged{false};
-        LogOnce(logged, "sampler LOD bias is not applied (Metal samplers have none)");
-    }
     BorderInfo border = BorderColor(LiverpoolToVK::BorderColor(sampler.border_color_type));
     if (!border.supported) {
         static std::atomic<bool> logged{false};
@@ -53,6 +49,7 @@ Sampler::Sampler(Metal::Device& device, const AmdGpu::Sampler& sampler,
     desc.mag_filter = SamplerFilter(LiverpoolToVK::Filter(sampler.xy_mag_filter));
     desc.min_lod = sampler.MinLod();
     desc.max_lod = sampler.MaxLod();
+    desc.lod_bias = lod_bias;
     desc.mip_filter = desc.max_lod <= desc.min_lod && desc.min_lod == 0.0f
                           ? SamplerMipNotMipmapped
                           : MipFilter(LiverpoolToVK::MipFilter(sampler.mip_filter));

@@ -135,6 +135,18 @@ ImageView::ImageView(const ImageViewInfo& info_, const Image& image) : info{info
         }
     }
 
+    // Metal aborts on views it cannot make (an uncompressed view of a BC texture, a colour view
+    // of a depth texture, ...): such views read the texture in its own format.
+    const u32 safe_format =
+        Metal::SafeViewPixelFormat(desc.pixel_format, pixel_format, desc.format_views);
+    if (safe_format != pixel_format) {
+        static std::atomic<bool> logged{false};
+        LogOnce(logged, "image view format cannot view the texture in Metal (block or depth "
+                        "reinterpretation): using the image's format");
+        pixel_format = safe_format;
+        format = image.info.pixel_format;
+    }
+
     const Metal::TextureType type = ViewTextureType(info.type, desc.type);
     const bool is_3d = type == Metal::TextureType::Tex3D;
     if (is_3d && image.info.type == AmdGpu::ImageType::Color3D &&

@@ -884,8 +884,77 @@ void TestTextures() {
     sd.compare_function = MTLCompareFunctionLessEqual;
     Metal::Object sampler = Metal::CreateSampler(device, sd);
     Expect(bool(sampler), "sampler created");
+    sd.lod_bias = -0.5f;
+    Metal::Object biased = Metal::CreateSampler(device, sd);
+    Expect(bool(biased), "sampler with a LOD bias created");
     Expect(Metal::SupportsSampleCount(device, 1) && Metal::SupportsSampleCount(device, 4),
            "1x and 4x samples supported");
+}
+
+void TestSafeViewFormats() {
+    using Metal::SafeViewPixelFormat;
+    Expect(SafeViewPixelFormat(MTLPixelFormatBC1_RGBA, MTLPixelFormatRG32Uint, false) ==
+               MTLPixelFormatBC1_RGBA,
+           "BC1 viewed as RG32Uint falls back to BC1");
+    Expect(SafeViewPixelFormat(MTLPixelFormatBC1_RGBA, MTLPixelFormatBC4_RUnorm, false) ==
+               MTLPixelFormatBC1_RGBA,
+           "BC1 viewed as BC4 falls back to BC1");
+    Expect(SafeViewPixelFormat(MTLPixelFormatBC1_RGBA, MTLPixelFormatBC1_RGBA_sRGB, false) ==
+               MTLPixelFormatBC1_RGBA_sRGB,
+           "BC1 viewed as its sRGB twin");
+    Expect(SafeViewPixelFormat(MTLPixelFormatDepth32Float_Stencil8, MTLPixelFormatX32_Stencil8,
+                               true) == MTLPixelFormatX32_Stencil8,
+           "D32S8 viewed as X32_Stencil8");
+    Expect(SafeViewPixelFormat(MTLPixelFormatDepth32Float, MTLPixelFormatR32Float, true) ==
+               MTLPixelFormatDepth32Float,
+           "D32 viewed as R32Float falls back to D32");
+    Expect(SafeViewPixelFormat(MTLPixelFormatDepth32Float, MTLPixelFormatX32_Stencil8, true) ==
+               MTLPixelFormatDepth32Float,
+           "D32 has no stencil view");
+    Expect(SafeViewPixelFormat(MTLPixelFormatRGBA8Unorm, MTLPixelFormatR32Uint, true) ==
+               MTLPixelFormatR32Uint,
+           "RGBA8 with format views viewed as R32Uint");
+    Expect(SafeViewPixelFormat(MTLPixelFormatRGBA8Unorm, MTLPixelFormatR32Uint, false) ==
+               MTLPixelFormatRGBA8Unorm,
+           "RGBA8 without format views keeps its format");
+    Expect(SafeViewPixelFormat(MTLPixelFormatRGBA8Unorm, MTLPixelFormatRG32Uint, true) ==
+               MTLPixelFormatRGBA8Unorm,
+           "different texel sizes fall back");
+    Expect(SafeViewPixelFormat(MTLPixelFormatRGBA8Unorm, MTLPixelFormatDepth32Float, true) ==
+               MTLPixelFormatRGBA8Unorm,
+           "colour textures have no depth views");
+
+    // One real view per allowed case: none may abort.
+    Metal::Device device;
+    const auto make = [&](u32 format, u32 w, bool views) {
+        Metal::TextureDesc d{};
+        d.pixel_format = format;
+        d.width = d.height = w;
+        d.format_views = views;
+        d.render_target = views;
+        return Metal::CreateTexture(device, d, "", nullptr);
+    };
+    const auto view_ok = [&](const Metal::Object& tex, u32 requested, u32 texture_format,
+                             bool views) {
+        const u32 format = SafeViewPixelFormat(texture_format, requested, views);
+        return bool(Metal::CreateTextureView(tex.Get(), format, Metal::TextureType::Tex2D, 0, 1,
+                                             0, 1,
+                                             {MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+                                              MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha}));
+    };
+    Metal::Object bc1 = make(MTLPixelFormatBC1_RGBA, 8, false);
+    Metal::Object d32s8 = make(MTLPixelFormatDepth32Float_Stencil8, 4, true);
+    Metal::Object d32 = make(MTLPixelFormatDepth32Float, 4, true);
+    Metal::Object rgba = make(MTLPixelFormatRGBA8Unorm, 4, true);
+    Expect(bc1 && d32s8 && d32 && rgba, "view-format textures created");
+    Expect(view_ok(bc1, MTLPixelFormatRG32Uint, MTLPixelFormatBC1_RGBA, false) &&
+               view_ok(bc1, MTLPixelFormatBC4_RUnorm, MTLPixelFormatBC1_RGBA, false) &&
+               view_ok(bc1, MTLPixelFormatBC1_RGBA_sRGB, MTLPixelFormatBC1_RGBA, false),
+           "BC1 views");
+    Expect(view_ok(d32s8, MTLPixelFormatX32_Stencil8, MTLPixelFormatDepth32Float_Stencil8, true),
+           "D32S8 stencil view");
+    Expect(view_ok(d32, MTLPixelFormatR32Float, MTLPixelFormatDepth32Float, true), "D32 view");
+    Expect(view_ok(rgba, MTLPixelFormatR32Uint, MTLPixelFormatRGBA8Unorm, true), "RGBA8 view");
 }
 
 int main() {
@@ -916,6 +985,7 @@ int main() {
         TestTimelines();
         TestBufferCreation();
         TestTextures();
+        TestSafeViewFormats();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

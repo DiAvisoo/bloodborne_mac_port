@@ -39,6 +39,7 @@ struct SamplerDesc {
     u32 address_u{}, address_v{}, address_w{};    ///< MTLSamplerAddressMode
     u32 border{};                                 ///< MTLSamplerBorderColor
     float min_lod{}, max_lod{};
+    float lod_bias{}; ///< MTLSamplerDescriptor.lodBias (macOS 26); ignored (logged once) before
     u32 max_anisotropy{1}; ///< clamped to 1..16
     bool compare{};
     u32 compare_function{}; ///< MTLCompareFunction, used when `compare`
@@ -55,6 +56,14 @@ bool SupportsSampleCount(Device& device, u32 samples);
 /// X32_Stencil8 for Depth32Float_Stencil8, X24_Stencil8 for Depth24Unorm_Stencil8, Stencil8 for
 /// Stencil8; 0 for formats without stencil.
 u32 StencilViewPixelFormat(u32 pixel_format);
+
+/// The pixel format to view a texture of `texture_format` with when `requested_format` is wanted:
+/// `requested_format` when Metal can make that view, else `texture_format` (Metal aborts on an
+/// incompatible view). Allowed: the same format; its sRGB/linear twin; for depth textures only the
+/// stencil view format (StencilViewPixelFormat) besides those; for block-compressed and depth
+/// textures nothing else; otherwise, with `texture_has_format_views` (PixelFormatView usage), an
+/// uncompressed non-depth format of the same texel size.
+u32 SafeViewPixelFormat(u32 texture_format, u32 requested_format, bool texture_has_format_views);
 
 /// Bytes per texel block of a pixel format (a texel for uncompressed formats) and the block's
 /// size in texels; BytesPerBlock is 0 for formats without a table entry (buffer copies of them

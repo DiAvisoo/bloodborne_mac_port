@@ -6,6 +6,8 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <atomic>
+#include "common/logging/log.h"
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_metal/mtl_texture.h"
 
@@ -69,6 +71,40 @@ Block BlockOf(MTLPixelFormat f) {
         return {16, 4, 4};
     default:
         return {};
+    }
+}
+
+/// The sRGB/linear twin of a format, or Invalid.
+MTLPixelFormat SrgbTwin(MTLPixelFormat f) {
+    switch (f) {
+#define TWIN(a, b)                                                                                 \
+    case MTLPixelFormat##a:                                                                        \
+        return MTLPixelFormat##b;                                                                  \
+    case MTLPixelFormat##b:                                                                        \
+        return MTLPixelFormat##a;
+        TWIN(R8Unorm, R8Unorm_sRGB)
+        TWIN(RG8Unorm, RG8Unorm_sRGB)
+        TWIN(RGBA8Unorm, RGBA8Unorm_sRGB)
+        TWIN(BGRA8Unorm, BGRA8Unorm_sRGB)
+        TWIN(BC1_RGBA, BC1_RGBA_sRGB)
+        TWIN(BC2_RGBA, BC2_RGBA_sRGB)
+        TWIN(BC3_RGBA, BC3_RGBA_sRGB)
+        TWIN(BC7_RGBAUnorm, BC7_RGBAUnorm_sRGB)
+#undef TWIN
+    default:
+        return MTLPixelFormatInvalid;
+    }
+}
+
+bool IsDepthOrStencil(MTLPixelFormat f) {
+    switch (f) {
+    case MTLPixelFormatDepth16Unorm: case MTLPixelFormatDepth32Float:
+    case MTLPixelFormatStencil8: case MTLPixelFormatDepth24Unorm_Stencil8:
+    case MTLPixelFormatDepth32Float_Stencil8: case MTLPixelFormatX32_Stencil8:
+    case MTLPixelFormatX24_Stencil8:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -152,6 +188,17 @@ Object CreateSampler(Device& device, const SamplerDesc& desc) {
         d.compareFunction = MTLCompareFunction(desc.compare_function);
     }
     d.normalizedCoordinates = desc.normalized;
+    if (desc.lod_bias != 0.0f) {
+        if (@available(macOS 26.0, *)) {
+            d.lodBias = desc.lod_bias;
+        } else {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                LOG_WARNING(Render, "sampler LOD bias is not applied (Metal samplers have none "
+                                    "before macOS 26)");
+            }
+        }
+    }
     d.supportArgumentBuffers = NO;
     id<MTLDevice> mtl_device = (__bridge id<MTLDevice>)device.NativeDevice();
     id<MTLSamplerState> state = [mtl_device newSamplerStateWithDescriptor:d];
@@ -177,6 +224,31 @@ u32 StencilViewPixelFormat(u32 pixel_format) {
     default:
         return 0;
     }
+}
+
+u32 SafeViewPixelFormat(u32 texture_format, u32 requested_format, bool texture_has_format_views) {
+    const auto texture = MTLPixelFormat(texture_format);
+    const auto requested = MTLPixelFormat(requested_format);
+    if (requested == texture || (requested != MTLPixelFormatInvalid && requested == SrgbTwin(texture))) {
+        return requested_format;
+    }
+    if (requested == MTLPixelFormatInvalid) {
+        return texture_format;
+    }
+    const Block texture_block = BlockOf(texture);
+    const Block requested_block = BlockOf(requested);
+    if (IsDepthOrStencil(texture)) {
+        const u32 stencil = StencilViewPixelFormat(texture_format);
+        return stencil != 0 && stencil != texture_format && requested_format == stencil
+                   ? requested_format
+                   : texture_format;
+    }
+    const bool compressed = texture_block.width > 1 || requested_block.width > 1;
+    if (!texture_has_format_views || compressed || IsDepthOrStencil(requested) ||
+        texture_block.bytes == 0 || texture_block.bytes != requested_block.bytes) {
+        return texture_format;
+    }
+    return requested_format;
 }
 
 u32 BytesPerBlock(u32 pixel_format) {
