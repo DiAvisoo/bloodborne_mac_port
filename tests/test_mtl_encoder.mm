@@ -1372,6 +1372,71 @@ void FullViewport(Metal::Encoder& encoder) {
     encoder.SetScissor({0, 0, kSize, kSize});
 }
 
+/// Object motion's history: vertex shaders write a buffer they reach by GPU address and the next
+/// frame's vertex shaders read it, in another render encoder of a later command buffer. Declared
+/// with IndirectUse::VertexWrite, hazard tracking orders the two; RemoveIndirect lets the buffer go.
+void TestIndirectVertexWrite() {
+    static const char* kSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct PointOut { float4 position [[position]]; float size [[point_size]]; };
+vertex PointOut store_by_address(uint vid [[vertex_id]], constant ulong& address [[buffer(1)]]) {
+    ((device uint*)address)[vid] = 500 + vid;
+    return {float4(0, 0, 0, 1), 1};
+}
+vertex PointOut load_by_address(uint vid [[vertex_id]], constant ulong& address [[buffer(1)]],
+                                device uint* out [[buffer(2)]]) {
+    out[vid] = ((device const uint*)address)[vid];
+    return {float4(0, 0, 0, 1), 1};
+}
+fragment float4 white() { return float4(1); }
+)";
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    NSError* error = nil;
+    id<MTLLibrary> library = [dev newLibraryWithSource:@(kSource) options:nil error:&error];
+    if (!library) {
+        std::printf("FAIL: vertex-write shaders: %s\n", error.localizedDescription.UTF8String);
+        ++failures;
+        return;
+    }
+    id<MTLRenderPipelineState> store = RasterPipeline(device, library, @"store_by_address", @"white");
+    id<MTLRenderPipelineState> load = RasterPipeline(device, library, @"load_by_address", @"white");
+    constexpr u32 kCount = 4096;
+    id<MTLBuffer> history = [dev newBufferWithLength:kCount * 4 options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> out = SharedBuffer(device, kCount * 4);
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    const u64 address = history.gpuAddress;
+    device.MakeResident((__bridge void*)history);
+    encoder.DeclareIndirect((__bridge void*)history, Metal::IndirectUse::VertexWrite);
+    // Frame 1 stores; frame 2 (next command buffer, not waited for) loads.
+    for (id<MTLRenderPipelineState> pipeline : {store, load}) {
+        encoder.BeginRenderPass(ColorPass(target, true, 0));
+        FullViewport(encoder);
+        encoder.SetRenderPipeline((__bridge void*)pipeline);
+        encoder.SetBytes(Metal::Stage::Vertex, 1, &address, sizeof(address));
+        encoder.SetBuffer(Metal::Stage::Vertex, 2, Ref(out));
+        encoder.Draw(Metal::Primitive::Point, kCount);
+        encoder.EndRenderPass();
+        encoder.Submit();
+    }
+    device.Finish();
+    bool all = true;
+    for (u32 i = 0; i < kCount; ++i) {
+        all &= static_cast<const u32*>(out.contents)[i] == 500 + i;
+    }
+    Expect(all, "vertex shaders read what the previous frame's vertex shaders wrote by address");
+    // Undeclared and released: a new encoder must not reference it.
+    encoder.RemoveIndirect((__bridge void*)history);
+    device.Evict((__bridge void*)history);
+    history = nil;
+    encoder.BeginRenderPass(ColorPass(target, true, 0));
+    encoder.EndRenderPass();
+    device.Wait(encoder.Submit());
+    Expect(device.ErrorCount() == 0, "encoders after RemoveIndirect run without the buffer");
+}
+
 void TestVertexBufferStride() {
     Metal::Device device;
     Metal::Encoder encoder{device};
@@ -1778,6 +1843,7 @@ int main() {
         TestSubmitResetsBindings();
         TestUntrackedRunsFirst();
         TestIndirectResidency();
+        TestIndirectVertexWrite();
         TestDepthAspectCopy();
         TestResolvePasses();
         TestBlitShaders();

@@ -7,32 +7,24 @@
 
 #pragma once
 
-#ifndef BB_METAL_NATIVE_STAGE
-#error "BB_METAL_NATIVE_STAGE must be defined (gpu/CMakeLists.txt: target_compile_definitions)"
-#endif
-
-#ifdef BB_M5_PENDING_VK_OBJECT_MOTION
-// Not converted to Metal yet (M5, BB_M5_PENDING in gpu/CMakeLists.txt): the source is left out
-// of the build and this stand-in takes its place.
-#include "stubs_m3.h"
-#else
-
 #include <array>
 #include "video_core/renderer_vulkan/motion_history.h"
 
 #include "common/types.h"
-#include "video_core/renderer_vulkan/vk_common.h"
-#include "video_core/texture_cache/image.h"
+#include "video_core/renderer_metal/mtl_object.h"
+
+namespace Metal {
+class Device;
+}
 
 namespace Vulkan {
 
-class Instance;
 class Scheduler;
 struct RenderState;
 
 class ObjectMotion {
 public:
-    ObjectMotion(const Instance& instance, Scheduler& scheduler);
+    ObjectMotion(Metal::Device& device, Scheduler& scheduler);
     ~ObjectMotion();
 
     [[nodiscard]] bool Enabled() const noexcept {
@@ -52,29 +44,30 @@ public:
         return index_ranges.Get(key, frame, scan);
     }
 
-    /// Rendering of a motion pipeline: the motion attachment (render-target size).
+    /// Rendering of a motion pipeline: the motion attachment (render-target size) as colour 7,
+    /// cleared by the first pass of the frame.
     void Attach(RenderState& state, u32 width, u32 height);
 
     /// Start of a frame (display pass).
     void OnFrameStart();
     void InvalidateHistory() { history.NextFrame(); history.NextFrame(); }
 
-    /// The motion image for the compose pass (layout General after this call) and whether it
+    /// The motion texture (id<MTLTexture>, RGBA32Float) for the compose pass and whether it
     /// holds this frame's vectors at `width` x `height`.
-    vk::ImageView PrepareRead(vk::CommandBuffer cmdbuf, u32 width, u32 height, bool& valid);
-    /// The image of the last PrepareRead (layout General), or null.
-    [[nodiscard]] vk::ImageView View() const noexcept {
-        return view ? *view : vk::ImageView{};
+    void* PrepareRead(u32 width, u32 height, bool& valid);
+    /// The motion texture (id<MTLTexture>), or null before the first Attach/PrepareRead.
+    [[nodiscard]] void* View() const noexcept {
+        return image.Get();
     }
-    [[nodiscard]] vk::Image Image(u32 width, u32 height) const noexcept {
-        return written && width == image_width && height == image_height
-            ? vk::Image(image) : vk::Image{};
+    /// The motion texture if it holds this frame's vectors at `width` x `height`, else null.
+    [[nodiscard]] void* Image(u32 width, u32 height) const noexcept {
+        return written && width == image_width && height == image_height ? image.Get() : nullptr;
     }
 
 private:
     void EnsureImage(u32 width, u32 height);
 
-    const Instance& instance;
+    Metal::Device& device;
     Scheduler& scheduler;
     bool enabled = false;
 
@@ -87,21 +80,17 @@ private:
     Motion::History history{PositionsPerFrame};
     Motion::IndexRangeCache index_ranges;
     std::array<u64, FrameSlots> params_ticks{};
-    vk::Buffer params_buffer{};
-    VmaAllocation params_allocation{};
+    // Reached by shaders only through their GPU addresses (Shader::MotionVectors): resident
+    // and declared on the scheduler's encoder (see the constructor for the ordering).
+    Metal::Object params_buffer;
     u32* params_mapped{};
-    vk::Buffer positions_buffer{};
-    VmaAllocation positions_allocation{};
+    Metal::Object positions_buffer;
 
     u64 frame = 0;
     u32 params_used = 0;
-    VideoCore::UniqueImage image;
-    vk::UniqueImageView view;
+    Metal::Object image; ///< id<MTLTexture>
     u32 image_width = 0, image_height = 0;
     bool written = false; ///< this frame's vectors are in the image
-    vk::ImageLayout image_layout = vk::ImageLayout::eUndefined;
 };
 
 } // namespace Vulkan
-
-#endif // BB_METAL_NATIVE_STAGE < 5

@@ -159,7 +159,7 @@ endif()
 # file removes its name from this list, and its stand-in in the same task. (The names are the
 # files under renderer_vulkan/ and shim/; imgui_impl_vulkan is the Vulkan ImGui backend, replaced
 # by imgui_impl_metal.)
-set(BB_M5_PENDING vk_temporal_upscaler vk_camera_motion vk_object_motion vk_gpu_profiler
+set(BB_M5_PENDING vk_temporal_upscaler vk_camera_motion vk_gpu_profiler
     bbport_overlay bbport_metalfx imgui_impl_vulkan)
 set(BB_UNCONVERTED_6 host_passes/fsr_pass)
 set(BB_UNCONVERTED_7 vk_instance vk_platform)

@@ -4,8 +4,8 @@
 // files named in BB_M5_PENDING out of the build; their headers include this one instead and get
 // classes with the same public API that do nothing (each guarded by BB_M5_PENDING_<FILE NAME>,
 // which CMake defines while the file is pending):
-//   - M5: the temporal upscaler, camera and object motion and the GPU profiler
-//     (vk_temporal_upscaler.h, vk_camera_motion.h, vk_object_motion.h, vk_gpu_profiler.h): all off.
+//   - M5: the temporal upscaler, camera motion and the GPU profiler
+//     (vk_temporal_upscaler.h, vk_camera_motion.h, vk_gpu_profiler.h): all off.
 //     The settings overlay keeps its header; stubs_m3.cpp defines what the shim calls.
 // Converting a file removes its name from BB_M5_PENDING and its stand-in from here; the last
 // conversion deletes this file.
@@ -19,7 +19,6 @@
 #include <array>
 
 #include "common/types.h"
-#include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/types.h"
@@ -140,34 +139,6 @@ public:
     void OnDisplayPass(VideoCore::ImageId) {}
 };
 #endif // BB_M5_PENDING_VK_CAMERA_MOTION
-
-// --- M5: object motion vectors (vk_object_motion.h) ------------------------------------------
-
-#ifdef BB_M5_PENDING_VK_OBJECT_MOTION
-class ObjectMotion {
-public:
-    ObjectMotion(Metal::Device&, Scheduler&) {}
-
-    [[nodiscard]] bool Enabled() const noexcept {
-        return false;
-    }
-    using DrawInfo = Motion::Draw;
-    u32 PrepareDraw(const DrawInfo&) {
-        return 0; // parameter 0: motion off
-    }
-    bool Moving(const Motion::History::GateKey&, u64) {
-        return false;
-    }
-    /// Uncached: scans every time.
-    template <class Scan>
-    Motion::IndexRangeCache::Result IndexRange(const Motion::IndexRangeCache::Key&, Scan&& scan) {
-        return scan();
-    }
-    void Attach(RenderState&, u32, u32) {}
-    void OnFrameStart() {}
-    void InvalidateHistory() {}
-};
-#endif // BB_M5_PENDING_VK_OBJECT_MOTION
 
 // --- M5: GPU time per pass (vk_gpu_profiler.h): never on -------------------------------------
 

@@ -26,6 +26,11 @@ enum class BlitAspect : u8 { All, Depth, Stencil };
 enum class Winding : u8 { Clockwise, CounterClockwise };
 enum class FillMode : u8 { Fill, Lines };
 enum class DepthClip : u8 { Clip, Clamp };
+/// How render encoders use a buffer reached by GPU address (Encoder::DeclareIndirect).
+enum class IndirectUse : u8 {
+    Read,        ///< read by vertex and fragment shaders (guest memory, page table)
+    VertexWrite, ///< read and written by vertex shaders (object motion history)
+};
 
 struct Origin3 {
     u32 x{}, y{}, z{};
@@ -160,8 +165,14 @@ public:
                      u32 dst_level, u32 dst_slice, Origin3 dst_origin, Size3 size);
 
     /// Buffers shaders reach by GPU address, declared on every Metal encoder this Encoder opens
-    /// from now on (render encoders: read; compute: read/write) so Metal orders them.
-    void DeclareIndirect(void* buffer);
+    /// from now on (useResource) so they are resident and Metal's hazard tracking orders the
+    /// encoders that use them (the buffers must be tracked: the default for device buffers).
+    /// Compute encoders: read/write. Render encoders: read (vertex and fragment stages), or
+    /// with VertexWrite read/write at the vertex stage. Declaring a buffer again changes its use.
+    void DeclareIndirect(void* buffer, IndirectUse use = IndirectUse::Read);
+    /// Stops declaring `buffer` on encoders opened from now on (before it is released; the
+    /// open encoder keeps it until it ends).
+    void RemoveIndirect(void* buffer);
     /// True while any slot, pipeline or render state is set (Submit clears all of it).
     [[nodiscard]] bool HasBindings() const noexcept;
 

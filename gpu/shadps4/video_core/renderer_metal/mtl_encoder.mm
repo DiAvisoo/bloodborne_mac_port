@@ -199,7 +199,11 @@ struct Encoder::Impl {
     bool compute_pipeline_dirty{};
     StageState compute_stage;
 
-    std::vector<void*> indirect; ///< declared on every encoder opened (survives Submit)
+    struct Indirect {
+        void* buffer;
+        IndirectUse use;
+    };
+    std::vector<Indirect> indirect; ///< declared on every encoder opened (survives Submit)
     id<MTLComputePipelineState> fill_u32;
     id<MTLComputePipelineState> clamp_count;
 
@@ -221,17 +225,33 @@ struct Encoder::Impl {
         }
     }
 
-    void DeclareOn(id<MTLRenderCommandEncoder> e) {
-        for (void* b : indirect) {
-            [e useResource:(__bridge id<MTLBuffer>)b
+    static void Declare(id<MTLRenderCommandEncoder> e, const Indirect& i) {
+        id<MTLBuffer> b = (__bridge id<MTLBuffer>)i.buffer;
+        if (i.use == IndirectUse::VertexWrite) {
+            // Written and read by vertex shaders only: render passes order against each other
+            // at the vertex stage, so a later pass's vertex work still overlaps the fragment
+            // work of the one before it.
+            [e useResource:b
+                     usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                    stages:MTLRenderStageVertex];
+        } else {
+            [e useResource:b
                      usage:MTLResourceUsageRead
                     stages:MTLRenderStageVertex | MTLRenderStageFragment];
         }
     }
+    static void Declare(id<MTLComputeCommandEncoder> e, const Indirect& i) {
+        [e useResource:(__bridge id<MTLBuffer>)i.buffer
+                 usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    }
+    void DeclareOn(id<MTLRenderCommandEncoder> e) {
+        for (const auto& i : indirect) {
+            Declare(e, i);
+        }
+    }
     void DeclareOn(id<MTLComputeCommandEncoder> e) {
-        for (void* b : indirect) {
-            [e useResource:(__bridge id<MTLBuffer>)b
-                     usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        for (const auto& i : indirect) {
+            Declare(e, i);
         }
     }
 
@@ -710,20 +730,28 @@ void Encoder::SubmitUntracked() {
     impl->Finish(false);
 }
 
-void Encoder::DeclareIndirect(void* buffer) {
-    if (std::find(impl->indirect.begin(), impl->indirect.end(), buffer) != impl->indirect.end()) {
+void Encoder::DeclareIndirect(void* buffer, IndirectUse use) {
+    const auto it = std::find_if(impl->indirect.begin(), impl->indirect.end(),
+                                 [buffer](const Impl::Indirect& i) { return i.buffer == buffer; });
+    if (it != impl->indirect.end() && it->use == use) {
         return;
     }
-    impl->indirect.push_back(buffer);
-    id<MTLBuffer> b = (__bridge id<MTLBuffer>)buffer;
+    const Impl::Indirect entry{buffer, use};
+    if (it != impl->indirect.end()) {
+        *it = entry;
+    } else {
+        impl->indirect.push_back(entry);
+    }
     if (impl->render) {
-        [impl->render useResource:b
-                            usage:MTLResourceUsageRead
-                           stages:MTLRenderStageVertex | MTLRenderStageFragment];
+        Impl::Declare(impl->render, entry);
     }
     if (impl->compute) {
-        [impl->compute useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        Impl::Declare(impl->compute, entry);
     }
+}
+
+void Encoder::RemoveIndirect(void* buffer) {
+    std::erase_if(impl->indirect, [buffer](const Impl::Indirect& i) { return i.buffer == buffer; });
 }
 
 bool Encoder::HasBindings() const noexcept {

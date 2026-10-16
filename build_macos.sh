@@ -172,6 +172,11 @@ if [[ ${1:-} == --test ]]; then
         # Saved upscaler choices (FSR 4 runs as off, the ini keeps the user's value).
         ninja -C out/gpu-arm64 upscaler-support-test >/dev/null
         out/gpu-arm64/upscaler-support-test 2>&1 | grep -E 'PASS|FAIL' || { echo 'FAIL: upscaler-support-test'; exit 1; }
+        # Metal-native M5: the motion shader variants compile to MSL; object motion on Metal
+        # (history buffers by GPU address, the motion attachment), plain and under validation.
+        ninja -C out/gpu-arm64 motion-shader-test >/dev/null
+        out/gpu-arm64/motion-shader-test 2>&1 | grep -E '^(FAIL|motion-shader-test)'
+        MTL_DEBUG_LAYER=1 out/gpu-arm64/motion-shader-test 2>&1 | grep -E '^(FAIL|motion-shader-test)'
         # Metal-native M5: the pipeline key's depth/stencil formats follow the pass's attachment.
         ninja -C out/gpu-arm64 depth-attachment-test >/dev/null
         out/gpu-arm64/depth-attachment-test || { echo 'FAIL: depth-attachment-test'; exit 1; }

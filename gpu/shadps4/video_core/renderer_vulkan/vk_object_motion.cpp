@@ -1,56 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
-#include <vk_mem_alloc.h>
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
+#include "common/assert.h"
 #include "shader_recompiler/runtime_info.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_metal/mtl_buffer.h"
+#include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_encoder.h"
+#include "video_core/renderer_metal/mtl_texture.h"
+#include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
 
-namespace {
-
-bool CreateBuffer(const Instance& instance, vk::DeviceSize size, bool host, vk::Buffer& buffer,
-                  VmaAllocation& allocation, void** mapped, u64& address) {
-    const VkBufferCreateInfo buffer_ci{
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = size,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-    };
-    VmaAllocationCreateInfo alloc_ci{
-        .usage = VMA_MEMORY_USAGE_AUTO,
-    };
-    if (host) {
-        alloc_ci.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        alloc_ci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
-                         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-    } else {
-        alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    }
-    VkBuffer raw{};
-    VmaAllocationInfo info{};
-    if (vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &raw, &allocation, &info) !=
-        VK_SUCCESS) {
-        return false;
-    }
-    buffer = raw;
-    if (mapped) {
-        *mapped = info.pMappedData;
-    }
-    address = instance.GetDevice().getBufferAddress({.buffer = buffer});
-    return address != 0;
-}
-
-} // namespace
-
-ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
-    : instance{instance_}, scheduler{scheduler_} {
+ObjectMotion::ObjectMotion(Metal::Device& device_, Scheduler& scheduler_)
+    : device{device_}, scheduler{scheduler_} {
     // Pipeline selection limits the extra attachment and vertex stores to likely
     // animated draws. A setting or environment override can still disable the path.
     if (!BbSettings::Get().object_motion ||
@@ -58,22 +28,43 @@ ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
         std::puts("Object motion: off (enable in menu or BB_OBJECT_MOTION=1)");
         return;
     }
-    const auto& features = instance.GetPhysicalDevice().getFeatures();
-    if (!features.vertexPipelineStoresAndAtomics) {
-        std::printf("Object motion: vertexPipelineStoresAndAtomics unsupported, off\n");
-        return;
-    }
-    void* mapped = nullptr;
+    u8* mapped = nullptr;
+    u8* unused = nullptr;
     u64 params_address = 0, positions_address = 0;
-    if (!CreateBuffer(instance, vk::DeviceSize(1 + FrameSlots * ParamsPerFrame) * 32, true,
-                      params_buffer, params_allocation, &mapped, params_address) ||
-        !CreateBuffer(instance, vk::DeviceSize(1 + 2 * PositionsPerFrame) * 16, false,
-                      positions_buffer, positions_allocation, nullptr, positions_address)) {
+    params_buffer = Metal::CreateBuffer(device, u64(1 + FrameSlots * ParamsPerFrame) * 32,
+                                        VideoCore::MemoryType::HostUncached, "ObjectMotionParams",
+                                        &params_address, &mapped);
+    positions_buffer = Metal::CreateBuffer(device, u64(1 + 2 * PositionsPerFrame) * 16,
+                                           VideoCore::MemoryType::DeviceLocal,
+                                           "ObjectMotionPositions", &positions_address, &unused);
+    if (!params_buffer || !positions_buffer || !mapped || !params_address || !positions_address) {
+        params_buffer = {};
+        positions_buffer = {};
         std::printf("Object motion: buffer creation failed, off\n");
         return;
     }
-    params_mapped = static_cast<u32*>(mapped);
+    params_mapped = reinterpret_cast<u32*>(mapped);
     std::memset(params_mapped, 0, 32);
+    // Shaders reach both buffers only through the addresses embedded in the motion variants
+    // (Shader::MotionVectors), never through a binding, so Metal neither makes them resident
+    // nor orders the passes that use them on its own:
+    //  - residency: the queue's residency set (MakeResident) and useResource on every encoder
+    //    the scheduler's Encoder opens (DeclareIndirect);
+    //  - order: the buffers are tracked (Metal's default for device buffers) and declared, so
+    //    hazard tracking orders the encoders that use them, across command buffers too (one
+    //    queue). Positions are written by this frame's vertex shaders (current half) and read
+    //    by the next frame's (previous half), and the half read this frame is written two
+    //    frames on: VertexWrite declares them read/write at the vertex stage, which orders
+    //    those stores and loads (and the reuse) the way the Vulkan vertex-to-vertex barrier at
+    //    frame start did. Parameters are written by the CPU before the command buffer that
+    //    reads them is committed and only read on the GPU (FrameSlots ring, params_ticks).
+    device.MakeResident(params_buffer.Get());
+    device.MakeResident(positions_buffer.Get());
+    scheduler.Record([params = params_buffer.Get(),
+                      positions = positions_buffer.Get()](Metal::Encoder& e) {
+        e.DeclareIndirect(params);
+        e.DeclareIndirect(positions, Metal::IndirectUse::VertexWrite);
+    });
     Shader::MotionVectors::params_address = params_address;
     Shader::MotionVectors::positions_address = positions_address;
     enabled = true;
@@ -81,13 +72,17 @@ ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
 }
 
 ObjectMotion::~ObjectMotion() {
-    scheduler.Finish();
-    const auto allocator = instance.GetAllocator();
     if (params_buffer) {
-        vmaDestroyBuffer(allocator, params_buffer, params_allocation);
+        scheduler.Record([params = params_buffer.Get(),
+                          positions = positions_buffer.Get()](Metal::Encoder& e) {
+            e.RemoveIndirect(params);
+            e.RemoveIndirect(positions);
+        });
     }
-    if (positions_buffer) {
-        vmaDestroyBuffer(allocator, positions_buffer, positions_allocation);
+    scheduler.Finish();
+    if (params_buffer) {
+        device.Evict(params_buffer.Get());
+        device.Evict(positions_buffer.Get());
     }
 }
 
@@ -123,18 +118,8 @@ void ObjectMotion::OnFrameStart() {
     }
     params_used = 0;
     written = false;
-    scheduler.EndRendering();
-    // Last frame's stores must be visible to this frame's loads. Also finish old reads
-    // before the ping-pong half they reference is reused for writes.
-    scheduler.Record([](vk::CommandBuffer cmd) {
-        const vk::MemoryBarrier2 barrier{
-            .srcStageMask = vk::PipelineStageFlagBits2::eVertexShader,
-            .srcAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eVertexShader,
-            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-        };
-        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
-    });
+    // Last frame's position stores before this frame's loads: hazard tracking on the declared
+    // positions buffer (constructor), no barrier to record.
 }
 
 u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {
@@ -166,31 +151,20 @@ void ObjectMotion::EnsureImage(u32 width, u32 height) {
     if (image && width == image_width && height == image_height) {
         return;
     }
-    const auto device = instance.GetDevice();
     if (image) {
+        // Recorded passes and the compose pass may still use the old texture.
         scheduler.Finish();
     }
-    view.reset();
-    image_layout = vk::ImageLayout::eUndefined;
-    image = VideoCore::UniqueImage(device, instance.GetAllocator());
-    image.Create(vk::ImageCreateInfo{
-        .imageType = vk::ImageType::e2D,
-        .format = vk::Format::eR32G32B32A32Sfloat,
-        .extent = {width, height, 1},
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .samples = vk::SampleCountFlagBits::e1,
-        .tiling = vk::ImageTiling::eOptimal,
-        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
-                 vk::ImageUsageFlagBits::eTransferSrc,
-        .initialLayout = vk::ImageLayout::eUndefined,
-    });
-    view = Check(device.createImageViewUnique({
-        .image = vk::Image(image),
-        .viewType = vk::ImageViewType::e2D,
-        .format = vk::Format::eR32G32B32A32Sfloat,
-        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-    }));
+    image = Metal::CreateTexture(
+        device,
+        Metal::TextureDesc{
+            .pixel_format = Metal::VkToMtl::PixelFormat(vk::Format::eR32G32B32A32Sfloat),
+            .width = width,
+            .height = height,
+            .render_target = true,
+        },
+        "ObjectMotion", nullptr);
+    ASSERT_MSG(image, "Object motion: {}x{} motion texture creation failed", width, height);
     image_width = width;
     image_height = height;
     written = false;
@@ -199,53 +173,20 @@ void ObjectMotion::EnsureImage(u32 width, u32 height) {
 void ObjectMotion::Attach(RenderState& state, u32 width, u32 height) {
     constexpr u32 slot = Shader::MotionVectors::Output;
     EnsureImage(width, height);
-    auto& attachment = state.color_attachments[slot];
+    auto& attachment = state.colors[slot];
     attachment = {};
-    attachment.image_view = *view;
-    attachment.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
-    if (!written || image_layout != vk::ImageLayout::eColorAttachmentOptimal) {
-        // Clear once per frame; later reads must not erase the validity of this history.
-        scheduler.EndRendering();
-        const vk::ImageMemoryBarrier2 barrier{
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite |
-                             vk::AccessFlagBits2::eColorAttachmentRead,
-            .oldLayout = image_layout,
-            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
-            .image = vk::Image(image),
-            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-        };
-        // Recorded in order on the recording thread: CommandBuffer() here switched the rest of
-        // the submission (most of the G-buffer) to direct recording on the GPU thread.
-        scheduler.Record([barrier](vk::CommandBuffer cmd) {
-            cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-        });
-        image_layout = vk::ImageLayout::eColorAttachmentOptimal;
-        attachment.is_clear = !written;
-        written = true;
-    }
-    state.num_color_attachments = std::max<u16>(state.num_color_attachments, slot + 1);
+    attachment.texture = image.Get();
+    // Clear (to zero: no motion) once per frame; later passes load, so a read in between does
+    // not erase the vectors already written.
+    attachment.clear = !written;
+    written = true;
+    state.num_colors = std::max(state.num_colors, slot + 1);
 }
 
-vk::ImageView ObjectMotion::PrepareRead(vk::CommandBuffer cmdbuf, u32 width, u32 height,
-                                        bool& valid) {
+void* ObjectMotion::PrepareRead(u32 width, u32 height, bool& valid) {
     EnsureImage(std::max(image_width, 1u), std::max(image_height, 1u));
     valid = written && width == image_width && height == image_height;
-    const vk::ImageMemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-        .oldLayout = image_layout,
-        .newLayout = vk::ImageLayout::eGeneral,
-        .image = vk::Image(image),
-        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-    };
-    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-    image_layout = vk::ImageLayout::eGeneral;
-    return *view;
+    return image.Get();
 }
 
 } // namespace Vulkan
