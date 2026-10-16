@@ -57,7 +57,7 @@ public:
     }
     /// The highest tick the GPU is known to have finished.
     [[nodiscard]] u64 KnownGpuTick() const noexcept {
-        return gpu_tick.load(std::memory_order_acquire);
+        return counters->gpu_tick.load(std::memory_order_acquire);
     }
     /// True once the GPU finished every command buffer up to `tick`.
     [[nodiscard]] bool IsFree(u64 tick) const;
@@ -71,7 +71,7 @@ public:
     u64 Commit(void* command_buffer);
     /// Command buffers that completed with an error (each one is logged).
     [[nodiscard]] u64 ErrorCount() const noexcept {
-        return errors.load(std::memory_order_relaxed);
+        return counters->errors.load(std::memory_order_relaxed);
     }
 
 private:
@@ -82,8 +82,13 @@ private:
     std::string name;
     Limits limits;
     std::atomic<u64> current_tick{1};
-    mutable std::atomic<u64> gpu_tick{0};
-    std::atomic<u64> errors{0};
+    /// What completion handlers write. Shared with each handler, so a handler that runs after
+    /// the Device is gone writes into memory it still owns.
+    struct Counters {
+        std::atomic<u64> gpu_tick{0};
+        std::atomic<u64> errors{0};
+    };
+    std::shared_ptr<Counters> counters{std::make_shared<Counters>()};
 };
 
 } // namespace Metal

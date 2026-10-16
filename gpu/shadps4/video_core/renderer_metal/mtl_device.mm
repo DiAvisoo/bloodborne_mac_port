@@ -46,7 +46,7 @@ void* Device::NativeQueue() const noexcept {
 }
 
 void Device::Refresh() const {
-    RaiseTo(gpu_tick, impl->event.signaledValue);
+    RaiseTo(counters->gpu_tick, impl->event.signaledValue);
 }
 
 bool Device::IsFree(u64 tick) const {
@@ -77,15 +77,14 @@ u64 Device::Commit(void* command_buffer) {
     id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)command_buffer;
     const u64 tick = current_tick.fetch_add(1, std::memory_order_acq_rel);
     [cmd encodeSignalEvent:impl->event value:tick];
-    std::atomic<u64>* known = &gpu_tick;
-    std::atomic<u64>* failed = &errors;
+    std::shared_ptr<Counters> shared = counters;
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
         if (done.status == MTLCommandBufferStatusError) {
-            failed->fetch_add(1, std::memory_order_relaxed);
+            shared->errors.fetch_add(1, std::memory_order_relaxed);
             LOG_ERROR(Render, "Metal command buffer of tick {} failed: {}", tick,
                       done.error ? done.error.localizedDescription.UTF8String : "unknown error");
         }
-        RaiseTo(*known, tick);
+        RaiseTo(shared->gpu_tick, tick);
     }];
     [cmd commit];
     return tick;
