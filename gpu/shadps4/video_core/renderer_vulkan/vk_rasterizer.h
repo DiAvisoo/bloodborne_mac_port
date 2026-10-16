@@ -205,7 +205,10 @@ private:
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    /// Updates the dynamic state from the registers and returns the whole draw state for the
+    /// draw helper (the target size is `state`'s).
+    Metal::Draw::DrawState UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
+                                              const RenderState& state) const;
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;

@@ -75,6 +75,9 @@ enum : std::uint64_t {
     /// The game's copy shader (ExecuteCopyShaderHLE) is hoisted the same way when neither its
     /// source nor its destination was used in the submission; bit set: it ends the pass.
     CopyShaderHoisting = 1ull << 60,
+    /// The vertex streams of a draw come from the draw-preparation worker's V#s (alone of the
+    /// prepared resources; PreparedResources turns them all off); bit set: from the registers.
+    PreparedVertexInputs = 1ull << 62,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

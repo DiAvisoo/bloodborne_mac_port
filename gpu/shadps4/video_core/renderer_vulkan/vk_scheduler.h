@@ -32,6 +32,7 @@
 #include "video_core/buffer_cache/buffer_copy.h"
 #include "video_core/renderer_metal/mtl_depth_stencil.h"
 #include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_draw.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
 #include "video_core/renderer_metal/mtl_raster_util.h"
 #include "video_core/renderer_metal/mtl_timeline.h"
@@ -139,6 +140,8 @@ struct DynamicState {
         bool color_write_masks : 1;
         bool line_width : 1;
         bool feedback_loop_enabled : 1;
+
+        bool attachments : 1;
     } dirty_state{};
 
     Viewports viewports{};
@@ -177,38 +180,47 @@ struct DynamicState {
     float line_width{};
     bool feedback_loop_enabled{};
 
-    /// bbport: passes each dirty state change to `emit` as a small closure taking a
-    /// Metal::Encoder& and holding only its own values (recording a copy of the whole state per
-    /// draw was a hot spot), and clears the flags it emitted. Flags whose test is disabled stay
-    /// dirty. The depth/stencil fields become one MTLDepthStencilState, looked up here (on the
-    /// producer thread) in `depth_stencil`.
+    /// The pass's depth and stencil attachments (tests of a missing aspect are off).
+    bool has_depth_attachment{};
+    bool has_stencil_attachment{};
+
+    /// The whole state of the next draw in the draw helper's terms, kept up to date by
+    /// CommitWith() (the target size is the pass's, filled by the caller).
+    Metal::Draw::DrawState draw_state{};
+
+    /// bbport: folds the dirty fields into `draw_state`, clears the flags it used, and passes
+    /// the complete state to `emit` (the draw helper takes the whole state with every draw: a
+    /// tessellation run flushed before a draw leaves its own state on the encoder). Flags whose
+    /// test is disabled stay dirty. The depth/stencil fields become one MTLDepthStencilState,
+    /// looked up here (on the producer thread) only when they changed. The PSO-key state
+    /// (primitive restart, color write masks, line width, depth bounds, feedback loop) comes
+    /// from the pipeline: its flags are cleared without effect.
     template <typename Emit>
     void CommitWith(Metal::DepthStencilCache& depth_stencil, Emit&& emit) {
+        Metal::Draw::DrawState& s = draw_state;
         if (dirty_state.viewports) {
             dirty_state.viewports = false;
             if (!viewports.empty()) {
-                // Vulkan's y axis kept through a negative Metal height (mtl_raster_util.h).
+                // Vulkan conventions: the helper converts with RasterUtil::ToMetalViewport.
+                // Metal has one viewport per draw: the first one.
                 const vk::Viewport& v = viewports[0];
-                const auto m = Metal::RasterUtil::ToMetalViewport(v.x, v.y, v.width, v.height,
-                                                                  v.minDepth, v.maxDepth);
-                const Metal::Viewport viewport{float(m.origin_x), float(m.origin_y),
-                                               float(m.width),    float(m.height),
-                                               float(m.znear),    float(m.zfar)};
-                emit([viewport](Metal::Encoder& e) { e.SetViewport(viewport); });
+                s.viewport_x = v.x;
+                s.viewport_y = v.y;
+                s.viewport_width = v.width;
+                s.viewport_height = v.height;
+                s.min_depth = v.minDepth;
+                s.max_depth = v.maxDepth;
             }
         }
         if (dirty_state.scissors) {
             dirty_state.scissors = false;
             if (!scissors.empty()) {
-                // Metal wants the scissor inside the target: negative offsets are cut here, the
-                // encoder clamps the far edges to the pass.
+                // The helper clamps to the target (negative offsets included).
                 const vk::Rect2D& r = scissors[0];
-                const s64 x0 = std::max<s64>(r.offset.x, 0);
-                const s64 y0 = std::max<s64>(r.offset.y, 0);
-                const s64 x1 = std::max<s64>(s64(r.offset.x) + r.extent.width, x0);
-                const s64 y1 = std::max<s64>(s64(r.offset.y) + r.extent.height, y0);
-                const Metal::Scissor scissor{u32(x0), u32(y0), u32(x1 - x0), u32(y1 - y0)};
-                emit([scissor](Metal::Encoder& e) { e.SetScissor(scissor); });
+                s.scissor_x = r.offset.x;
+                s.scissor_y = r.offset.y;
+                s.scissor_width = r.extent.width;
+                s.scissor_height = r.extent.height;
             }
         }
 
@@ -217,7 +229,8 @@ struct DynamicState {
             dirty_state.stencil_front_ops || dirty_state.stencil_back_ops ||
             dirty_state.stencil_front_write_mask || dirty_state.stencil_back_write_mask ||
             dirty_state.stencil_front_compare_mask || dirty_state.stencil_back_compare_mask;
-        if (dirty_state.depth_test_enabled || dirty_state.depth_write_enabled ||
+        if (dirty_state.attachments || dirty_state.depth_test_enabled ||
+            dirty_state.depth_write_enabled ||
             (depth_test_enabled && dirty_state.depth_compare_op) ||
             dirty_state.stencil_test_enabled || (stencil_test_enabled && stencil_faces_dirty)) {
             Metal::DepthStencilKey key{};
@@ -250,14 +263,16 @@ struct DynamicState {
             }
             dirty_state.depth_test_enabled = dirty_state.depth_write_enabled = false;
             dirty_state.stencil_test_enabled = false;
-            void* const state = depth_stencil.Get(key);
-            emit([state](Metal::Encoder& e) { e.SetDepthStencil(state); });
+            dirty_state.attachments = false;
+            // Ignored fields zeroed, so equal states share one MTLDepthStencilState.
+            s.depth_stencil = depth_stencil.Get(Metal::Draw::MaskDepthStencil(
+                key, has_depth_attachment, has_stencil_attachment));
         }
         if (stencil_test_enabled &&
             (dirty_state.stencil_front_reference || dirty_state.stencil_back_reference)) {
             dirty_state.stencil_front_reference = dirty_state.stencil_back_reference = false;
-            emit([front = stencil_front_reference, back = stencil_back_reference](
-                     Metal::Encoder& e) { e.SetStencilReference(front, back); });
+            s.stencil_ref_front = stencil_front_reference;
+            s.stencil_ref_back = stencil_back_reference;
         }
         if (dirty_state.depth_bias_enabled || (depth_bias_enabled && dirty_state.depth_bias)) {
             dirty_state.depth_bias_enabled = false;
@@ -265,31 +280,33 @@ struct DynamicState {
                 dirty_state.depth_bias = false;
             }
             const bool on = depth_bias_enabled;
-            emit([k = on ? depth_bias_constant : 0.0f, slope = on ? depth_bias_slope : 0.0f,
-                  clamp = on ? depth_bias_clamp : 0.0f](Metal::Encoder& e) {
-                e.SetDepthBias(k, slope, clamp);
-            });
+            s.depth_bias_enable = on;
+            s.depth_bias_constant = on ? depth_bias_constant : 0.0f;
+            s.depth_bias_slope = on ? depth_bias_slope : 0.0f;
+            s.depth_bias_clamp = on ? depth_bias_clamp : 0.0f;
         }
         if (dirty_state.cull_mode) {
             dirty_state.cull_mode = false;
-            emit([mode = ToMetalCull(cull_mode)](Metal::Encoder& e) { e.SetCullMode(mode); });
+            // Metal has no front-and-back culling: the helper skips those draws.
+            s.cull_all = cull_mode == vk::CullModeFlagBits::eFrontAndBack;
+            s.cull = ToMetalCull(cull_mode);
         }
         if (dirty_state.front_face) {
             dirty_state.front_face = false;
-            const auto winding = front_face == vk::FrontFace::eClockwise
-                                     ? Metal::Winding::Clockwise
-                                     : Metal::Winding::CounterClockwise;
-            emit([winding](Metal::Encoder& e) { e.SetFrontFace(winding); });
+            s.front_face = front_face == vk::FrontFace::eClockwise
+                               ? Metal::Winding::Clockwise
+                               : Metal::Winding::CounterClockwise;
         }
         if (dirty_state.blend_constants) {
             dirty_state.blend_constants = false;
-            emit([v = blend_constants](Metal::Encoder& e) {
-                e.SetBlendColor(v[0], v[1], v[2], v[3]);
-            });
+            s.blend_color = blend_constants;
         }
-        // Metal: these belong to the pipeline key (M3) or have no equivalent.
+        if (dirty_state.rasterizer_discard_enable) {
+            dirty_state.rasterizer_discard_enable = false;
+            s.rasterizer_discard = rasterizer_discard_enable; // the helper skips the draw
+        }
+        // Metal: these belong to the pipeline key or have no equivalent.
         dirty_state.primitive_restart_enable = false;
-        dirty_state.rasterizer_discard_enable = false;
         dirty_state.color_write_masks = false;
         dirty_state.line_width = false;
         dirty_state.feedback_loop_enabled = false;
@@ -297,17 +314,11 @@ struct DynamicState {
         if (depth_bounds_test_enabled) {
             dirty_state.depth_bounds = false;
         }
+        emit(static_cast<const Metal::Draw::DrawState&>(s));
     }
 
-    /// Metal has no front-and-back culling: logged once, culls back faces.
+    /// Front or back culling (none for front-and-back: DrawState::cull_all skips those draws).
     static Metal::CullMode ToMetalCull(vk::CullModeFlags mode) {
-        if (mode == vk::CullModeFlagBits::eFrontAndBack) {
-            static std::once_flag logged;
-            std::call_once(logged, [] {
-                LOG_WARNING(Render, "Front-and-back culling is not in Metal: culling back");
-            });
-            return Metal::CullMode::Back;
-        }
         if (mode == vk::CullModeFlagBits::eFront) {
             return Metal::CullMode::Front;
         }
@@ -317,32 +328,9 @@ struct DynamicState {
         return Metal::CullMode::None;
     }
 
-    /// bbport: true when CommitWith() would emit anything. Flags that CommitWith() defers (their
-    /// test is disabled) do not count.
-    [[nodiscard]] bool AnyDirty() const noexcept {
-        auto pending = dirty_state;
-        if (!depth_test_enabled) {
-            pending.depth_compare_op = false;
-        }
-        if (!depth_bounds_test_enabled) {
-            pending.depth_bounds = false;
-        }
-        if (!depth_bias_enabled) {
-            pending.depth_bias = false;
-        }
-        if (!stencil_test_enabled) {
-            pending.stencil_front_ops = pending.stencil_back_ops = false;
-            pending.stencil_front_reference = pending.stencil_back_reference = false;
-            pending.stencil_front_write_mask = pending.stencil_back_write_mask = false;
-            pending.stencil_front_compare_mask = pending.stencil_back_compare_mask = false;
-        }
-        static constexpr decltype(dirty_state) clean{};
-        return std::memcmp(&pending, &clean, sizeof(pending)) != 0;
-    }
-
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
-        // bbport: named flags only; padding bits set by a memset made AnyDirty() always true.
+        // bbport: named flags only (a memset also set the padding bits).
         dirty_state.viewports = true;
         dirty_state.scissors = true;
         dirty_state.depth_test_enabled = true;
@@ -369,6 +357,7 @@ struct DynamicState {
         dirty_state.color_write_masks = true;
         dirty_state.line_width = true;
         dirty_state.feedback_loop_enabled = true;
+        dirty_state.attachments = true;
     }
 
     void SetViewports(const Viewports& viewports_) {
@@ -538,6 +527,14 @@ struct DynamicState {
         }
     }
 
+    void SetAttachments(const bool has_depth, const bool has_stencil) {
+        if (has_depth_attachment != has_depth || has_stencil_attachment != has_stencil) {
+            has_depth_attachment = has_depth;
+            has_stencil_attachment = has_stencil;
+            dirty_state.attachments = true;
+        }
+    }
+
     void SetAttachmentFeedbackLoopEnabled(const bool enabled) {
         if (feedback_loop_enabled != enabled) {
             feedback_loop_enabled = enabled;
@@ -691,6 +688,9 @@ public:
     /// (Record() included, so callers may mix both) until the next KickRecording() or
     /// submission.
     [[gnu::noinline]] Metal::Encoder& DirectEncoder() {
+        if (draw_run_open) {
+            EndDrawRun(); // the caller may encode anything
+        }
         if (recorder_running && !direct_mode) {
             SyncRecording();
             direct_mode = true;
@@ -705,8 +705,42 @@ public:
 
     /// Records `func(Metal::Encoder&)` in order with other commands. The closure must own
     /// everything it uses (capture by value): it may run later on the recording thread.
+    /// Patch draws a tessellated draw left waiting (RecordDraw) are drawn first, so no waiting
+    /// patch draw crosses a copy, clear, debug group, pass end or submission recorded here.
     template <typename Func>
     void Record(Func&& func) {
+        if (draw_run_open) [[unlikely]] {
+            EndDrawRun();
+        }
+        RecordCommand(std::forward<Func>(func));
+    }
+
+    /// Records a draw or dispatch that goes through GetDrawRuns() (which ends a waiting
+    /// tessellation run itself before anything else). `leaves_run`: the command may leave patch
+    /// draws waiting in the runs (a tessellated draw): the next Record() draws them first.
+    template <typename Func>
+    void RecordDraw(Func&& func, bool leaves_run) {
+        RecordCommand(std::forward<Func>(func));
+        draw_run_open = leaves_run;
+    }
+
+    /// The draw helper of this scheduler's encoder: used by recorded commands only (on the
+    /// recording thread), and by the scheduler's pass ends and submissions, which go through
+    /// its EndRenderPass / Submit wrappers.
+    [[nodiscard]] Metal::Draw::Runs& GetDrawRuns() noexcept {
+        return draw_runs;
+    }
+
+    /// bbport: debug groups (Xcode GPU captures, Metal System Trace). A pop without its push in
+    /// the same command buffer (a submission in between closed it) is dropped.
+    void PushDebugGroup(std::string label);
+    void PopDebugGroup();
+    /// An empty debug group with this label (Metal has no labels without a scope).
+    void InsertDebugLabel(std::string label);
+
+private:
+    template <typename Func>
+    void RecordCommand(Func&& func) {
         if (!recorder_running || direct_mode) {
             func(encoder);
             return;
@@ -726,6 +760,13 @@ public:
         }
     }
 
+    /// Records the end of the waiting tessellation run (Runs::Flush).
+    void EndDrawRun() {
+        draw_run_open = false;
+        RecordCommand([runs = &draw_runs](Metal::Encoder& e) { runs->Flush(e); });
+    }
+
+public:
     /// True when Record() defers commands (and RecordData() copies into chunks).
     [[nodiscard]] bool IsRecordingDeferred() const noexcept {
         return recorder_running && !direct_mode &&
@@ -778,7 +819,8 @@ public:
     /// work anyway, so small copies cost no wakeup); WaitHostCopies() covers it.
     template <typename Func>
     void RecordHostCopy(Func&& copy) {
-        Record([copy = std::forward<Func>(copy), this,
+        // Not an encoder command: a waiting tessellation run may continue past it.
+        RecordCommand([copy = std::forward<Func>(copy), this,
                 seq = ++host_copies_issued](Metal::Encoder&) {
             copy();
             host_copies_done.store(seq, std::memory_order_release);
@@ -885,6 +927,15 @@ private:
     std::mutex upload_mutex; ///< upload_encoder and upload_open
     bool upload_open{};
     Metal::DepthStencilCache depth_stencil{device};
+    /// The draw helper's stand-ins and runs for `encoder`.
+    Metal::Draw::NullResources draw_nulls{device};
+    Metal::Draw::Runs draw_runs{device, draw_nulls.Get()};
+    /// A recorded tessellated draw may have left patch draws waiting in draw_runs (producer
+    /// side; see Record / RecordDraw).
+    bool draw_run_open = false;
+    /// Debug groups pushed in the command buffer being recorded (recording thread; reset by
+    /// SubmitExecution after the recording is synced).
+    u32 debug_groups = 0;
     DynamicState dynamic_state;
     std::function<void()> on_submit{};
     struct PendingOp {

@@ -167,8 +167,9 @@ struct Resources {
     IndexType index_type{IndexType::U16};
 };
 
-/// Binds the vertex streams at the pipeline's vertex slots (stride 16 for constant streams and
-/// unknown strides; null stand-in for missing streams).
+/// Binds the vertex streams at the pipeline's vertex slots with the V#'s stride (0 for constant
+/// streams; a stride of 0 repeats element 0, as in Vulkan); missing streams get the null
+/// stand-in at stride 0 (zero for every vertex).
 void BindVertexStreams(Encoder& e, std::span<const VertexBufferSlot> slots,
                        std::span<const VertexStream> streams, const Nulls& nulls);
 

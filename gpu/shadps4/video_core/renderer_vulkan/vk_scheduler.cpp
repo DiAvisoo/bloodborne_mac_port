@@ -203,7 +203,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         CountPass(is_rendering ? &reason : nullptr, true);
         if (is_rendering) {
             is_rendering = false; // counted above, not again in EndRendering
-            Record([](Metal::Encoder& e) { e.EndRenderPass(); });
+            Record([runs = &draw_runs](Metal::Encoder& e) { runs->EndRenderPass(e); });
         }
     }
     EndRendering();
@@ -221,7 +221,31 @@ void Scheduler::EndRendering(std::source_location where, const char* detail) {
         CountPass(&reason, false);
     }
     is_rendering = false;
-    Record([](Metal::Encoder& e) { e.EndRenderPass(); });
+    // Through the draw runs: waiting patch draws are drawn in this pass first.
+    Record([runs = &draw_runs](Metal::Encoder& e) { runs->EndRenderPass(e); });
+}
+
+void Scheduler::PushDebugGroup(std::string label) {
+    Record([this, label = std::move(label)](Metal::Encoder& e) {
+        e.PushDebugGroup(label);
+        ++debug_groups;
+    });
+}
+
+void Scheduler::PopDebugGroup() {
+    Record([this](Metal::Encoder& e) {
+        if (debug_groups) {
+            --debug_groups;
+            e.PopDebugGroup();
+        }
+    });
+}
+
+void Scheduler::InsertDebugLabel(std::string label) {
+    Record([label = std::move(label)](Metal::Encoder& e) {
+        e.PushDebugGroup(label);
+        e.PopDebugGroup();
+    });
 }
 
 void Scheduler::TraceDirectRecording(void* caller) {
@@ -519,7 +543,11 @@ u64 Scheduler::SubmitExecution() {
 
     ImGui::Core::TextureManager::Submit(); // ImGui textures: M5
     const u64 submit_start = bbport::CpuCycles();
-    const u64 tick = timeline.Committed(encoder.Submit());
+    // Through the draw runs: no patch draw is left waiting, and their scratch memory is
+    // handed to this submission's tick.
+    draw_run_open = false;
+    const u64 tick = timeline.Committed(draw_runs.Submit(encoder));
+    debug_groups = 0; // Encoder::Submit closed them
     BbStats::queue_submit_ns.fetch_add(bbport::CyclesToNs(bbport::CpuCycles() - submit_start),
                                        std::memory_order_relaxed);
     BbStats::queue_submits.fetch_add(1, std::memory_order_relaxed);

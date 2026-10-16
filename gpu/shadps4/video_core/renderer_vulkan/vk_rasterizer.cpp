@@ -117,6 +117,32 @@ bool IsKnownFormat(AmdGpu::DataFormat data_fmt, AmdGpu::NumberFormat num_fmt) {
     const u32 d = static_cast<u32>(data_fmt), n = static_cast<u32>(num_fmt);
     return d < 256 && n < 256 && tables.first[d] && tables.second[n];
 }
+
+/// Recording thread: the Metal pipelines of a graphics pipeline, waiting for the creation pool
+/// in shader_compile=wait mode. Failed (or no render pipeline): none, so the draw helper skips
+/// the draw and counts it once (skipped_no_pipeline).
+Metal::Draw::Runs::Graphics DrawPipelines(const GraphicsPipeline& pipeline) {
+    pipeline.WaitReady();
+    if (pipeline.Failed() || !pipeline.Render()) {
+        return {};
+    }
+    return {pipeline.Render(), pipeline.Tessellation(), pipeline.Geometry()};
+}
+
+/// Recording thread: the same for a compute pipeline (an empty view: skipped and counted).
+Metal::Draw::ComputeView ComputeView(const ComputePipeline& pipeline) {
+    pipeline.WaitReady();
+    if (pipeline.Failed() || !pipeline.Compute()) {
+        return {};
+    }
+    return Metal::Draw::View(*pipeline.Compute());
+}
+
+/// Producer side: the draw may leave patch draws waiting in the draw runs (a tessellated draw;
+/// known from the stages before the pipeline is built).
+bool IsTessellated(const GraphicsPipeline& pipeline) {
+    return pipeline.GetStages()[u32(Shader::SwStage::TessellationControl)] != nullptr;
+}
 } // namespace
 
 bool Rasterizer::FilterDraw() {
@@ -1108,7 +1134,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             });
         }
     }
-    pipeline->BindResources(set_writes, push_data);
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
@@ -1116,7 +1141,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
         draw_jitter = upscaler->Jitter();
     }
-    UpdateDynamicState(pipeline, is_indexed);
+    const Metal::Draw::DrawState draw_state = UpdateDynamicState(pipeline, is_indexed, state);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
 
@@ -1128,20 +1153,24 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 num_instances = regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
+    // Indexed: the index buffer is bound at the first index; the base vertex is added to each.
+    const Metal::Draw::DrawArgs draw_args{
+        .count = num_indices,
+        .instances = num_instances,
+        .first = is_indexed ? 0u : first_vertex,
+        .vertex_offset = is_indexed ? s32(first_vertex) : 0,
+        .first_instance = first_instance,
+        .indexed = is_indexed,
+    };
+    // Right before the command: the copies share its chunk (push_data is final here).
+    const Metal::Draw::Resources resources = RecordResources(is_indexed);
     // bbport: the pipeline may still be compiling on the creation pool; the recording thread
-    // waits for it as late as possible (null: rejected by the driver, the draw is dropped).
-    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        const vk::Pipeline handle = pipeline->WaitHandle();
-        if (!handle) {
-            return;
-        }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-        if (is_indexed) {
-            cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
-        } else {
-            cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
-        }
-    });
+    // waits for it as late as possible (failed: the draw helper skips and counts it).
+    scheduler.RecordDraw(
+        [=, runs = &scheduler.GetDrawRuns()](Metal::Encoder& e) {
+            runs->Draw(e, DrawPipelines(*pipeline), draw_state, resources, draw_args);
+        },
+        IsTessellated(*pipeline));
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
@@ -1240,39 +1269,33 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     push_data.xoffset *= target_scale[0];
     push_data.yscale *= target_scale[1];
     push_data.yoffset *= target_scale[1];
-    pipeline->BindResources(set_writes, push_data);
     draw_jitter = {};
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
         draw_jitter = upscaler->Jitter();
     }
-    UpdateDynamicState(pipeline, is_indexed);
+    const Metal::Draw::DrawState draw_state = UpdateDynamicState(pipeline, is_indexed, state);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
-    const Metal::BufferRef args = buffer->Ref(base);
-    const Metal::BufferRef counts =
-        count_address != 0 ? count_buffer->Ref(count_offset) : Metal::BufferRef{};
-    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        const vk::Pipeline handle = pipeline->WaitHandle(); // see Draw
-        if (!handle) {
-            return;
-        }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-        if (is_indexed) {
-            if (counts) {
-                cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,
-                                                stride);
-            } else {
-                cmdbuf.drawIndexedIndirect(args, args_offset, max_count, stride);
-            }
-        } else if (counts) {
-            cmdbuf.drawIndirectCount(args, args_offset, counts, counts_offset, max_count, stride);
-        } else {
-            cmdbuf.drawIndirect(args, args_offset, max_count, stride);
-        }
-    });
+    // The records and the GPU count are arguments of the draw calls (hazard-tracked by Metal).
+    const Metal::Draw::IndirectArgs indirect_args{
+        .args = buffer->Ref(base),
+        .count = max_count,
+        .stride = stride,
+        .indexed = is_indexed,
+        .count_buffer =
+            count_address != 0 ? count_buffer->Ref(count_offset) : Metal::BufferRef{},
+    };
+    const Metal::Draw::Resources resources = RecordResources(is_indexed);
+    // Indirect tessellated draws are skipped by the helper (no run is left waiting).
+    scheduler.RecordDraw(
+        [=, runs = &scheduler.GetDrawRuns()](Metal::Encoder& e) {
+            runs->DrawIndirect(e, DrawPipelines(*pipeline), draw_state, resources,
+                               indirect_args); // see Draw
+        },
+        false);
     DebugState.IncDrawCall();
     if (PassLabels() == 2) {
         scheduler.EndRendering();
@@ -1332,18 +1355,24 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     scheduler.EndRendering();
     mark();
-    pipeline->BindResources(set_writes, push_data);
 
     const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
     if (FrameCapture::Active()) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
     }
-    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+    // An empty grid is a no-op (as in Vulkan); Metal's validation rejects it.
+    if (dim_x != 0 && dim_y != 0 && dim_z != 0) {
+        const Metal::Size3 groups{dim_x, dim_y, dim_z};
+        const Metal::Draw::Resources resources = RecordResources(false);
         // Dispatches always wait for their pipeline: skipping one could leave its results
-        // missing for later frames.
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->WaitHandle());
-        cmdbuf.dispatch(dim_x, dim_y, dim_z);
-    });
+        // missing for later frames (a failed one is skipped and counted).
+        scheduler.RecordDraw(
+            [=, runs = &scheduler.GetDrawRuns()](Metal::Encoder& e) {
+                runs->Dispatch(e, ComputeView(*pipeline), resources.bound, resources.push,
+                               groups);
+            },
+            false);
+    }
     DebugState.IncDispatch();
 
     ResetBindings();
@@ -1381,13 +1410,16 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, push_data);
 
+    // The group counts are an argument of the dispatch (hazard-tracked by Metal).
     const Metal::BufferRef args = buffer->Ref(base);
-    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->WaitHandle());
-        cmdbuf.dispatchIndirect(args, args_offset);
-    });
+    const Metal::Draw::Resources resources = RecordResources(false);
+    scheduler.RecordDraw(
+        [=, runs = &scheduler.GetDrawRuns()](Metal::Encoder& e) {
+            runs->DispatchIndirect(e, ComputeView(*pipeline), resources.bound, resources.push,
+                                   args); // see DispatchRecord
+        },
+        false);
     DebugState.IncDispatch();
 
     ResetBindings();
@@ -1712,7 +1744,8 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     const PreparedVertexInputs* ready =
         prepared && prepared->vertex.valid && fetch &&
                 fetch->attributes.size() == prepared->vertex.count && !FrameCapture::Active() &&
-                !BbToggle::Disabled(BbToggle::PreparedResources)
+                !BbToggle::Disabled(BbToggle::PreparedResources) &&
+                !BbToggle::Disabled(BbToggle::PreparedVertexInputs)
             ? &prepared->vertex
             : nullptr;
     if (ready) {
@@ -3106,18 +3139,25 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+Metal::Draw::DrawState Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline,
+                                                      const bool is_indexed,
+                                                      const RenderState& state) const {
     UpdateViewportScissorState();
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed);
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
 
+    // The draw helper takes the whole state with each draw (DynamicState::CommitWith keeps it
+    // current); tests of a depth or stencil aspect the pass lacks are off.
     auto& dynamic_state = scheduler.GetDynamicState();
-    dynamic_state.CommitWith(instance.IsDepthBoundsSupported(),
-                             instance.IsDynamicColorWriteMaskSupported(),
-                             instance.IsAttachmentFeedbackLoopLayoutSupported(),
-                             [&](auto&& command) { scheduler.Record(std::move(command)); });
+    dynamic_state.SetAttachments(state.has_depth, state.has_stencil);
+    Metal::Draw::DrawState draw_state;
+    dynamic_state.CommitWith(scheduler.GetDepthStencilCache(),
+                             [&](const Metal::Draw::DrawState& s) { draw_state = s; });
+    draw_state.target_width = state.width;
+    draw_state.target_height = state.height;
+    return draw_state;
 }
 
 void Rasterizer::UpdateViewportScissorState() const {
@@ -3408,10 +3448,7 @@ void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) 
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
-        .pLabelName = str.data(),
-    });
+    scheduler.PushDebugGroup(std::string(str));
 }
 
 void Rasterizer::ScopeMarkerEnd(bool from_guest) {
@@ -3420,8 +3457,7 @@ void Rasterizer::ScopeMarkerEnd(bool from_guest) {
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.endDebugUtilsLabelEXT();
+    scheduler.PopDebugGroup();
 }
 
 void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest) {
@@ -3430,10 +3466,7 @@ void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
-        .pLabelName = str.data(),
-    });
+    scheduler.InsertDebugLabel(std::string(str));
 }
 
 void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 color,
@@ -3443,12 +3476,9 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
-        .pLabelName = str.data(),
-        .color = std::array<f32, 4>(
-            {(f32)((color >> 16) & 0xff) / 255.0f, (f32)((color >> 8) & 0xff) / 255.0f,
-             (f32)(color & 0xff) / 255.0f, (f32)((color >> 24) & 0xff) / 255.0f})});
+    // Metal debug groups have no color.
+    (void)color;
+    scheduler.InsertDebugLabel(std::string(str));
 }
 
 std::thread::id Rasterizer::GetGpuCommandProcessorThread() {
@@ -3498,7 +3528,10 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
             db_desc.first ? vk::to_string(texture_cache.GetImage(db_desc.first).info.pixel_format)
                           : std::string{"-"},
             pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, ps_stage ? ps_stage->pgm_hash : 0));
-        scheduler.Record([name](vk::CommandBuffer cmdbuf) { BbPassLog::Pass(cmdbuf, *name); });
+        // Commands recorded now go into the submission that signals the current tick.
+        scheduler.Record([name, tick = scheduler.CurrentTick()](Metal::Encoder&) {
+            BbPassLog::Pass(tick, *name);
+        });
         if (!profiler) {
             return;
         }

@@ -60,6 +60,18 @@ vertex VOut rect6(uint vid [[vertex_id]]) {
     return o;
 }
 
+// A vertex attribute (location 0, Metal vertex buffer 30) passed to the fragment.
+struct AttrIn { float4 color [[attribute(0)]]; };
+struct AttrOut { float4 pos [[position]]; float4 color; };
+vertex AttrOut fullscreen_attr(AttrIn in [[stage_in]], uint vid [[vertex_id]]) {
+    const float2 uv = float2((vid << 1) & 2, vid & 2);
+    AttrOut o;
+    o.pos = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+    o.color = in.color;
+    return o;
+}
+fragment float4 attr_color(AttrOut in [[stage_in]]) { return in.color; }
+
 fragment float4 push_color(constant float4& color [[buffer(0)]]) { return color; }
 fragment float4 bound_color(constant float4& color [[buffer(1)]]) { return color; }
 
@@ -677,6 +689,56 @@ void TestScratchPool() {
     Expect(device.ErrorCount() == 0, "scratch ran without errors");
 }
 
+void TestVertexStreamStrides() {
+    Device device;
+    Encoder encoder{device};
+    NullResources null_resources{device};
+    Runs runs{device, null_resources.Get()};
+    Shaders shaders;
+    id<MTLLibrary> library = Library(device);
+    constexpr u32 kSlot = 30;
+    MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+    MTLVertexDescriptor* vd = [MTLVertexDescriptor new];
+    vd.attributes[0].format = MTLVertexFormatFloat4;
+    vd.attributes[0].bufferIndex = kSlot;
+    vd.layouts[kSlot].stride = MTLBufferLayoutStrideDynamic;
+    vd.layouts[kSlot].stepFunction = MTLVertexStepFunctionPerVertex;
+    desc.vertexDescriptor = vd;
+    id<MTLRenderPipelineState> pipeline =
+        Pipeline(device, library, @"fullscreen_attr", @"attr_color", desc);
+    const std::array<VertexBufferSlot, 1> slots{VertexBufferSlot{0, kSlot, false}};
+    DrawPipeline p = View(pipeline, &shaders.none, &shaders.none);
+    p.vertex_slots = slots;
+    // Three different colors, one per vertex if the stride advanced.
+    id<MTLBuffer> colors = SharedBuffer(device, 48);
+    float* c = static_cast<float*>(colors.contents);
+    const float values[12] = {1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1};
+    std::memcpy(c, values, sizeof(values));
+
+    // A V# stride of 0 (Vulkan: every vertex reads the same element).
+    const std::array<VertexStream, 1> same{VertexStream{Ref(colors), 0}};
+    id<MTLTexture> constant = Target(device);
+    encoder.BeginRenderPass(Pass(constant));
+    Expect(runs.Draw(encoder, p, FullState(), Resources{{}, {}, same, {}, IndexType::U16},
+                     DrawArgs{3}),
+           "a stride-0 stream draws");
+    encoder.EndRenderPass();
+    // A missing stream: the stand-in at stride 0 (element 0 for every vertex: zero).
+    id<MTLTexture> missing = Target(device);
+    encoder.BeginRenderPass(Pass(missing));
+    Expect(runs.Draw(encoder, p, FullState(), Resources{{}, {}, {}, {}, IndexType::U16},
+                     DrawArgs{3}),
+           "a draw with a missing stream draws");
+    encoder.EndRenderPass();
+    id<MTLBuffer> out_constant = Readback(device, encoder, constant);
+    id<MTLBuffer> out_missing = Readback(device, encoder, missing);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out_constant, 10, 10) == kRed && Pixel(out_constant, 40, 20) == kRed,
+           "a stride-0 stream gives every vertex element 0");
+    Expect(Pixel(out_missing, 10, 10) == 0u, "a missing stream reads zero");
+    Expect(device.ErrorCount() == 0, "vertex stream strides ran without errors");
+}
+
 void TestMaskDepthStencil() {
     DepthStencilKey key;
     key.depth_test = true;
@@ -704,6 +766,7 @@ int main() {
         TestRunWrappers();
         TestScratchPool();
         TestMaskDepthStencil();
+        TestVertexStreamStrides();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

@@ -108,6 +108,7 @@ public:
     /// A vertex buffer with an attribute stride (the pipeline's vertex layout uses
     /// MTLBufferLayoutStrideDynamic): setVertexBuffer:offset:attributeStride:. Occupies the
     /// vertex-stage buffer `slot`, like SetBuffer(Stage::Vertex, ...), and is replaced by it.
+    /// A stride of 0 reads element 0 for every vertex (Vulkan's stride 0).
     void SetVertexBuffer(u32 slot, BufferRef buffer, u32 stride);
     void SetTexture(Stage stage, u32 slot, void* texture); ///< id<MTLTexture>
     void SetSampler(Stage stage, u32 slot, void* sampler); ///< id<MTLSamplerState>

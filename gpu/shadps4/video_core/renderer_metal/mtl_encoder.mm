@@ -54,7 +54,8 @@ struct StageState {
     struct Slot {
         void* buffer{};
         u64 offset{};
-        u32 stride{}; ///< non-zero: bound with an attribute stride (vertex buffers)
+        u32 stride{};          ///< the attribute stride (0 repeats element 0)
+        bool attribute_stride{}; ///< bound with an attribute stride (vertex buffers)
         std::vector<u8> bytes; ///< non-empty: inline bytes instead of the buffer
     };
     std::array<Slot, MaxBuffers> buffers{};
@@ -444,7 +445,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
                 } else {
                     [e setFragmentBytes:b.bytes.data() length:b.bytes.size() atIndex:slot];
                 }
-            } else if (is_vertex && b.stride) {
+            } else if (is_vertex && b.attribute_stride) {
                 [e setVertexBuffer:(__bridge id<MTLBuffer>)b.buffer
                             offset:b.offset
                     attributeStride:b.stride
@@ -731,6 +732,7 @@ void Encoder::SetBuffer(Stage stage, u32 slot, BufferRef buffer) {
     b.buffer = buffer.buffer;
     b.offset = buffer.offset;
     b.stride = 0;
+    b.attribute_stride = false;
     b.bytes.clear();
     s.buffers_dirty |= 1u << slot;
     s.buffers_used |= 1u << slot;
@@ -739,6 +741,7 @@ void Encoder::SetBuffer(Stage stage, u32 slot, BufferRef buffer) {
 void Encoder::SetVertexBuffer(u32 slot, BufferRef buffer, u32 stride) {
     SetBuffer(Stage::Vertex, slot, buffer);
     impl->vertex.buffers[slot].stride = stride;
+    impl->vertex.buffers[slot].attribute_stride = true;
 }
 
 void Encoder::SetBytes(Stage stage, u32 slot, const void* data, u32 size) {
@@ -759,6 +762,7 @@ void Encoder::SetBytes(Stage stage, u32 slot, const void* data, u32 size) {
     b.buffer = nullptr;
     b.offset = 0;
     b.stride = 0;
+    b.attribute_stride = false;
     b.bytes.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + size);
     s.buffers_dirty |= 1u << slot;
     s.buffers_used |= 1u << slot;
