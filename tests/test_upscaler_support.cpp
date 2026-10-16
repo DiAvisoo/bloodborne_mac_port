@@ -39,7 +39,7 @@ int main() {
                 s.fsr4_problem = nullptr;
                 Load();
                 assert(s.upscaler == requested);
-                ConfigureUpscalerSupport(fsr4, fsr411);
+                ConfigureUpscalerSupport(fsr4, fsr411, true);
                 const bool unsupported = (requested == UpscalerFsr4 && !fsr4) ||
                     (requested == UpscalerFsr411 && !(fsr4 && fsr411));
                 assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
@@ -49,7 +49,7 @@ int main() {
                 assert(s.preset == Performance && s.output_res == 2);
                 // Startup patch settings still describe the already applied guest patches.
                 assert(s.startup_upscaler == requested);
-                ConfigureUpscalerSupport(fsr4, fsr411);
+                ConfigureUpscalerSupport(fsr4, fsr411, true);
                 assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
             }
         }

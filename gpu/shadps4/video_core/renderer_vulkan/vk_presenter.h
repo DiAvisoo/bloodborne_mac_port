@@ -121,6 +121,11 @@ public:
     /// presented, so the screen shows it anyway).
     Frame* PrepareLastFrame();
 
+    /// The Metal device (status lines: bbgpu_dump_breadcrumbs).
+    [[nodiscard]] const Metal::Device& GetDevice() const noexcept {
+        return device;
+    }
+
 private:
     /// The frames and their free list. Shared with the present completion handlers, which may
     /// outlive the presenter when a present is stuck at shutdown.

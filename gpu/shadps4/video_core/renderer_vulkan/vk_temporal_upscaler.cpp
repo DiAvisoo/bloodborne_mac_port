@@ -165,11 +165,9 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
     : instance{instance_}, scheduler{scheduler_}, texture_cache{texture_cache_},
       runtime{runtime_}, camera_motion{camera_motion_}, scene_targets{scene_targets_} {
     // Reject unsupported shaders before allocating resources or recording a frame.
-    BbSettings::ConfigureUpscalerSupport(instance.IsFsr4Int8Supported(),
-                                         instance.IsFsr411Supported(),
+    BbSettings::ConfigureUpscalerSupport(false, false,
                                          instance.IsMetalObjectsSupported() &&
                                              BbMetalFx::Supported());
-    fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
     // Available unless BB_UPSCALER=none; on/off and the parameters are the menu's settings.
     const char* env = std::getenv("BB_UPSCALER");
     enabled = !(env && std::strcmp(env, "none") == 0);
@@ -228,15 +226,13 @@ bool TemporalUpscaler::Active() const {
     // Toggle 1 << 24 switches it off at run time (A/B); history restarts after.
     return enabled && !failed &&
            (BbSettings::Get().upscaler == BbSettings::UpscalerFsr3 ||
-            BbSettings::IsFsr4(BbSettings::Get().upscaler) ||
             BbSettings::Get().upscaler == BbSettings::UpscalerTaa ||
             BbSettings::Get().upscaler == BbSettings::UpscalerMetalFx) &&
            !BbToggle::Disabled(1u << 24);
 }
 
 bool TemporalUpscaler::ReactiveOn() const {
-    // FSR 4 takes no reactive mask: the opaque snapshot and the mask pass would be wasted.
-    return BbSettings::Get().reactive && !BbToggle::Disabled(1u << 27) && !UseFsr4() &&
+    return BbSettings::Get().reactive && !BbToggle::Disabled(1u << 27) &&
            BbSettings::Get().upscaler != BbSettings::UpscalerTaa &&
            BbSettings::Get().upscaler != BbSettings::UpscalerMetalFx; // MetalFX: no mask input
 }
@@ -302,17 +298,9 @@ bool TemporalUpscaler::OnFrameStart() {
         target_height = BbSettings::OutputHeights[output];
         std::printf("Output resolution: %ux%u (live)\n", target_width, target_height);
         failed = false;
-        fsr4_failed = false;
     }
     const bool changed = output_changed || applied_preset != preset || active != last_active ||
                          jitter_on != last_jitter || applied_upscaler != upscaler;
-    if (applied_upscaler != upscaler) {
-        // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
-        scheduler.Finish();
-        fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
-        if (BbSettings::IsFsr4(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
-    }
-    if (applied_upscaler != upscaler) fsr4_failed = false; // retry after a menu change
     // Dynamic scene resolution scaling (live preset switching) works on all GPUs.
     // On GPUs without D32S8 blit support, UI depth is cleared instead of copied from scene.
     if (!scaled_session) {
@@ -369,7 +357,6 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
 }
 
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
-    const bool use_fsr4 = UseFsr4();
     const bool use_taa = BbSettings::Get().upscaler == BbSettings::UpscalerTaa;
     const bool use_metalfx = BbSettings::Get().upscaler == BbSettings::UpscalerMetalFx;
     if (use_taa && (w != ow || h != oh)) {
@@ -377,12 +364,12 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
         return false;
     }
     if (resources_ready && w == width && h == height && ow == out_width && oh == out_height &&
-        hdr == context_hdr && use_fsr4 == resources_fsr4 && use_taa == resources_taa &&
+        hdr == context_hdr && use_taa == resources_taa &&
         use_metalfx == resources_metalfx) {
         return true;
     }
     const auto device = instance.GetDevice();
-    // FSR 4 owns no portable FSR 3 context, but its images can still be in flight.
+    // The images can still be in flight.
     scheduler.Finish();
     resources_ready = false;
     if (context) {
@@ -417,8 +404,8 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
                             : 0;
     create_info.maxRenderSize = {w, h};
     create_info.maxOutputSize = {ow, oh};
-    // FSR 4 has its own model context (vk_fsr4), MetalFX its scaler; the images are shared.
-    if (!use_fsr4 && !use_taa && !use_metalfx) {
+    // MetalFX has its own scaler; the images are shared.
+    if (!use_taa && !use_metalfx) {
         if (const u64 issues = ffxVkPortableValidateUpscaleCreateInfo(&create_info)) {
             PrintIssues("create info", issues);
             return false;
@@ -519,16 +506,11 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
     opaque_valid = false;
     reset = true;
     resources_ready = true;
-    resources_fsr4 = use_fsr4;
     resources_taa = use_taa;
     resources_metalfx = use_metalfx;
     if (use_taa) {
         std::printf("TAA: context %ux%u -> %ux%u (%s), no FSR model\n", w, h, ow, oh,
                     hdr ? "HDR scene color" : "tonemapped frame");
-        return true;
-    }
-    if (use_fsr4) {
-        std::printf("Upscaler: FSR 4 inputs %ux%u -> %ux%u\n", w, h, ow, oh);
         return true;
     }
     FfxVkPortableMemoryUsage usage{};
@@ -1091,9 +1073,6 @@ void TemporalUpscaler::Run() {
     if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
         RecordTaa(cmdbuf, input_color_view, input_depth_view);
         dispatched = true;
-    } else if (UseFsr4()) {
-        dispatched = RecordFsr4(cmdbuf, {input_color, input_color_view, w, h},
-                                {input_depth, input_depth_view, w, h}, w, h, ow, oh, frame_ms);
     } else if (BbSettings::Get().upscaler == BbSettings::UpscalerMetalFx) {
         // bbport: MetalFX encodes into its own Metal command buffer on MoltenVK's queue, so the
         // Vulkan work that wrote color, depth and motion is submitted first (commit order).
@@ -1657,9 +1636,9 @@ void TemporalUpscaler::RunScaled() {
     }
     last_frame = now;
 
-    // bbport: FSR 4 writes its HDR-format output, copied into the output-size UI image.
+    // bbport: TAA and MetalFX write an HDR-format output, copied into the output-size UI image.
     const bool metalfx = BbSettings::Get().upscaler == BbSettings::UpscalerMetalFx;
-    if (UseFsr4() || BbSettings::Get().upscaler == BbSettings::UpscalerTaa || metalfx) {
+    if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa || metalfx) {
         barrier(vk::Image(output_image), vk::ImageAspectFlagBits::eColor,
                 vk::ImageLayout::eUndefined, all, vk::AccessFlagBits2::eNone,
                 vk::ImageLayout::eGeneral, all, rw);
@@ -1695,10 +1674,6 @@ void TemporalUpscaler::RunScaled() {
             if (!ok4) {
                 failed = true;
             }
-        } else {
-            ok4 = RecordFsr4(cmdbuf, {color_image, color_view, source_width, source_height},
-                            {depth_image, depth_view, source_width, source_height}, w, h, ow,
-                            oh, frame_ms);
         }
         if (ok4) {
             if (BbSettings::Get().upscaler != BbSettings::UpscalerTaa) {
@@ -1984,66 +1959,6 @@ bool TemporalUpscaler::DisplayOverride(VAddr address, Display& display) {
                      bgra ? "bgra" : "rgba"}});
     }
     return true;
-}
-
-} // namespace Vulkan
-
-namespace Vulkan {
-
-bool TemporalUpscaler::UseFsr4() const {
-    const int selected = BbSettings::Get().upscaler;
-    const bool supported = selected == BbSettings::UpscalerFsr411
-                               ? instance.IsFsr411Supported()
-                               : instance.IsFsr4Int8Supported();
-    return BbSettings::IsFsr4(selected) && supported && !fsr4_failed;
-}
-
-bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color,
-                                  Fsr4Upscaler::Image depth, u32 w, u32 h, u32 ow, u32 oh,
-                                  float frame_ms) {
-    const auto& settings = BbSettings::Get();
-    // Same jitter convention as FSR 3; the menu (or toggle 1 << 26) flips it for tests.
-    const float sign =
-        BbToggle::Disabled(1u << 26) != settings.fsr4_invert_jitter.load() ? -1.0f : 1.0f;
-    const bool ok = fsr4->Record({
-        .cmdbuf = cmdbuf,
-        .color = color,
-        .depth = depth,
-        .motion = {vk::Image(motion_image), *motion_view, w, h},
-        .output = {vk::Image(output_image), *output_view, ow, oh},
-        .render_width = w,
-        .render_height = h,
-        .preset = applied_preset,
-        .jitter = {sign * jitter[0], sign * jitter[1]},
-        .frame_ms = frame_ms,
-        .near_plane = camera_motion.Near(),
-        .far_plane = 3000.0f,
-        .vertical_fov = camera_motion.VerticalFov(),
-        .sharpness = std::min(settings.sharpness.load(), 1.0f),
-        .sharpen = settings.sharpen,
-        .reset = reset,
-        .auto_exposure = settings.fsr4_auto_exposure,
-    });
-    // The menu shows the reason; it outlives this frame (FSR 4 keeps its last message).
-    static std::string shown;
-    const char* problem = fsr4->Problem();
-    if (!problem) {
-        BbSettings::Get().fsr4_problem = nullptr;
-    } else if (shown != problem) {
-        shown = problem;
-        static std::array<std::string, 8> kept;
-        static u32 next = 0;
-        kept[next] = shown;
-        BbSettings::Get().fsr4_problem = kept[next].c_str();
-        next = (next + 1) % kept.size();
-    }
-    if (!ok && fsr4->Fatal()) {
-        std::printf("Upscaler: falling back to FSR 3.1\n");
-        BbSettings::Get().upscaler = BbSettings::UpscalerFsr3;
-        fsr4_failed = true; // EnsureResources creates the FSR 3 context next frame
-        reset = true;
-    }
-    return ok;
 }
 
 } // namespace Vulkan

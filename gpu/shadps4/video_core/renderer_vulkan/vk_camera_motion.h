@@ -9,9 +9,9 @@
 #error "BB_METAL_NATIVE_STAGE must be defined (gpu/CMakeLists.txt: target_compile_definitions)"
 #endif
 
-#if BB_METAL_NATIVE_STAGE < 5
-// Not converted to Metal yet (M5): gpu/CMakeLists.txt leaves the source out and this stand-in
-// takes its place.
+#ifdef BB_M5_PENDING_VK_CAMERA_MOTION
+// Not converted to Metal yet (M5, BB_M5_PENDING in gpu/CMakeLists.txt): the source is left out
+// of the build and this stand-in takes its place.
 #include "stubs_m3.h"
 #else
 

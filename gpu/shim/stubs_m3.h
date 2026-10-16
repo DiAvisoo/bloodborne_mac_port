@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: stand-ins for the renderer parts not converted to Metal yet (Metal-native renderer,
 // docs/superpowers/plans/2026-10-16-metal-native-roadmap.md). gpu/CMakeLists.txt leaves the
-// unconverted files out of the build below BB_METAL_NATIVE_STAGE; their headers include this one
-// instead and get classes with the same public API that do nothing:
-//   - below stage 5 (M5): the temporal upscaler, camera and object motion and the GPU profiler
+// files named in BB_M5_PENDING out of the build; their headers include this one instead and get
+// classes with the same public API that do nothing (each guarded by BB_M5_PENDING_<FILE NAME>,
+// which CMake defines while the file is pending):
+//   - M5: the temporal upscaler, camera and object motion and the GPU profiler
 //     (vk_temporal_upscaler.h, vk_camera_motion.h, vk_object_motion.h, vk_gpu_profiler.h): all off.
-//     Breadcrumbs and the settings overlay keep their headers; stubs_m3.cpp defines what the
-//     shim calls.
-// Each milestone deletes its part; M5 deletes this file.
+//     The settings overlay keeps its header; stubs_m3.cpp defines what the shim calls.
+// Converting a file removes its name from BB_M5_PENDING and its stand-in from here; the last
+// conversion deletes this file.
 
 #pragma once
 
@@ -43,6 +44,7 @@ struct RenderState;
 
 class CameraMotion;
 
+#ifdef BB_M5_PENDING_VK_TEMPORAL_UPSCALER
 class TemporalUpscaler {
 public:
     TemporalUpscaler(Metal::Device&, Scheduler&, VideoCore::TextureCache&, Runtime&,
@@ -100,9 +102,11 @@ public:
         return false;
     }
 };
+#endif // BB_M5_PENDING_VK_TEMPORAL_UPSCALER
 
 // --- M5: camera motion vectors (vk_camera_motion.h) ------------------------------------------
 
+#ifdef BB_M5_PENDING_VK_CAMERA_MOTION
 class CameraMotion {
 public:
     CameraMotion(Metal::Device&, Scheduler&, VideoCore::TextureCache&, Runtime&) {}
@@ -135,9 +139,11 @@ public:
     void OnGBufferPass(VideoCore::ImageId) {}
     void OnDisplayPass(VideoCore::ImageId) {}
 };
+#endif // BB_M5_PENDING_VK_CAMERA_MOTION
 
 // --- M5: object motion vectors (vk_object_motion.h) ------------------------------------------
 
+#ifdef BB_M5_PENDING_VK_OBJECT_MOTION
 class ObjectMotion {
 public:
     ObjectMotion(Metal::Device&, Scheduler&) {}
@@ -161,9 +167,11 @@ public:
     void OnFrameStart() {}
     void InvalidateHistory() {}
 };
+#endif // BB_M5_PENDING_VK_OBJECT_MOTION
 
 // --- M5: GPU time per pass (vk_gpu_profiler.h): never on -------------------------------------
 
+#ifdef BB_M5_PENDING_VK_GPU_PROFILER
 class GpuProfiler {
 public:
     static GpuProfiler* Get() noexcept {
@@ -182,5 +190,6 @@ public:
     }
     void BeginFrame() {}
 };
+#endif // BB_M5_PENDING_VK_GPU_PROFILER
 
 } // namespace Vulkan

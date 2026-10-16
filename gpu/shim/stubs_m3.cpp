@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: what the shim calls of the breadcrumbs and the settings overlay, whose sources
-// leave the build until M5.
+// bbport: what the shim calls of the settings overlay, whose source stays out of the build until
+// it is converted to Metal (M5; BB_M5_PENDING in gpu/CMakeLists.txt).
 
 #include "bbport_overlay.h"
 #include "stubs_m3.h"
-#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
-
-namespace Vulkan::Breadcrumbs {
-
-void ReportStuck(const char*) {}
-
-} // namespace Vulkan::Breadcrumbs
 
 namespace BbOverlay {
 

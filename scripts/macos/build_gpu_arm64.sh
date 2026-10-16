@@ -39,7 +39,7 @@ cmake -S gpu -B "$OUT" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_PREFIX_PATH="$PREFIX;$boost" \
     -DCMAKE_IGNORE_PREFIX_PATH="/opt/homebrew;/usr/local;$ROOT/deps/x86_64" \
     -DBoost_INCLUDE_DIR="$boost/include" \
-    -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$ROOT/pgo" -DBB_METAL_NATIVE_STAGE=4 -Wno-dev >/dev/null
+    -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$ROOT/pgo" -DBB_METAL_NATIVE_STAGE=5 -Wno-dev >/dev/null
 echo "GPU library (arm64): LTO ${BB_LTO:-ON}"
 if ! ninja -C "$OUT" bbgpu > "$ROOT/out/gpu-arm64-build.log" 2>&1; then
     grep -v '^\[' "$ROOT/out/gpu-arm64-build.log" | tail -40 >&2

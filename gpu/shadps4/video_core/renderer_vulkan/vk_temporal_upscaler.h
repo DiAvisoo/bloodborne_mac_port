@@ -15,9 +15,9 @@
 #error "BB_METAL_NATIVE_STAGE must be defined (gpu/CMakeLists.txt: target_compile_definitions)"
 #endif
 
-#if BB_METAL_NATIVE_STAGE < 5
-// Not converted to Metal yet (M5): gpu/CMakeLists.txt leaves the source out and this stand-in
-// takes its place.
+#ifdef BB_M5_PENDING_VK_TEMPORAL_UPSCALER
+// Not converted to Metal yet (M5, BB_M5_PENDING in gpu/CMakeLists.txt): the source is left out
+// of the build and this stand-in takes its place.
 #include "stubs_m3.h"
 #else
 
@@ -30,7 +30,6 @@
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
-#include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/texture_cache/image.h"
 
 struct FfxVkPortableUpscaleContext;
@@ -132,8 +131,7 @@ public:
     bool DisplayOverride(VAddr address, Display& display);
 
 private:
-    /// bbport: views of guest images the upscaler reads, kept across frames: FSR 4 registers
-    /// images by view in a registry of eight (a new view per frame filled it at Native AA).
+    /// bbport: views of guest images the upscaler reads, kept across frames.
     vk::ImageView CachedView(const VideoCore::Image& image, vk::Format format,
                              vk::ImageAspectFlags aspect);
     struct ViewEntry {
@@ -172,11 +170,6 @@ private:
     void CreatePipelines();
     /// Records the reactive mask pass; false when there is no snapshot this frame.
     bool RecordReactive(vk::ImageView color_view);
-    /// FSR 4 is selected, possible in this session (not BB_RENDER_RES) and has not failed.
-    [[nodiscard]] bool UseFsr4() const;
-    /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over.
-    bool RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
-                    u32 w, u32 h, u32 ow, u32 oh, float frame_ms);
     void RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color, vk::ImageView depth);
     /// Sharpness above 1 for FSR 3/4 (their RCAS stops at 1): one more RCAS pass over the target
     /// (output_image, or the 8-bit UI image with ldr) in General layout after the upscaler.
@@ -250,11 +243,8 @@ private:
     std::unordered_map<VAddr, DisplayImage> displays;
     FfxVkPortableUpscaleContext* context = nullptr;
     bool resources_ready = false; ///< images below match width/height/out size
-    bool resources_fsr4 = false;  ///< made for FSR 4 (no FSR 3 context)
     bool resources_taa = false;
     bool resources_metalfx = false; ///< made for MetalFX (no FSR 3 context)
-    std::unique_ptr<Fsr4Upscaler> fsr4;
-    bool fsr4_failed = false;
     VideoCore::UniqueImage motion_image;
     VideoCore::UniqueImage output_image;
     vk::UniqueImageView motion_view;

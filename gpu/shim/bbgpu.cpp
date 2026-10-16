@@ -29,7 +29,6 @@
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
 #include "common/signal_context.h"
-#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 #include "core/memory.h"
@@ -232,6 +231,12 @@ static void OpenWindow(const BbGpuConfig* config);
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
     BbSettings::Load();
+    if (BbSettings::IsFsr4(BbSettings::Get().upscaler)) {
+        // FSR 4 is removed (M5): off until the fallback rule (M5 Task 9). Not saved.
+        std::printf("Upscaler: %s was removed; using off\n",
+                    BbSettings::UpscalerName(BbSettings::Get().upscaler));
+        BbSettings::Get().upscaler = BbSettings::UpscalerOff;
+    }
 #ifdef __APPLE__
     // MoltenVK encodes Metal commands while our recorder thread records them, instead of all at
     // once inside the flip's vkQueueSubmit (~13 ms per frame on the M4 Max): the flip and the
@@ -600,12 +605,25 @@ extern "C" void bbgpu_dump_host_threads_hang(void* file_handle) {
     std::fflush(f);
 }
 
+// Stuck-GPU diagnostics: the Metal device's tick counters (the old breadcrumb buffer markers
+// need VK_AMD_buffer_marker; a Metal stall shows as a gap between the tick being waited on and
+// the last tick known done).
 extern "C" void bbgpu_dump_breadcrumbs(void* file_handle) {
     if (!file_handle) return;
     FILE* f = static_cast<FILE*>(file_handle);
-    std::fprintf(f, "\n=== GPU BREADCRUMBS STATE ===\n");
-    Vulkan::Breadcrumbs::ReportStuck("diagnostic dump");
-    std::fprintf(f, "=============================\n\n");
+    std::fprintf(f, "\n=== GPU STATE ===\n");
+    if (const auto* p = presenter.get()) {
+        const Metal::Device& device = p->GetDevice();
+        std::fprintf(f,
+                     "Metal device %s: next tick %llu, last tick done %llu, command buffer "
+                     "errors %llu\n",
+                     device.Name().c_str(), (unsigned long long)device.CurrentTick(),
+                     (unsigned long long)device.KnownGpuTick(),
+                     (unsigned long long)device.ErrorCount());
+    } else {
+        std::fprintf(f, "no presenter (the renderer is not running in this process)\n");
+    }
+    std::fprintf(f, "=================\n\n");
     std::fflush(f);
 }
 

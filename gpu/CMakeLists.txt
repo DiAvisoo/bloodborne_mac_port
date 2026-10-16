@@ -142,16 +142,29 @@ list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_metal/")
 # Metal-native renderer (docs/superpowers/plans/2026-10-16-metal-native-roadmap.md): the milestone
 # the renderer sources are converted to. Files of later milestones leave the build; their headers
 # include gpu/shim/stubs_m3.h instead (stand-ins with the same API, compiled in shim/stubs_m3.cpp).
-set(BB_METAL_NATIVE_STAGE 4 CACHE STRING "Metal-native renderer milestone the sources are converted to (4-7)")
-set(BB_UNCONVERTED_5 vk_temporal_upscaler vk_camera_motion vk_object_motion vk_gpu_profiler
-    vk_breadcrumbs vk_fsr4 fsr411/fsr411)
+set(BB_METAL_NATIVE_STAGE 5 CACHE STRING "Metal-native renderer milestone the sources are converted to (5-7)")
+if (BB_METAL_NATIVE_STAGE LESS 5)
+    message(FATAL_ERROR "BB_METAL_NATIVE_STAGE below 5 is gone (the M5 stand-ins are selected by BB_M5_PENDING)")
+endif()
+# Stage 5 (M5) files that are still Vulkan: left out of the build one by one, each with the
+# stand-in class of the same name in stubs_m3.h (BB_M5_PENDING_<NAME> selects it). Converting a
+# file removes its name from this list, and its stand-in in the same task. (The names are the
+# files under renderer_vulkan/ and shim/; imgui_impl_vulkan is the Vulkan ImGui backend, replaced
+# by imgui_impl_metal.)
+set(BB_M5_PENDING vk_temporal_upscaler vk_camera_motion vk_object_motion vk_gpu_profiler
+    bbport_overlay bbport_metalfx imgui_impl_vulkan)
 set(BB_UNCONVERTED_6 host_passes/fsr_pass)
 set(BB_UNCONVERTED_7 vk_instance vk_platform)
-foreach(stage 5 6 7)
+foreach(stage 6 7)
     if (BB_METAL_NATIVE_STAGE LESS ${stage})
         foreach(source IN LISTS BB_UNCONVERTED_${stage})
             list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_vulkan/${source}\\.cpp$")
         endforeach()
+    endif()
+endforeach()
+foreach(source IN LISTS BB_M5_PENDING)
+    if (source MATCHES "^vk_")
+        list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_vulkan/${source}\\.cpp$")
     endif()
 endforeach()
 set(BB_DECODER "")
@@ -167,8 +180,9 @@ set(COMMON
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
-if (BB_METAL_NATIVE_STAGE LESS 5)
-    # The settings overlay draws through Vulkan until M5; stubs_m3.cpp answers for it.
+if ("bbport_overlay" IN_LIST BB_M5_PENDING)
+    # The settings overlay draws through Vulkan until M5; stubs_m3.cpp answers for it (the other
+    # stand-ins are header-only), and goes with the overlay's conversion.
     list(FILTER SHIM_SOURCES EXCLUDE REGEX "shim/bbport_overlay\\.cpp$")
 else()
     list(FILTER SHIM_SOURCES EXCLUDE REGEX "shim/stubs_m3\\.cpp$")
@@ -183,11 +197,15 @@ add_dependencies(bbgpu host_shaders)
 # embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp)
-if (NOT BB_METAL_NATIVE_STAGE LESS 5)
+if (NOT "imgui_impl_vulkan" IN_LIST BB_M5_PENDING)
     target_sources(bbgpu PRIVATE third_party/imgui/backends/imgui_impl_vulkan.cpp)
 endif()
 # PUBLIC: the gated headers (stubs_m3.h) must see the same stage in the tests that include them.
 target_compile_definitions(bbgpu PUBLIC BB_METAL_NATIVE_STAGE=${BB_METAL_NATIVE_STAGE})
+foreach(source IN LISTS BB_M5_PENDING)
+    string(TOUPPER "${source}" pending_name)
+    target_compile_definitions(bbgpu PUBLIC BB_M5_PENDING_${pending_name})
+endforeach()
 target_include_directories(bbgpu PRIVATE third_party/imgui third_party/imgui/backends)
 target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
     BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
@@ -200,7 +218,7 @@ if (APPLE)
     # bbport: one-frame Metal GPU capture (shim/bbport_gpu_capture.h).
     enable_language(OBJCXX)
     target_sources(bbgpu PRIVATE shim/bbport_gpu_capture.mm)
-    if (NOT BB_METAL_NATIVE_STAGE LESS 5)
+    if (NOT "bbport_metalfx" IN_LIST BB_M5_PENDING)
         # MetalFX temporal upscaling (shim/bbport_metalfx.h), used by the upscaler (M5).
         target_sources(bbgpu PRIVATE shim/bbport_metalfx.mm)
     endif()
@@ -278,9 +296,9 @@ else()
     # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
-if (NOT BB_METAL_NATIVE_STAGE LESS 5)
-    # FSR 3.1 and FSR 4 (the temporal upscaler, M5; FSR 3.1 on Metal in M6).
-    target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
+if (NOT BB_METAL_NATIVE_STAGE LESS 6)
+    # FSR 3.1 on Vulkan: not below stage 6 (M6 brings it back through ffx_metal); FSR 4 is gone.
+    target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable)
 endif()
 if (APPLE)
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
@@ -314,9 +332,9 @@ target_link_libraries(scene-resolution-test PRIVATE bbgpu)
 # keep LTO from internalizing them.
 target_link_options(scene-resolution-test PRIVATE -Wl,-export_dynamic)
 target_link_options(motion-shader-test PRIVATE -Wl,-export_dynamic)
-# These two create a Vulkan instance (vk_instance.cpp leaves the build below stage 7); the
-# upscaler milestone (M5) ports them to Metal.
-if (NOT BB_METAL_NATIVE_STAGE LESS 7)
+# These two test the TAA and camera motion kernels. They are ported to Metal with their sources
+# (M5 Tasks 7 and 5): built from stage 5 on, but not while the Vulkan versions are pending.
+if (NOT "vk_temporal_upscaler" IN_LIST BB_M5_PENDING)
     add_executable(taa-shader-test EXCLUDE_FROM_ALL ../tests/test_taa_shader.cpp ../tests/test_gpu_runtime_stubs.cpp)
     target_include_directories(taa-shader-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
     target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)
@@ -324,7 +342,8 @@ if (NOT BB_METAL_NATIVE_STAGE LESS 7)
         COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
     target_link_libraries(taa-shader-test PRIVATE bbgpu)
     add_dependencies(taa-shader-test host_shaders)
-
+endif()
+if (NOT "vk_camera_motion" IN_LIST BB_M5_PENDING)
     add_executable(camera-motion-test EXCLUDE_FROM_ALL ../tests/test_camera_motion.cpp ../tests/test_gpu_runtime_stubs.cpp)
     target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
     target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
@@ -332,13 +351,8 @@ if (NOT BB_METAL_NATIVE_STAGE LESS 7)
     add_dependencies(camera-motion-test host_shaders)
 endif()
 
-# bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
-add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
-    shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)
-target_include_directories(fsr4-bench PRIVATE shadps4/video_core/renderer_vulkan/fsr411)
-target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan)

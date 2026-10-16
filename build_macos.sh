@@ -45,7 +45,7 @@ cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET \
     -DCMAKE_PREFIX_PATH="$PREFIX;$boost" -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew \
     -DBoost_INCLUDE_DIR="$boost/include" \
-    -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" -DBB_METAL_NATIVE_STAGE=4 -Wno-dev >/dev/null
+    -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" -DBB_METAL_NATIVE_STAGE=5 -Wno-dev >/dev/null
 echo "GPU library: LTO ${BB_LTO:-ON}"
 # A failed GPU build must stop here: an older libbbgpu.dylib would otherwise be used silently.
 if ! ninja -C out/gpu bbgpu > out/gpu-build.log 2>&1; then
