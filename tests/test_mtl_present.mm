@@ -3,7 +3,7 @@
 // aspect fit, the post-process pass (gamma, sRGB input, alpha swizzle) against the CPU formula of
 // host_shaders/post_process.frag, the letterboxed present into an offscreen CAMetalLayer's
 // drawable, the present queue's wait on the device's shared event, drawable recycling inside
-// autorelease pools and the queue's destructor. Links bbmetal_core alone; no window.
+// autorelease pools and the queue's destructor (and its bounded waits). Links bbmetal_core alone; no window.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -446,6 +446,55 @@ void TestDestructorWaits(Device& device) {
     Expect(callbacks == kCount, "~PresentQueue returns after every completion callback ran");
 }
 
+// A present stuck behind a device tick that is not committed yet: WaitIdleFor and the destructor
+// give up after their timeout instead of hanging, and the late completion still runs safely.
+void TestBoundedWaits(Device& device) {
+    auto advance_to = [&device](u64 tick) {
+        while (device.CurrentTick() <= tick) {
+            Encoder extra{device};
+            extra.CommandBuffer();
+            extra.Submit();
+        }
+    };
+    auto stuck_present = [](PresentQueue& queue, u64 tick, std::atomic<int>& done) {
+        WithAutoreleasePool([&] {
+            void* cb = queue.Begin();
+            queue.WaitForDeviceTick(cb, tick);
+            queue.Commit(cb, nullptr, [&done] { ++done; });
+        });
+    };
+    std::atomic<int> done{0};
+    {
+        PresentQueue queue{device};
+        const u64 tick = device.CurrentTick() + 1;
+        stuck_present(queue, tick, done);
+        const auto start = std::chrono::steady_clock::now();
+        const bool idle = queue.WaitIdleFor(50);
+        const auto waited = std::chrono::steady_clock::now() - start;
+        Expect(!idle && done == 0, "WaitIdleFor times out while a present waits for a tick");
+        Expect(waited >= std::chrono::milliseconds(45) && waited < std::chrono::seconds(2),
+               "WaitIdleFor waits about its timeout");
+        advance_to(tick);
+        Expect(queue.WaitIdleFor(5000) && done == 1, "WaitIdleFor returns once the tick came");
+    }
+    {
+        const u64 tick = device.CurrentTick() + 1;
+        const auto start = std::chrono::steady_clock::now();
+        {
+            PresentQueue queue{device, 100};
+            stuck_present(queue, tick, done);
+        } // logs an error and leaves the command buffer behind
+        const auto waited = std::chrono::steady_clock::now() - start;
+        Expect(done == 1 && waited < std::chrono::seconds(2),
+               "~PresentQueue gives up after its shutdown timeout");
+        advance_to(tick);
+        for (int i = 0; i < 500 && done != 2; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        Expect(done == 2, "the abandoned present still completes (its state was kept)");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -464,6 +513,7 @@ int main() {
             TestAutoreleaseLoop(device, passes, queue);
         }
         TestDestructorWaits(device);
+        TestBoundedWaits(device);
         Expect(device.ErrorCount() == 0, "no command buffer errors on the device queue");
     }
     if (failures) {

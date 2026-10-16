@@ -83,8 +83,11 @@ void WithAutoreleasePool(const std::function<void()>& body);
 /// raw (never through Device::Commit, whose ticks assume one queue).
 class PresentQueue {
 public:
-    explicit PresentQueue(Device& device);
-    /// Waits for every command buffer in flight (and its callback).
+    /// `shutdown_timeout_ms`: how long the destructor waits for command buffers in flight.
+    explicit PresentQueue(Device& device, u32 shutdown_timeout_ms = 3000);
+    /// Waits up to the shutdown timeout for every command buffer in flight (and its callback).
+    /// On timeout (a present stuck behind a device tick that never comes) it logs an error and
+    /// leaks the queue's state, which the pending callbacks still use, instead of hanging.
     ~PresentQueue();
 
     PresentQueue(const PresentQueue&) = delete;
@@ -101,6 +104,8 @@ public:
     void Commit(void* command_buffer, void* drawable, std::function<void()> on_complete);
     /// Blocks until nothing is in flight.
     void WaitIdle();
+    /// Blocks until nothing is in flight or `milliseconds` passed; true when idle.
+    bool WaitIdleFor(u32 milliseconds);
     /// Command buffers committed whose completion callbacks have not finished.
     [[nodiscard]] u32 InFlight() const;
 

@@ -3,28 +3,21 @@
 
 #pragma once
 
-#ifndef BB_METAL_NATIVE_STAGE
-#error "BB_METAL_NATIVE_STAGE must be defined (gpu/CMakeLists.txt: target_compile_definitions)"
-#endif
-
-#if BB_METAL_NATIVE_STAGE < 4
-// Not converted to Metal yet (M4): gpu/CMakeLists.txt leaves the source out and this stand-in
-// takes its place.
-#include "stubs_m3.h"
-#else
-
-#include <deque>
-#include <thread>
-
+#include <array>
 #include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "core/libraries/videoout/buffer.h"
-#include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
+#include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_object.h"
+#include "video_core/renderer_metal/mtl_present.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Frontend {
@@ -37,18 +30,15 @@ struct Liverpool;
 
 namespace Vulkan {
 
+/// bbport (Metal-native M4): a game frame after the post-process pass, at the size it is shown
+/// (the game image fitted into the window), waiting to be presented to the CAMetalLayer.
 struct Frame {
-    u32 width;
-    u32 height;
-    VmaAllocation allocation;
-    vk::Image image;
-    vk::ImageView image_view;
-    vk::Fence present_done;
-    vk::Semaphore ready_semaphore;
-    u64 ready_tick;
+    u32 width{};
+    u32 height{};
+    Metal::Object texture; ///< id<MTLTexture>, BGRA8Unorm render target (empty: never drawn)
+    u64 ready_tick{};      ///< draw-scheduler tick that wrote it; 0: blank (Present clears)
     bool is_hdr{false};
-    u8 id{};
-
+    u32 id{};
 };
 
 enum SchedulerType {
@@ -68,10 +58,6 @@ public:
         return pp_settings;
     }
 
-    HostPasses::FsrPass::Settings& GetFsrSettingsRef() {
-        return fsr_settings;
-    }
-
     Frontend::WindowSDL& GetWindow() const {
         return window;
     }
@@ -80,17 +66,12 @@ public:
         return *rasterizer.get();
     }
 
+    /// HDR output returns with the Metal presenter's EDR support (backlog); SDR only for now.
     bool IsHDRSupported() const {
-        return swapchain.HasHDR();
+        return false;
     }
 
-    void SetHDR(bool enable) {
-        if (!IsHDRSupported()) {
-            return;
-        }
-        swapchain.SetHDR(enable);
-        pp_settings.hdr = enable ? 1 : 0;
-    }
+    void SetHDR(bool) {}
 
     VideoCore::Image& RegisterVideoOutSurface(
         const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
@@ -104,12 +85,17 @@ public:
 
     bool IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const;
 
+    /// On the thread recording into the draw scheduler: the post-process pass of the guest's
+    /// display buffer into a free frame, submitted. Never null.
     Frame* PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                         VAddr cpu_address);
 
+    /// A frame that presents as black. Never null.
     Frame* PrepareBlankFrame(bool present_thread);
 
-    /// present_id (bbport, frame spike log): tags the present for VK_GOOGLE_display_timing.
+    /// Presents `frame` on the present queue once its draw-scheduler tick is done, and returns
+    /// it to the pool when the present completed. Never touches the draw scheduler.
+    /// present_id (bbport, frame spike log): unused until presented-time stats (M5).
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true,
                  u32 present_id = 0);
 
@@ -121,48 +107,49 @@ public:
         return last_present;
     }
     bool IsDisplayTimingSupported() const {
-        return instance.IsDisplayTimingSupported();
+        return false;
     }
     std::vector<vk::PastPresentationTimingGOOGLE> TakePastTimings() {
-        return swapchain.TakePastTimings();
+        return {};
     }
+    /// The last presented frame again when it is back in the pool, else null (it is still being
+    /// presented, so the screen shows it anyway).
     Frame* PrepareLastFrame();
 
 private:
-    Frame* GetRenderFrame();
+    /// The frames and their free list. Shared with the present completion handlers, which may
+    /// outlive the presenter when a present is stuck at shutdown.
+    struct FramePool {
+        static constexpr u32 Count = 2;
+        std::array<Frame, Count> frames;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<Frame*> free; ///< under `mutex`
+        Frame* last_presented{}; ///< under `mutex`
 
-    void RecreateFrame(Frame* frame, u32 width, u32 height);
+        /// Blocks until a frame is free and takes it.
+        Frame* Take();
+        /// Returns a frame to the free list.
+        void Free(Frame* frame);
+    };
 
-    void SetExpectedGameSize(s32 width, s32 height);
-
-private:
-    float expected_ratio{1920.0 / 1080.0f};
-    u32 expected_frame_width{1920};
-    u32 expected_frame_height{1080};
+    /// A free frame whose texture has the given size (recreated when it differs).
+    Frame* GetRenderFrame(u32 width, u32 height);
 
     Frontend::WindowSDL& window;
-    Instance instance;
-    HostPasses::FsrPass fsr_pass;
-    HostPasses::FsrPass::Settings fsr_settings{};
-    HostPasses::PostProcessingPass::Settings pp_settings{};
-    HostPasses::PostProcessingPass pp_pass;
     AmdGpu::Liverpool* liverpool;
+    Metal::Device device;
     Scheduler draw_scheduler;
     std::deque<u64> recent_frame_ticks; ///< bbport: BB_FRAMES_AHEAD bound (PrepareFrame)
-    Scheduler present_scheduler;
-    Scheduler flip_scheduler;
-    Swapchain swapchain;
     Runtime runtime;
     std::unique_ptr<Rasterizer> rasterizer;
     VideoCore::TextureCache& texture_cache;
-    vk::UniqueCommandPool command_pool;
-    std::vector<Frame> present_frames;
-    std::queue<Frame*> free_queue;
-    Frame* last_submit_frame;
+    void* layer; ///< CAMetalLayer* (the window's, SDL_Metal_GetLayer)
+    HostPasses::PostProcessingPass::Settings pp_settings{};
+    HostPasses::PostProcessingPass pp_pass;
+    std::unique_ptr<Metal::PresentQueue> present_queue;
+    std::shared_ptr<FramePool> pool;
     PresentTiming last_present{};
-    std::mutex free_mutex;
-    std::condition_variable free_cv;
-    std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
     // bbport: frame timeline (BB_FRAME_STATS): flips waiting for GPU completion. Last, so the
     // thread stops before anything it uses is destroyed.
@@ -174,5 +161,3 @@ private:
 };
 
 } // namespace Vulkan
-
-#endif // BB_METAL_NATIVE_STAGE < 4

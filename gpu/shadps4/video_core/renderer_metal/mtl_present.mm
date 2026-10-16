@@ -5,6 +5,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include "common/assert.h"
@@ -160,9 +161,12 @@ struct PresentQueue::Impl {
     std::mutex mutex;
     std::condition_variable idle;
     u32 in_flight{}; ///< under `mutex`
+    u32 shutdown_timeout_ms{};
 };
 
-PresentQueue::PresentQueue(Device& device) : impl{std::make_unique<Impl>()} {
+PresentQueue::PresentQueue(Device& device, u32 shutdown_timeout_ms)
+    : impl{std::make_unique<Impl>()} {
+    impl->shutdown_timeout_ms = shutdown_timeout_ms;
     impl->queue = [(__bridge id<MTLDevice>)device.NativeDevice() newCommandQueue];
     ASSERT_MSG(impl->queue != nil, "No Metal present queue");
     impl->queue.label = @"Present";
@@ -170,7 +174,12 @@ PresentQueue::PresentQueue(Device& device) : impl{std::make_unique<Impl>()} {
 }
 
 PresentQueue::~PresentQueue() {
-    WaitIdle();
+    if (!WaitIdleFor(impl->shutdown_timeout_ms)) {
+        LOG_ERROR(Render, "Metal present queue: {} command buffer(s) still in flight after {} ms; "
+                          "leaving them behind",
+                  InFlight(), impl->shutdown_timeout_ms);
+        (void)impl.release(); // their completion handlers still use it
+    }
 }
 
 void* PresentQueue::Begin() {
@@ -218,6 +227,12 @@ void PresentQueue::Commit(void* command_buffer, void* drawable,
 void PresentQueue::WaitIdle() {
     std::unique_lock lock{impl->mutex};
     impl->idle.wait(lock, [this] { return impl->in_flight == 0; });
+}
+
+bool PresentQueue::WaitIdleFor(u32 milliseconds) {
+    std::unique_lock lock{impl->mutex};
+    return impl->idle.wait_for(lock, std::chrono::milliseconds(milliseconds),
+                               [this] { return impl->in_flight == 0; });
 }
 
 u32 PresentQueue::InFlight() const {
