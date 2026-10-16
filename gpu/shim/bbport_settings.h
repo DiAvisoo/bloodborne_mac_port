@@ -97,6 +97,11 @@ struct Values {
     /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;
     int startup_upscaler = UpscalerFsr3;
+    /// What the ini (or BB_UPSCALER) asked for, and the value Load() ran with. They differ for
+    /// the removed FSR 4 choices, which run as off; Save() writes requested_upscaler while the
+    /// running choice is still loaded_upscaler (the user did not change it).
+    int requested_upscaler = UpscalerFsr3;
+    int loaded_upscaler = UpscalerFsr3;
     bool startup_object_motion = true;
     bool startup_effects[EffectCount]{};
     int startup_model_lod = 0;

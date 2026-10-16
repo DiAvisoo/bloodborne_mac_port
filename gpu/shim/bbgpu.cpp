@@ -231,12 +231,6 @@ static void OpenWindow(const BbGpuConfig* config);
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
     BbSettings::Load();
-    if (BbSettings::IsFsr4(BbSettings::Get().upscaler)) {
-        // FSR 4 is removed (M5): off until the fallback rule (M5 Task 9). Not saved.
-        std::printf("Upscaler: %s was removed; using off\n",
-                    BbSettings::UpscalerName(BbSettings::Get().upscaler));
-        BbSettings::Get().upscaler = BbSettings::UpscalerOff;
-    }
 #ifdef __APPLE__
     // MoltenVK encodes Metal commands while our recorder thread records them, instead of all at
     // once inside the flip's vkQueueSubmit (~13 ms per frame on the M4 Max): the flip and the

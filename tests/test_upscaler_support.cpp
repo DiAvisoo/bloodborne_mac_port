@@ -38,19 +38,26 @@ int main() {
                 std::fclose(config);
                 s.fsr4_problem = nullptr;
                 Load();
-                assert(s.upscaler == requested);
                 ConfigureUpscalerSupport(fsr4, fsr411, true);
-                const bool unsupported = (requested == UpscalerFsr4 && !fsr4) ||
-                    (requested == UpscalerFsr411 && !(fsr4 && fsr411));
-                assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
+                // FSR 4 is removed from the Mac build: its choices run as off whatever the GPU
+                // supports (was: FSR 3.1 only where the GPU lacked the FSR 4 shaders).
+                const bool removed = IsFsr4(requested);
+                assert(s.requested_upscaler == requested);
+                assert(s.upscaler == (removed ? UpscalerOff : requested));
+                assert(!s.fsr4_problem.load());
                 assert(s.fsr4_supported == fsr4);
                 assert(s.fsr411_supported == (fsr4 && fsr411));
-                assert(bool(s.fsr4_problem.load()) == unsupported);
                 assert(s.preset == Performance && s.output_res == 2);
                 // Startup patch settings still describe the already applied guest patches.
-                assert(s.startup_upscaler == requested);
+                assert(s.startup_upscaler == s.upscaler);
                 ConfigureUpscalerSupport(fsr4, fsr411, true);
-                assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
+                assert(s.upscaler == (removed ? UpscalerOff : requested));
+                // A Save() with the choice untouched writes the user's value back.
+                Save();
+                s.upscaler = UpscalerOff;
+                s.requested_upscaler = UpscalerOff;
+                Load();
+                assert(s.requested_upscaler == requested);
             }
         }
     }

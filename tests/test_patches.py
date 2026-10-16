@@ -76,6 +76,15 @@ class NativeUiTests(unittest.TestCase):
         self.assertIsNone(render_size({'preset': '0'}))
         self.assertIsNone(render_size({'upscaler': 'off', 'preset': '3'}))
 
+    def test_removed_fsr4_choices_run_as_off(self):
+        for name in ('fsr4', 'fsr411'):
+            self.assertIsNone(render_size({'upscaler': name, 'preset': '3'}))
+        with mock.patch.object(sys, 'platform', 'darwin'):
+            self.assertEqual(scaled_sizes({'upscaler': 'fsr4', 'preset': '3'}),
+                             scaled_sizes({'upscaler': 'off', 'preset': '3'}))
+            self.assertEqual(scaled_sizes({'output_res': '2560x1440', 'upscaler': 'fsr411', 'preset': '3'}),
+                             scaled_sizes({'output_res': '2560x1440', 'upscaler': 'off', 'preset': '3'}))
+
     def test_output_other_than_1080p_scales_the_scene(self):
         with mock.patch.object(sys, 'platform', 'linux'):
             self.assertIsNone(scaled_sizes({'output_res': '1920x1080', 'preset': '2'}))

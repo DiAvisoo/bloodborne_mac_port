@@ -110,12 +110,18 @@ def read_settings(path):
     return settings
 
 
+def upscaler_of(settings,default='fsr3'):
+    """The upscaler that runs: the removed FSR 4 choices run as off (macOS port, M5)."""
+    name=settings.get('upscaler',default)
+    return 'off' if name in ('fsr4','fsr411') else name
+
+
 def render_size(settings,override=''):
     """Render resolution for the upscaler preset, or None for native."""
     if override:
         w,h=(int(v) for v in override.lower().split('x'))
         return (w,h)
-    if settings.get('upscaler','fsr3')=='off': return None
+    if upscaler_of(settings)=='off': return None
     preset=int(settings.get('preset','0') or 0)
     scale=PRESET_SCALES[max(0,min(preset,len(PRESET_SCALES)-1))]
     if scale==1.0: return None
@@ -144,9 +150,9 @@ def scaled_sizes(settings):
         # cancel the saving on a pixel-bound GPU: the whole frame renders at the preset size
         # (a restart per preset change). live_resolution=1 keeps the live path there too.
         if sys.platform!='darwin' or settings.get('live_resolution')=='1': return None
-        if settings.get('upscaler','fsr3')=='off': return None
+        if upscaler_of(settings)=='off': return None
     scale=1.0
-    if settings.get('upscaler','fsr3')!='off':
+    if upscaler_of(settings)!='off':
         preset=int(settings.get('preset','0') or 0)
         scale=PRESET_SCALES[max(0,min(preset,len(PRESET_SCALES)-1))]
     render=tuple(max(2,round(v/scale/2)*2) for v in out)

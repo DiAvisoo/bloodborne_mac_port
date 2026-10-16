@@ -159,6 +159,9 @@ if [[ ${1:-} == --test ]]; then
         ninja -C out/gpu-arm64 scene-resolution-test >/dev/null
         out/gpu-arm64/scene-resolution-test 2>&1 | grep -E 'PASS|FAIL'
         BB_SCENE_STENCIL_BITS=1 out/gpu-arm64/scene-resolution-test 2>&1 | grep -E 'PASS|FAIL'
+        # Saved upscaler choices (FSR 4 runs as off, the ini keeps the user's value).
+        ninja -C out/gpu-arm64 upscaler-support-test >/dev/null
+        out/gpu-arm64/upscaler-support-test 2>&1 | grep -E 'PASS|FAIL' || { echo 'FAIL: upscaler-support-test'; exit 1; }
     fi
     # Metal-native M3: every pipeline of a stored pipeline cache built through the renderer's
     # pipeline cache (needs a cache from a game run; BB_MSL_CHECK_DIR picks another one).

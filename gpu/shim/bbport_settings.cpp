@@ -148,6 +148,13 @@ void Load() {
             Set(v, key, value);
         }
     }
+    v.requested_upscaler = v.upscaler;
+    if (IsFsr4(v.upscaler)) {
+        // FSR 4 is removed from the Mac build (M5): it runs as off (M5 Task 9: fallback rule).
+        std::printf("Upscaler: %s was removed; using off\n", UpscalerName(v.upscaler));
+        v.upscaler = UpscalerOff;
+    }
+    v.loaded_upscaler = v.upscaler;
     v.startup_preset = v.preset;
     v.startup_upscaler = v.upscaler;
     v.startup_object_motion = v.object_motion;
@@ -220,14 +227,17 @@ void Save() {
         std::printf("Settings: cannot write %s\n", Path());
         return;
     }
+    // A choice the menu did not change keeps what the user asked for (FSR 4 runs as off).
+    const int saved_upscaler =
+        v.upscaler == v.loaded_upscaler ? v.requested_upscaler : int(v.upscaler);
     std::printf("Settings: saved %s (upscaler=%s preset=%d jitter=%d)\n", Path(),
-                UpscalerName(v.upscaler), v.preset.load(), int(v.jitter.load()));
+                UpscalerName(saved_upscaler), v.preset.load(), int(v.jitter.load()));
     std::fprintf(file,
                  "# bbport settings (in-game menu: " BBPORT_MENU_KEYS " / L3+R3)\n"
                  "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
                  "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
-                 UpscalerName(v.upscaler), v.preset.load(), int(v.sharpen.load()),
+                 UpscalerName(saved_upscaler), v.preset.load(), int(v.sharpen.load()),
                  v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
                  int(v.object_motion.load()),
                  v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
