@@ -11,6 +11,7 @@ namespace Metal {
 struct RenderPipeline;
 struct ComputePipeline;
 struct TessellationPipeline;
+struct GeometryPipeline;
 struct DepthStencilKey;
 } // namespace Metal
 
@@ -31,6 +32,7 @@ struct FixedState {
 struct GraphicsEntry {
     const Metal::RenderPipeline* render{};     ///< null: no Metal pipeline (the draw is skipped)
     const Metal::TessellationPipeline* tess{}; ///< a tessellated draw's pipelines
+    const Metal::GeometryPipeline* geometry{}; ///< a geometry-shader draw's pipelines
     bool rect_list{};                          ///< the vertex shader is the rect list rewrite
     bool generic{};                            ///< built from a Vulkan create info (host passes)
     FixedState fixed;                          ///< generic pipelines: their static state

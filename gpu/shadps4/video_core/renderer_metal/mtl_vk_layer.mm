@@ -58,7 +58,8 @@ using MetalFrame::Owned;
     X(vkCmdWriteTimestamp) X(vkCmdWriteTimestamp2) X(vkCmdWriteBufferMarkerAMD)                    \
     X(vkCreateSampler) X(vkDestroySampler) X(vkDestroyImageView) X(vkDestroyPipeline)              \
     X(vkGetBufferDeviceAddress) X(vkGetBufferDeviceAddressKHR) X(vkCreateShaderModule)            \
-    X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkCreateImageView)
+    X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkCreateImageView)               \
+    X(vkSetDebugUtilsObjectNameEXT)
 
 enum Id : unsigned {
 #define BB_ID(name) Id_##name,
@@ -161,6 +162,32 @@ void OwnBuffer(VkCommandBuffer cb) {
     }
     owned_count.store(unsigned(owned.size()), std::memory_order_release);
     ++owned_generation;
+}
+
+/// Placeholder handles for the pipelines only the Metal path has (geometry shaders).
+std::mutex placeholder_mutex;
+std::vector<VkPipeline> placeholders;
+std::atomic<uint64_t> next_placeholder{1};
+VkPipeline PlaceholderPipeline() {
+    const VkPipeline p = reinterpret_cast<VkPipeline>(0xBB00000000000000ull | next_placeholder++);
+    std::scoped_lock lock{placeholder_mutex};
+    placeholders.push_back(p);
+    return p;
+}
+/// `forget`: the handle goes (vkDestroyPipeline).
+bool IsPlaceholderPipeline(VkPipeline p, bool forget = true) {
+    if ((reinterpret_cast<uint64_t>(p) >> 56) != 0xBB) {
+        return false;
+    }
+    std::scoped_lock lock{placeholder_mutex};
+    auto it = std::find(placeholders.begin(), placeholders.end(), p);
+    if (it == placeholders.end()) {
+        return false;
+    }
+    if (forget) {
+        placeholders.erase(it);
+    }
+    return true;
 }
 
 void Unsupported(unsigned id) {
@@ -268,16 +295,36 @@ struct Hook<I, R (*)(A...)> {
                 MetalShadow::ModuleCreated(*out, info);
             }
             return result;
-        } else if constexpr (I == Id_vkCreateGraphicsPipelines || I == Id_vkCreateComputePipelines) {
+        } else if constexpr (I == Id_vkCreateGraphicsPipelines) {
+            // Pipelines with a geometry shader exist only on the Metal path (MoltenVK has no
+            // geometry stage): they get a placeholder handle MoltenVK never sees.
+            const auto [dev, cache, count, infos, alloc, out] = std::tuple{args...};
+            R result = VK_SUCCESS;
+            for (uint32_t i = 0; i < count; ++i) {
+                bool geometry = false;
+                for (uint32_t st = 0; st < infos[i].stageCount; ++st) {
+                    geometry |= infos[i].pStages[st].stage == VK_SHADER_STAGE_GEOMETRY_BIT;
+                }
+                if (geometry && frame_enabled) {
+                    out[i] = PlaceholderPipeline();
+                } else {
+                    const R one = original(dev, cache, 1, &infos[i], alloc, &out[i]);
+                    if (one != VK_SUCCESS) {
+                        result = one;
+                        continue;
+                    }
+                }
+                if (frame_enabled && !geometry) {
+                    MetalShadow::GraphicsCreated(&infos[i], out[i]);
+                }
+            }
+            return result;
+        } else if constexpr (I == Id_vkCreateComputePipelines) {
             const auto [dev, cache, count, infos, alloc, out] = std::tuple{args...};
             const R result = original(args...);
             if (frame_enabled) {
                 for (uint32_t i = 0; i < count; ++i) {
-                    if constexpr (I == Id_vkCreateGraphicsPipelines) {
-                        MetalShadow::GraphicsCreated(&infos[i], out[i]);
-                    } else {
-                        MetalShadow::ComputeCreated(&infos[i], out[i]);
-                    }
+                    MetalShadow::ComputeCreated(&infos[i], out[i]);
                 }
             }
             return result;
@@ -288,6 +335,13 @@ struct Hook<I, R (*)(A...)> {
                 MetalFrame::ImageViewCreated(*out, info);
             }
             return result;
+        } else if constexpr (I == Id_vkSetDebugUtilsObjectNameEXT) {
+            const auto info = std::get<1>(std::tuple{args...});
+            if (info && info->objectType == VK_OBJECT_TYPE_PIPELINE &&
+                IsPlaceholderPipeline(reinterpret_cast<VkPipeline>(info->objectHandle), false)) {
+                return VK_SUCCESS; // MoltenVK does not know the placeholder
+            }
+            return original(args...);
         } else if constexpr (I == Id_vkDestroySampler) {
             if (present_enabled || frame_enabled) {
                 MetalFrame::SamplerDestroyed(std::get<1>(std::tuple{args...}));
@@ -299,7 +353,11 @@ struct Hook<I, R (*)(A...)> {
             }
             return original(args...);
         } else if constexpr (I == Id_vkDestroyPipeline) {
-            MetalShadow::Forget(std::get<1>(std::tuple{args...}));
+            const VkPipeline pipeline = std::get<1>(std::tuple{args...});
+            MetalShadow::Forget(pipeline);
+            if (IsPlaceholderPipeline(pipeline)) {
+                return;
+            }
             return original(args...);
         } else if constexpr (I == Id_vkGetBufferDeviceAddress || I == Id_vkGetBufferDeviceAddressKHR) {
             const R address = original(args...);
@@ -459,6 +517,10 @@ struct Hook<I, R (*)(A...)> {
 
 bool PresentEnabled() {
     return present_enabled && !frame_enabled;
+}
+
+bool FrameEnabled() {
+    return frame_enabled;
 }
 
 void* MtlDevice() {

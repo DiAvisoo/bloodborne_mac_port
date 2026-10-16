@@ -134,6 +134,23 @@ which is not where the time goes. So, in stages:
   image as MoltenVK), 0 unsupported commands, 0 draws without a pipeline; tessellated draws
   (~40/frame) still skipped. First speed: **85.7 FPS vs 94.8 through MoltenVK**, before any
   optimisation (a lock per command, per-bind object lookups, all state set per draw).
+  *Later the same night:* unretained-reference command buffers (Metal's completion thread was
+  saturated releasing resources, delaying "frame done" 7 ms), a per-thread lookup instead of a
+  lock per command, a residency set for the 91 device-address buffers with only the guest arena
+  declared per encoder, render encoders declaring the arena read-only (writes come from compute),
+  **tessellated draws** (vertex and control shaders as compute kernels, the patch draw in the
+  reopened pass) and **geometry-shader draws** (`BB_METAL_GEOMETRY=0` to keep them off): the
+  Instance reports a geometry stage on the Metal path, the layer gives those pipelines placeholder
+  handles MoltenVK never sees, and Huax-1839's geometry emulation (export and geometry shaders as
+  compute kernels, strip draw through a generated pass-through function) draws them. **MoltenVK
+  skips these draws; the Metal path renders them** (one such pipeline in the Hunter's Dream).
+  Chunked commits (`BB_METAL_CHUNK`) are off: the renderer copies guest data into GPU memory from
+  the CPU while recording, so a chunk the GPU started early read data meant for later draws
+  (broken geometry while walking; correct with chunking off).
+  Hunter's Dream 1080p native, three alternating pairs: **Metal 88.7 FPS (89.9, 87.9, 88.2) vs
+  MoltenVK 91.2 (86.5, 91.8, 95.2)**, Metal drawing everything incl. tessellation and geometry
+  shaders; walk correct. Known gap: passes whose pipeline names a depth format without a depth
+  attachment (Metal validation error, harmless in practice; needs pipeline variants).
 - **M3, pass merging:** load/store actions from what we know is read later; merge passes split by
   copies/uploads; one compute encoder for consecutive dispatches.
 - **M4, tessellation:** Metal tessellation (control stage as a compute kernel, post-tessellation

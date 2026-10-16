@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
 #include "video_core/renderer_metal/mtl_frame.h"
 #include <vulkan/vulkan_metal.h>
@@ -15,6 +16,7 @@
 #include "video_core/renderer_metal/mtl_shader.h"
 #include "video_core/renderer_metal/mtl_shadow.h"
 #include "video_core/renderer_metal/mtl_tessellation.h"
+#include "video_core/renderer_metal/mtl_geometry.h"
 #include "video_core/renderer_metal/vk_to_mtl.h"
 
 namespace MetalFrame {
@@ -318,7 +320,7 @@ bool PrepareDraw(Owned& o) {
         return false;
     }
     const Metal::RenderPipeline& p = *entry->render;
-    if (p.primitive_emulated && !entry->rect_list && !entry->tess) {
+    if (p.primitive_emulated && !entry->rect_list && !entry->tess && !entry->geometry) {
         ++stats.skipped_emulated;
         Log("a topology Metal lacks (fan, quad list, adjacency) is not expanded yet (skipped)");
         return false;
@@ -814,10 +816,13 @@ void EndRendering(Owned& o) {
     }
     o.rendering = false;
     o.pass = nil;
-    // BB_METAL_CHUNK=<draws> (default 200, 0: off): commit partway through the frame.
+    // BB_METAL_CHUNK=<draws> (default 0: off): commit partway through the frame. Off because the
+    // renderer writes guest data into GPU memory from the CPU while it records (host copies),
+    // assuming nothing of the frame runs before the submit: an early chunk read data meant for
+    // later draws (broken geometry while walking). Needs those writes ordered first.
     static const u32 chunk = [] {
         const char* env = std::getenv("BB_METAL_CHUNK");
-        return env ? u32(std::strtoul(env, nullptr, 10)) : 200u;
+        return env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
     }();
     if (chunk && o.chunk_draws >= chunk) {
         CommitChunk(o);
@@ -1019,9 +1024,111 @@ void TessellatedDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 ver
              baseInstance:0];
     ++stats.draws;
 }
+/// A geometry-shader draw (as Huax-1839's RecordGeometryDraw): per chunk of primitives the
+/// export shader and the geometry shader as compute kernels writing vertex records and strip
+/// indices, then the strip draws (pass-through vertex function) in the reopened render pass.
+void GeometryDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 vertex_offset,
+                  u32 first_instance, bool indexed, u32 first_index) {
+    const Metal::GeometryPipeline& geo = *o.graphics->geometry;
+    const u32 prims = geo.info.input_vertices ? count / geo.info.input_vertices : 0;
+    if (!prims || !instance_count) {
+        return;
+    }
+    if (instance_count > 1) {
+        Log("instanced geometry-shader draws draw instance 0 only");
+    }
+    if (!o.pass) {
+        Log("a geometry-shader draw outside a render pass (skipped)");
+        return;
+    }
+    Metal::Tessellation::DrawParams params;
+    params.num_vertices = prims * geo.info.input_vertices;
+    params.first_vertex = indexed ? u32(vertex_offset) : first;
+    params.first_instance = first_instance;
+    u64 index_size = 0;
+    if (indexed) {
+        if (!o.index_buffer || o.index_type == VK_INDEX_TYPE_UINT8_EXT) {
+            Log("a geometry-shader indexed draw without usable indices (skipped)");
+            return;
+        }
+        index_size = IndexSize(o.index_type);
+        params.index_type = index_size == 4 ? 2 : 1;
+        params.index_buffer = (__bridge void*)o.index_buffer;
+        params.index_offset = o.index_offset + u64(first_index) * index_size;
+    }
+    std::array<Metal::Tessellation::VertexBinding, 32> bindings;
+    const u32 num_bindings = std::min<u32>(geo.num_vertex_slots, bindings.size());
+    for (u32 j = 0; j < num_bindings; ++j) {
+        const auto& slot = geo.vertex_slots[j];
+        const auto& vb = slot.location < o.vertex_buffers.size() ? o.vertex_buffers[slot.location]
+                                                                 : Owned::VertexBuffer{};
+        bindings[j] = {(__bridge void*)(vb.buffer ? vb.buffer : null_buffer),
+                       vb.buffer ? vb.offset : 0, slot.constant || !vb.stride ? 16 : vb.stride,
+                       slot.slot};
+    }
+    [o.render endEncoding];
+    o.render = nil;
+    id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
+    const auto bind = [&](const Metal::CompiledShader& shader) {
+        BindStage(o, Stage::Compute, &shader, o.graphics_bindings);
+    };
+    struct Chunk {
+        Metal::Geometry::Plan plan;
+        id<MTLBuffer> buffer;
+        u64 offset;
+    };
+    std::vector<Chunk> chunks;
+    const u32 chunk_prims = Metal::Geometry::MaxPrimitivesPerChunk(geo);
+    for (u32 at = 0; at < prims; at += chunk_prims) {
+        const u32 n = std::min(chunk_prims, prims - at);
+        Chunk chunk;
+        chunk.plan = Metal::Geometry::PlanScratch(geo, n);
+        std::tie(chunk.buffer, chunk.offset) = Scratch(o, chunk.plan.total);
+        Metal::Tessellation::DrawParams draw = params;
+        draw.num_vertices = n * geo.info.input_vertices;
+        const u64 first_vertex = u64(at) * geo.info.input_vertices;
+        if (indexed) {
+            draw.index_offset = params.index_offset + first_vertex * index_size;
+        } else {
+            draw.first_vertex = params.first_vertex + u32(first_vertex);
+        }
+        Metal::Geometry::EncodeKernels((__bridge void*)enc, geo, draw, at,
+                                       std::span{bindings.data(), num_bindings},
+                                       (__bridge void*)chunk.buffer, chunk.offset, chunk.plan,
+                                       bind, bind);
+        chunks.push_back(chunk);
+    }
+    [o.compute endEncoding];
+    o.compute = nil;
+    o.render = [o.cmd renderCommandEncoderWithDescriptor:o.pass];
+    UseAddressBuffers(o.render, true);
+    if (!PrepareDraw(o)) {
+        return;
+    }
+    for (const Chunk& chunk : chunks) {
+        // The pass-through function reads the records at its buffer 0.
+        [o.render setVertexBuffer:chunk.buffer
+                           offset:chunk.offset + chunk.plan.record_offset
+                          atIndex:0];
+        [o.render drawIndexedPrimitives:MTLPrimitiveType(geo.render->primitive_type)
+                             indexCount:u64(chunk.plan.prims) * geo.info.IndexSlots()
+                              indexType:MTLIndexTypeUInt32
+                            indexBuffer:chunk.buffer
+                      indexBufferOffset:chunk.offset + chunk.plan.index_offset
+                          instanceCount:1
+                             baseVertex:0
+                           baseInstance:0];
+    }
+    ++stats.draws;
+    ++o.chunk_draws;
+}
 } // namespace
 
 void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 first_instance) {
+    if (o.graphics && o.graphics->geometry) {
+        GeometryDraw(o, vertex_count, instance_count, first_vertex, 0, first_instance, false, 0);
+        return;
+    }
     if (o.graphics && o.graphics->tess) {
         TessellatedDraw(o, vertex_count, instance_count, first_vertex, 0, first_instance, false, 0);
         return;
@@ -1046,6 +1153,11 @@ void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 
 
 void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
                  s32 vertex_offset, u32 first_instance) {
+    if (o.graphics && o.graphics->geometry) {
+        GeometryDraw(o, index_count, instance_count, 0, vertex_offset, first_instance, true,
+                     first_index);
+        return;
+    }
     if (o.graphics && o.graphics->tess) {
         TessellatedDraw(o, index_count, instance_count, 0, vertex_offset, first_instance, true,
                         first_index);

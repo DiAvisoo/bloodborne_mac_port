@@ -21,6 +21,8 @@
 #include "video_core/renderer_metal/mtl_shadow.h"
 #include "video_core/renderer_metal/mtl_vk_layer.h"
 #include "video_core/renderer_metal/mtl_spirv_rectlist.h"
+#include "video_core/renderer_metal/mtl_geometry.h"
+#include "video_core/renderer_metal/mtl_spirv_geometry.h"
 #include "video_core/renderer_metal/vk_to_mtl.h"
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -45,6 +47,7 @@ struct State {
     std::filesystem::path dir;
     Metal::ShaderCompiler compiler;
     Metal::PsoCache pso;
+    Metal::Geometry::PassThroughCache pass_through{device};
     std::mutex mutex;
     std::unordered_map<u64, std::shared_ptr<std::vector<u32>>> spirv; ///< by VkShaderModule
     std::unordered_map<u64, std::shared_ptr<ShaderEntry>> shaders;          ///< by VkShaderModule
@@ -53,6 +56,7 @@ struct State {
     std::atomic<u32> shader_failed{}, no_spirv{};
     std::atomic<u32> rect_ok{}, rect_failed{};
     std::atomic<u32> tess_ok{}, tess_failed{}, tess_unsupported{};
+    std::atomic<u32> geometry_ok{}, geometry_failed{}, geometry_unsupported{};
     std::atomic<u32> skipped_geometry{}, skipped_quad{},
         skipped_aux_fragment{};
     std::atomic<u32> seen{};
@@ -166,11 +170,12 @@ struct State {
             return;
         }
         std::printf("Metal shadow: %u pipelines: render %u ok / %u failed, compute %u ok / %u "
-                    "failed, rect lists %u ok / %u failed, tessellation %u ok / %u failed / %u not "
+                    "failed, geometry %u ok / %u failed / %u unsupported, rect lists %u ok / %u failed, tessellation %u ok / %u failed / %u not "
                     "possible in Metal; shaders failed %u, no SPIR-V %u; not yet: geometry %u, quad "
                     "lists %u, clip-emulation fragment %u\n",
                     n, render_ok.load(), render_failed.load(), compute_ok.load(),
-                    compute_failed.load(), rect_ok.load(), rect_failed.load(), tess_ok.load(),
+                    compute_failed.load(), geometry_ok.load(), geometry_failed.load(),
+                    geometry_unsupported.load(), rect_ok.load(), rect_failed.load(), tess_ok.load(),
                     tess_failed.load(), tess_unsupported.load(), shader_failed.load(),
                     no_spirv.load(), skipped_geometry.load(),
                     skipped_quad.load(), skipped_aux_fragment.load());
@@ -293,7 +298,83 @@ void Graphics(const Vulkan::GraphicsPipelineKey& key, std::span<const vk::Shader
             s.graphics[VkPipeline(vk_pipeline)] = {.render = tess->render, .tess = tess};
         }
     } else if (has(Stage::Geometry)) {
-        ++s.skipped_geometry;
+        // As Huax-1839's PipelineCache::GeometryShaders: the export shader as a kernel per index
+        // type, the geometry shader as a kernel, a generated pass-through vertex function.
+        using Kind = Metal::CompileVariant::Kind;
+        const auto es_module = modules[u32(Stage::Vertex)];
+        const auto gs_module = modules[u32(Stage::Geometry)];
+        const auto gs_words = s.Words(gs_module);
+        std::string why;
+        const Metal::GeometryPipeline* geo = nullptr;
+        if (!has(Stage::Vertex) || !gs_words) {
+            why = "a stage is missing";
+        } else {
+            const auto analysis = Metal::AnalyzeGeometryShader(*gs_words);
+            const bool matches =
+                analysis.ok &&
+                ((analysis.info.input == Metal::GsInputPrimitive::Points &&
+                  key.prim_type == AmdGpu::PrimitiveType::PointList) ||
+                 (analysis.info.input == Metal::GsInputPrimitive::Lines &&
+                  key.prim_type == AmdGpu::PrimitiveType::LineList) ||
+                 (analysis.info.input == Metal::GsInputPrimitive::Triangles &&
+                  key.prim_type == AmdGpu::PrimitiveType::TriangleList));
+            if (!analysis.ok || !matches) {
+                ++s.geometry_unsupported;
+                why = analysis.ok ? "primitive type differs from the shader's input"
+                                  : analysis.error;
+            } else {
+                Metal::GeometryPipelineInput input;
+                std::vector<Metal::VertexAttribute> attributes;
+                for (const auto& in : inputs) {
+                    attributes.push_back({in.location, in.per_instance, in.divisor});
+                }
+                input.vertex_attributes = attributes;
+                bool ok = true;
+                for (u32 index_type = 0; ok && index_type < 3; ++index_type) {
+                    input.es[index_type] =
+                        s.Variant(es_module, key.stage_hashes[u32(Stage::Vertex)],
+                                  {.kind = Kind::TessVertex, .index_type = index_type});
+                    ok = input.es[index_type] != nullptr;
+                }
+                if (ok) {
+                    Metal::CompileVariant variant{.kind = Kind::GeometryKernel};
+                    variant.es.stride = input.es[0]->tess_layout.output;
+                    variant.es.members = input.es[0]->tess_layout.members;
+                    input.gs = s.Variant(gs_module, key.stage_hashes[u32(Stage::Geometry)], variant);
+                    ok = input.gs != nullptr;
+                }
+                const Metal::CompiledShader* fs = nullptr;
+                if (ok && has(Stage::Fragment)) {
+                    fs = s.Get(modules[u32(Stage::Fragment)],
+                               key.stage_hashes[u32(Stage::Fragment)], "fragment");
+                    ok = fs != nullptr;
+                }
+                if (ok) {
+                    std::span<const Metal::StageInput> fs_inputs;
+                    if (fs) {
+                        fs_inputs = fs->stage_inputs;
+                    }
+                    input.pass_through = s.pass_through.Get(
+                        input.gs->geometry, fs_inputs,
+                        key.clip_space == AmdGpu::ClipSpace::MinusWToW, why);
+                    ok = input.pass_through != nullptr;
+                }
+                geo = ok ? s.pso.GetGeometryPipeline(key, input, fs) : nullptr;
+                if (!geo && why.empty()) {
+                    why = "a shader variant or the pipeline state failed";
+                }
+            }
+        }
+        ++(geo ? s.geometry_ok : s.geometry_failed);
+        if (geo) {
+            std::scoped_lock lock{s.pipelines_mutex};
+            s.graphics[VkPipeline(vk_pipeline)] = {.render = geo->render, .geometry = geo};
+        } else {
+            static std::atomic<u32> logged{0};
+            if (logged++ < 10) {
+                std::printf("Metal shadow: geometry pipeline not built: %s\n", why.c_str());
+            }
+        }
     } else if (key.prim_type == AmdGpu::PrimitiveType::QuadList) {
         ++s.skipped_quad;
     } else if (aux_fragment) {

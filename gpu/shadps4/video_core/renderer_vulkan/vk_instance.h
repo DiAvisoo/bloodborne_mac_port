@@ -286,7 +286,8 @@ public:
 
     /// Returns true when geometry shaders are supported by the device
     bool IsGeometryStageSupported() const {
-        return features.geometryShader;
+        // bbport: the Metal frame path emulates geometry shaders (BB_METAL_FRAME=1, arm64 host).
+        return features.geometryShader || metal_geometry;
     }
 
     /// Returns true when tessellation is supported by the device
@@ -541,6 +542,7 @@ private:
     vk::PhysicalDeviceVulkan13Properties vk13_props;
     vk::PhysicalDevicePushDescriptorPropertiesKHR push_descriptor_props;
     vk::PhysicalDeviceFeatures features;
+    bool metal_geometry{}; ///< bbport: geometry shaders run on the Metal frame path
     vk::PhysicalDeviceVulkan12Features vk12_features;
     vk::PhysicalDeviceVulkan13Features vk13_features;
     vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic_state_3_features;

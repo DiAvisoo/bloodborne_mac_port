@@ -20,6 +20,9 @@ void SetDevice(void* device, void* queue);
 void* MtlDevice();
 void* MtlQueue();
 
+/// Step C (BB_METAL_FRAME=1): every command buffer is encoded in Metal.
+bool FrameEnabled();
+
 /// Step B (BB_METAL_PRESENT=1): the presenter's command buffer is encoded in Metal.
 bool PresentEnabled();
 
