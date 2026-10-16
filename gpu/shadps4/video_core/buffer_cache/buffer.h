@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -12,77 +13,52 @@
 
 #include "common/assert.h"
 #include "common/types.h"
-#include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_metal/mtl_object.h"
 
-namespace Vulkan {
-class Instance;
-class Scheduler;
-} // namespace Vulkan
-
-VK_DEFINE_HANDLE(VmaAllocation)
-VK_DEFINE_HANDLE(VmaAllocator)
-
-struct VmaAllocationInfo;
+namespace Metal {
+class Device;
+class Timeline;
+} // namespace Metal
 
 namespace VideoCore {
 
 /// Hints and requirements for the backing memory type of a commit
 enum class MemoryType : u8 {
-    DeviceLocal,  ///< Requests device local buffer.
-    HostUncached, ///< Requires a host visible memory type optimized for CPU to GPU uploads
-    HostCached,   ///< Requires a host visible memory type optimized for GPU to CPU readbacks
-    Stream,       ///< Requests device local host visible buffer, falling back host memory.
-    Sparse,       ///< Requires an unbacked sparse resident buffer.
+    DeviceLocal,  ///< Private storage (GPU only; no CPU mapping).
+    HostUncached, ///< Shared, write-combined: optimized for CPU to GPU uploads.
+    HostCached,   ///< Shared, cached: optimized for GPU to CPU readbacks.
+    Stream,       ///< Shared, host-written every frame.
 };
 
-constexpr vk::BufferUsageFlags ReadFlags =
-    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
-    vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
-    vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
-
-constexpr vk::BufferUsageFlags AllFlags =
-    ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
-
-struct UniqueBuffer {
-    explicit UniqueBuffer(vk::Device device, VmaAllocator allocator);
-    ~UniqueBuffer();
-
-    UniqueBuffer(const UniqueBuffer&) = delete;
-    UniqueBuffer& operator=(const UniqueBuffer&) = delete;
-
-    UniqueBuffer(UniqueBuffer&& other) noexcept
-        : device{other.device}, buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
-          bda_addr{std::exchange(other.bda_addr, 0)},
-          allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
-          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)} {}
-
-    UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
-        if (this != &other) {
-            Destroy();
-            device = other.device;
-            buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
-            bda_addr = std::exchange(other.bda_addr, 0);
-            allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
-            allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
-        }
-        return *this;
-    }
-
-    void Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
-                VmaAllocationInfo* out_alloc_info);
-
+/// One MTLBuffer. Metal tracks hazards and shared storage is coherent, so there is nothing to
+/// flush or invalidate.
+class UniqueBuffer {
+public:
+    /// Creates the MTLBuffer (asserts on failure). Replaces any previous one.
+    void Create(Metal::Device& device, u64 size, MemoryType type, std::string_view label = "");
     void Destroy();
 
-    vk::Device device;
-    vk::Buffer buffer{};
-    vk::DeviceAddress bda_addr{};
-    VmaAllocator allocator;
-    VmaAllocation allocation{};
+    /// id<MTLBuffer>, unretained.
+    [[nodiscard]] void* Handle() const noexcept {
+        return buffer.Get();
+    }
+    [[nodiscard]] u64 GpuAddress() const noexcept {
+        return gpu_address;
+    }
+    /// The CPU pointer of a shared buffer; null for DeviceLocal (private storage).
+    [[nodiscard]] u8* Contents() const noexcept {
+        return contents;
+    }
+
+private:
+    Metal::Object buffer;
+    u64 gpu_address{};
+    u8* contents{};
 };
 
 struct Buffer {
-    explicit Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
-                    MemoryType mem_type, std::string_view debug_name = "");
+    explicit Buffer(Metal::Device& device, MemoryType mem_type, VAddr cpu_addr_, u64 size_bytes_,
+                    std::string_view debug_name = "");
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
@@ -106,37 +82,36 @@ struct Buffer {
         return size_bytes;
     }
 
-    vk::Buffer Handle() const noexcept {
-        return buffer.buffer;
+    /// id<MTLBuffer>, unretained.
+    void* Handle() const noexcept {
+        return buffer.Handle();
     }
 
-    vk::DeviceAddress BufferDeviceAddress() const noexcept {
-        ASSERT_MSG(buffer.bda_addr != 0, "Can't get BDA from a non BDA buffer");
-        return buffer.bda_addr;
+    Metal::BufferRef Ref(u64 offset = 0) const noexcept {
+        return {Handle(), offset};
     }
 
-    /// Makes host writes in provided range visible to the device.
-    void Flush(u64 offset, u64 size);
-
-    /// Makes device writes in provided range visible to the host.
-    void Invalidate(u64 offset, u64 size);
+    /// The buffer's GPU virtual address (for shaders that read it by address).
+    u64 GpuAddress() const noexcept {
+        return buffer.GpuAddress();
+    }
 
     VAddr cpu_addr = 0;
     size_t size_bytes = 0;
-    std::span<u8> mapped_data{};
-    bool is_coherent{};
+    std::span<u8> mapped_data{}; ///< shared storage only
     MemoryType mem_type{MemoryType::DeviceLocal};
     UniqueBuffer buffer;
 };
 
 struct StreamBuffer : public Buffer {
-    explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                          MemoryType mem_type, u64 size_bytes);
+    /// `timeline`: the ticks of the scheduler whose commands use this buffer.
+    explicit StreamBuffer(Metal::Device& device, Metal::Timeline& timeline, MemoryType mem_type,
+                          u64 size_bytes);
 
     /// Reserves a region of memory from the stream buffer. Must be followed by Commit().
     std::pair<u8*, u64> Map(u64 size, u64 alignment = 0, bool allow_wait = true);
 
-    /// Ensures that reserved bytes of memory are available to the GPU.
+    /// Marks the reserved bytes as used (shared storage needs no flush).
     void Commit();
 
     /// Reserves and commits a region in one step.
@@ -176,8 +151,7 @@ private:
     bool WaitPendingOperations(u64 requested_upper_bound, bool allow_wait);
 
 private:
-    Vulkan::Scheduler& scheduler;
-    vk::DeviceSize non_coherent_atom_size{};
+    Metal::Timeline& timeline;
     u64 offset{};
     u64 mapped_size{};
     u64 last_tick{};

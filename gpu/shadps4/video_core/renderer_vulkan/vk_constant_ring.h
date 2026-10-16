@@ -13,7 +13,8 @@
 #include "common/assert.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_timeline.h"
 
 namespace Vulkan {
 
@@ -21,14 +22,15 @@ class ConstantRing {
 public:
     static constexpr u64 Capacity = 32ull << 20;
 
-    ConstantRing(const Instance& instance, Scheduler& scheduler_)
-        : scheduler{scheduler_},
-          buffer{instance, 0, Capacity, VideoCore::MemoryType::Stream, "bbport constant ring"} {
+    /// `timeline`: the ticks of the scheduler that records the draws reading the ring.
+    ConstantRing(Metal::Device& device, Metal::Timeline& timeline_)
+        : timeline{timeline_},
+          buffer{device, VideoCore::MemoryType::Stream, 0, Capacity, "bbport constant ring"} {
         ASSERT(!buffer.mapped_data.empty());
     }
 
-    [[nodiscard]] vk::Buffer Handle() const noexcept {
-        return buffer.Handle();
+    [[nodiscard]] Metal::BufferRef Handle() const noexcept {
+        return buffer.Ref();
     }
 
     /// Stage A: `size` bytes at `alignment`; returns the ring offset, or nullopt when the ring is
@@ -53,11 +55,6 @@ public:
         return buffer.mapped_data.data() + offset;
     }
 
-    /// Stage A, after writing: makes the bytes visible to the GPU.
-    void Flush(u64 offset, u64 size) {
-        buffer.Flush(offset, size);
-    }
-
     /// Stage A: the position the next packet's allocations end at.
     [[nodiscard]] u64 Position() const noexcept {
         return position;
@@ -69,7 +66,7 @@ public:
         if (end == pending_end) {
             return;
         }
-        const u64 tick = scheduler.CurrentTick();
+        const u64 tick = timeline.CurrentTick();
         if (tick != pending_tick && pending_end != last_published) {
             Publish(pending_end, pending_tick);
         }
@@ -89,11 +86,9 @@ private:
     }
 
     void Retire() {
-        auto* semaphore = scheduler.GetWorkSemaphore();
-        semaphore->Refresh();
         u64 at = stamps_tail.load(std::memory_order_relaxed);
         const u64 head = stamps_head.load(std::memory_order_acquire);
-        while (at < head && semaphore->IsFree(stamps[at % stamps.size()].tick)) {
+        while (at < head && timeline.IsFree(stamps[at % stamps.size()].tick)) {
             retired = stamps[at % stamps.size()].end;
             ++at;
         }
@@ -104,7 +99,7 @@ private:
         u64 end;
         u64 tick;
     };
-    Scheduler& scheduler;
+    Metal::Timeline& timeline;
     VideoCore::Buffer buffer;
     u64 position = 0;     ///< stage A
     u64 retired = 0;      ///< stage A: the GPU is done with everything before this

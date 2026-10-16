@@ -14,6 +14,7 @@
 #include <map>
 #include <thread>
 #include <vector>
+#include "video_core/renderer_metal/mtl_buffer.h"
 #include "video_core/renderer_metal/mtl_object.h"
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
@@ -806,6 +807,20 @@ void TestTimelines() {
     Expect(b.KnownGpuTick() == 102 && b.PendingCount() == 0, "B's mappings pruned too");
 }
 
+void TestBufferCreation() {
+    Metal::Device device;
+    u64 stream_address = 0, private_address = 0;
+    u8 *stream_contents = nullptr, *private_contents = nullptr;
+    Metal::Object stream = Metal::CreateBuffer(device, 64, VideoCore::MemoryType::Stream, "test",
+                                               &stream_address, &stream_contents);
+    Metal::Object priv = Metal::CreateBuffer(device, 64, VideoCore::MemoryType::DeviceLocal, "",
+                                             &private_address, &private_contents);
+    Expect(stream && priv, "buffers created");
+    Expect(stream_contents != nullptr, "Stream buffer has CPU contents");
+    Expect(private_contents == nullptr, "DeviceLocal buffer has no CPU contents");
+    Expect(stream_address != 0 && private_address != 0, "both buffers have a GPU address");
+}
+
 int main() {
     @autoreleasepool {
         TestObject();
@@ -832,6 +847,7 @@ int main() {
         TestSpecialize();
         TestDepthStencilCache();
         TestTimelines();
+        TestBufferCreation();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

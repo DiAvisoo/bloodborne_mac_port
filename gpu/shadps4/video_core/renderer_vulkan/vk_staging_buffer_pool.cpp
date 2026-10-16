@@ -11,8 +11,7 @@
 #include "common/assert.h"
 #include "common/types.h"
 #include "core/devtools/widget/gpu_memory.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
 namespace Vulkan {
@@ -38,15 +37,15 @@ u64 RoundAllocationSize(u64 size) {
 
 } // Anonymous namespace
 
-StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
-    : instance{instance_}, scheduler{scheduler_} {
+StagingBufferPool::StagingBufferPool(Metal::Device& device_, Metal::Timeline& timeline_)
+    : device{device_}, timeline{timeline_} {
     const char* env = std::getenv("BB_STAGING_KEEP_MB");
     keep_blocks = (env ? std::strtoull(env, nullptr, 10) : 512) * 1_MB / BLOCK_SIZE;
     Ring& ring = rings[u32(MemoryType::HostUncached)];
     for (u64 i = 0; i < PREWARM_BLOCKS; ++i) {
         auto& block = ring.blocks.emplace_back(Block{
             .buffer = std::make_unique<VideoCore::StreamBuffer>(
-                instance, scheduler, MemoryType::HostUncached, BLOCK_SIZE),
+                device, timeline, MemoryType::HostUncached, BLOCK_SIZE),
             .last_used_frame = frame,
         });
         if (!block.buffer->mapped_data.empty()) {
@@ -84,7 +83,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
     if (!best) {
         best = &ring.blocks.emplace_back(Block{
             .buffer =
-                std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type, BLOCK_SIZE),
+                std::make_unique<VideoCore::StreamBuffer>(device, timeline, type, BLOCK_SIZE),
             .last_used_frame = frame,
         });
         ring.current = ring.blocks.size() - 1;
@@ -114,7 +113,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     for (LargeBuffer& entry : cache) {
         const u64 entry_size = entry.buffer->SizeBytes();
         if (entry.held || entry_size < size || entry_size > max_size ||
-            !scheduler.IsFree(entry.tick)) {
+            !timeline.IsFree(entry.tick)) {
             continue;
         }
         if (!best || entry_size < best->buffer->SizeBytes()) {
@@ -124,15 +123,15 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
 
     if (!best) {
         best = &cache.emplace_back(LargeBuffer{
-            .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
-                                                          type, "StagingBufferPool:Dedicated"),
+            .buffer = std::make_unique<VideoCore::Buffer>(device, type, 0, RoundAllocationSize(size),
+                                                          "StagingBufferPool:Dedicated"),
             .tick = 0,
             .last_used_frame = frame,
             .held = false,
         });
     }
 
-    best->tick = scheduler.CurrentTick();
+    best->tick = timeline.CurrentTick();
     best->last_used_frame = frame;
     best->held = deferred;
 
@@ -155,7 +154,7 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
         cache, [&](const LargeBuffer& entry) { return entry.buffer.get() == ref.buffer; });
     ASSERT_MSG(it != cache.end() && it->held, "FreeDeferred on an allocation that is not held");
     it->held = false;
-    it->tick = scheduler.CurrentTick();
+    it->tick = timeline.CurrentTick();
     it->last_used_frame = frame;
 }
 
@@ -175,7 +174,7 @@ void StagingBufferPool::TrimRing(Ring& ring) {
     for (size_t i = blocks.size(); i-- > 0;) {
         const Block& block = blocks[i];
         if (blocks.size() <= keep_blocks || frame - block.last_used_frame < RING_IDLE_FRAMES ||
-            !scheduler.IsFree(block.buffer->LastTick())) {
+            !timeline.IsFree(block.buffer->LastTick())) {
             continue;
         }
         blocks.erase(blocks.begin() + i);
@@ -193,7 +192,7 @@ void StagingBufferPool::TrimRing(Ring& ring) {
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
     std::erase_if(cache, [this](const LargeBuffer& entry) {
         return !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
-               scheduler.IsFree(entry.tick);
+               timeline.IsFree(entry.tick);
     });
 }
 
