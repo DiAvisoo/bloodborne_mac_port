@@ -38,6 +38,32 @@ Each item: what was done for now, what the refinement is, and where it lives.
   (1200x900 points via System Events) refits with black bars and no stall (2026-10-16). The
   `BB_FULLSCREEN=1` start and the green-button switch were only tried with the screen locked
   (no switch on 0.4.0 either then).
+- **Metal-native (M4): minimised/occluded window.** Fixed 2026-10-16: a minimised, hidden or
+  fully occluded macOS window keeps its pixel size, so the 0x0 skip never fired and
+  `nextDrawable` could block ~1 s per frame. `WindowSDL` now tracks SDL's MINIMIZED/HIDDEN/
+  OCCLUDED flags and `Present` frees the frame without a drawable (`ShouldAcquireDrawable`;
+  a `BB_SNAPSHOT_TRIGGER` request still acquires). Measured: 20 s minimised in the city, Frame
+  stats at 60 FPS throughout, 60 FPS after restore. *Left:* one ~1 s hitch as the window
+  minimises (the present already inside `nextDrawable` when the Dock animation starts; SDL's
+  MINIMIZED arrives after it). Fix if it matters: a `nextDrawable` timeout shorter than 1 s
+  (`allowsNextDrawableTimeout` is all or nothing; acquire on a helper with a deadline).
+- **Metal-native (M4): `PrepareBlankFrame(true)` blocks on the swap thread.** It does a blocking
+  `FramePool::Take`. If the draw thread queued both pool frames as flips while the port is
+  closing, the game frame waits in the swap queue behind the blocked blank frame: a deadlock
+  (pre-existing shape). Fix: a non-blocking try-take for blank frames (skip the blank when no
+  frame is free).
+- **Metal-native (M4): `PipelineCache::Sync` does not drain the build pool.** Pipelines still
+  building when it flushes are not in that write. Only `~Presenter` (single process) and the
+  M4 exit flush (`bbgpu_flush_caches`, bounded 5 s) write at the end; a build finishing after
+  them is lost until the next session compiles it again.
+- **Metal-native (M4): `~Presenter` vs the swap/present threads (single-process exit).**
+  `presenter` (gnmdriver.cpp) and `driver` (video_out.cpp, owns the swap and present threads)
+  are destroyed in unspecified order by guest `exit()`; `present_queue.reset()` before the
+  threads stop lets a concurrent `Present` use a null queue. Goes away with single-process mode
+  (M7); else stop the driver threads first or null-check in `Present`.
+- **Metal-native (M4): present drawable path covered only in game.** `TestAutoreleaseLoop`
+  commits without a drawable; `presentDrawable` → drawable return is checked only by game runs
+  (tens of thousands of frames). Optional: a test with a layer on an offscreen `NSWindow`.
 - **Metal-native (M4): presenter parts off until M5/M6.** HDR (`SetHDR` is a no-op, the layer is
   BGRA8 sRGB; was a MoltenVK HDR10 swapchain), display timing (`IsDisplayTimingSupported` false,
   `TakePastTimings` empty: the spike log's present-to-display column reads 0), the settings
@@ -311,6 +337,19 @@ Each item: what was done for now, what the refinement is, and where it lives.
   wait for them (first 5 s window: 55 FPS, worst ~410 ms; 0.4.0 preloads before the first frame:
   worst 40 ms). It happens behind the boot logos; later, start the warm-up earlier or let the
   first frames skip draws whose pipeline is not ready.
+
+- **Metal-native (M4): archive write cost grows with the session.** Each write re-adds and
+  serializes every recorded pipeline (~2.4 ms each; 258 pipelines ~0.6–1.0 s on M4 Max), every
+  10 s while compiles continue: at 2–3k pipelines late in the game that is 5–7 s of utility-thread
+  work per write, possibly contending with live compiles, and longer than the 5 s exit-flush
+  bound (`bbgpu_flush_caches` then gives up, logged; the old file stays). The "wrote N pipelines"
+  line now logs the duration: check it on a 16 GB / 8-core Mac in M5; grow the interval with N.
+- **Metal-native (M4): archive writer throttle allows double writes.** The writer's due time is
+  10 s after the last write, computed before it waits: a `Flush` (Sync, exit flush) during that
+  wait does not move it, so when more pipelines compile after the flush the writer does a second
+  full write sooner than 10 s after it (re-read `last_write` after waking).
+  Also archive hits after the session's last write are not counted as unwritten (only compiles
+  are), so they are missing from that file and recompile next session (self-healing, small).
 
 - **MoltenVK argument buffers off: done 2026-10-15** (default in `bbgpu_init`; +13–16% FPS
   uncapped at 1080p/1440p, native/FSR/MetalFX; FINDINGS).
