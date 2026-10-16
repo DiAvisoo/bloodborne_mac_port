@@ -47,9 +47,11 @@ inline constexpr Effect Effects[] = {
 };
 inline constexpr int EffectCount = int(sizeof(Effects) / sizeof(Effects[0]));
 /// Live output resolutions: the upscaler's output and the UI host targets.
-inline constexpr int OutputWidths[] = {1280, 1920, 2560, 3840};
-inline constexpr int OutputHeights[] = {720, 1080, 1440, 2160};
-inline constexpr int OutputCount = 4;
+/// 3456x1944: 16:9 at the full width of the 16-inch MacBook Pro's panel (3456x2234), pixel for
+/// pixel.
+inline constexpr int OutputWidths[] = {1280, 1920, 2560, 3456, 3840};
+inline constexpr int OutputHeights[] = {720, 1080, 1440, 1944, 2160};
+inline constexpr int OutputCount = 5;
 inline constexpr int OutputDefault = 1; ///< 1920x1080, the game's own size
 
 /// Values::shader_compile.

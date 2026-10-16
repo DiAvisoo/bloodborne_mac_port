@@ -769,7 +769,8 @@ void DisplayTab(BbSettings::Values& s) {
                   "sets the scene size relative to the output: 4K Performance = 1920x1080. "
                   "Changing it resets the upscaler history and may cause a brief pause.");
     static const char* outputs[] = {"1280 \xC3\x97 720", "1920 \xC3\x97 1080",
-                                    "2560 \xC3\x97 1440", "3840 \xC3\x97 2160"};
+                                    "2560 \xC3\x97 1440", "3456 \xC3\x97 1944",
+                                    "3840 \xC3\x97 2160"};
     static_assert(sizeof(outputs) / sizeof(outputs[0]) == BbSettings::OutputCount);
     if (const int picked = Segmented("output", outputs, BbSettings::OutputCount, s.output_res);
         picked >= 0) {
