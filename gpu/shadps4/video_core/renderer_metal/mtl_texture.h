@@ -49,6 +49,11 @@ struct SamplerDesc {
 /// An MTLSamplerState (not argument-buffer capable). Empty Object on failure.
 Object CreateSampler(Device& device, const SamplerDesc& desc);
 
+/// A texture's pixelFormat and sampleCount (id<MTLTexture>, unretained), for callers that only
+/// hold the texture (sample counts may have been clamped to what the device supports).
+u32 TexturePixelFormat(void* texture);
+u32 TextureSampleCount(void* texture);
+
 /// [MTLDevice supportsTextureSampleCount:].
 bool SupportsSampleCount(Device& device, u32 samples);
 

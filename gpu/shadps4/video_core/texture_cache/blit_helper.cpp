@@ -1,435 +1,174 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/renderer_vulkan/vk_instance.h"
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <fmt/format.h>
+#include "common/assert.h"
+#include "common/logging/log.h"
+#include "video_core/renderer_metal/mtl_blit_shaders.h"
+#include "video_core/renderer_metal/mtl_depth_stencil.h"
+#include "video_core/renderer_metal/mtl_encoder.h"
+#include "video_core/renderer_metal/mtl_render_pipeline.h"
+#include "video_core/renderer_metal/mtl_texture.h"
+#include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/blit_helper.h"
-#include "video_core/texture_cache/image.h"
 
-#include "video_core/host_shaders/color_to_ms_depth_frag.h"
-#include "video_core/host_shaders/fs_tri_vert.h"
-#include "video_core/host_shaders/ms_image_blit_frag.h"
-#include "video_core/host_shaders/ms_image_blit_msaa_frag.h"
+#include <vulkan/vulkan_format_traits.hpp>
 
 namespace VideoCore {
 
-static vk::SampleCountFlagBits ToSampleCount(u32 num_samples) {
-    switch (num_samples) {
-    case 1:
-        return vk::SampleCountFlagBits::e1;
-    case 2:
-        return vk::SampleCountFlagBits::e2;
-    case 4:
-        return vk::SampleCountFlagBits::e4;
-    case 8:
-        return vk::SampleCountFlagBits::e8;
-    case 16:
-        return vk::SampleCountFlagBits::e16;
-    default:
-        UNREACHABLE_MSG("Unknown samples count = {}", num_samples);
+namespace {
+
+constexpr std::array<u8, 4> IdentitySwizzle{
+    Metal::VkToMtl::SwizzleRed, Metal::VkToMtl::SwizzleGreen, Metal::VkToMtl::SwizzleBlue,
+    Metal::VkToMtl::SwizzleAlpha};
+
+/// Which flavour of ms_image_blit reads and writes the format: 0 float, 1 uint, 2 int.
+u32 NumericFlavour(vk::Format format) {
+    const char* numeric = vk::componentNumericFormat(format, 0);
+    if (std::strcmp(numeric, "UINT") == 0) {
+        return 1;
     }
+    if (std::strcmp(numeric, "SINT") == 0) {
+        return 2;
+    }
+    return 0;
 }
 
-BlitHelper::BlitHelper(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_)
-    : instance{instance_}, scheduler{scheduler_} {
-    CreateShaders();
-    CreatePipelineLayouts();
+/// Records one fullscreen-triangle draw as its own render pass, with `pipeline` reading `source`
+/// at fragment texture 0. Render state the rasterizer may have left (culling, depth bias) is
+/// reset, and the scheduler's dynamic state is invalidated so the next draw sets its own again.
+void DrawFullscreen(Vulkan::Scheduler& scheduler, const Metal::RenderPassDesc& pass,
+                    void* pipeline, void* depth_stencil, Metal::Object source) {
+    scheduler.EndRendering();
+    scheduler.Record([pass, pipeline, depth_stencil,
+                      source = std::move(source)](Metal::Encoder& e) mutable {
+        void* const texture = source.Get();
+        e.KeepAlive(std::move(source));
+        e.BeginRenderPass(pass);
+        e.SetRenderPipeline(pipeline);
+        e.SetDepthStencil(depth_stencil);
+        e.SetCullMode(Metal::CullMode::None);
+        e.SetDepthBias(0.0f, 0.0f, 0.0f);
+        e.SetViewport({0.0f, 0.0f, float(pass.width), float(pass.height), 0.0f, 1.0f});
+        e.SetScissor({0, 0, pass.width, pass.height});
+        e.SetTexture(Metal::Stage::Fragment, 0, texture);
+        e.Draw(Metal::Primitive::Triangle, 3);
+        e.EndRenderPass();
+    });
+    scheduler.GetDynamicState().Invalidate();
 }
 
-BlitHelper::~BlitHelper() {
-    const auto device = instance.GetDevice();
-    device.destroy(fs_tri_vertex);
-    device.destroy(color_to_ms_depth_frag);
-    device.destroy(src_msaa_copy_frag);
-    device.destroy(src_non_msaa_copy_frag);
+} // namespace
+
+BlitHelper::BlitHelper(Metal::Device& device_, Vulkan::Scheduler& scheduler_)
+    : device{device_}, scheduler{scheduler_},
+      library{Metal::CompileLibrary(device_, Metal::BlitShaders::Source, "Blit helper")} {
+    Metal::DepthStencilKey key{};
+    key.depth_test = true;
+    key.depth_write = true;
+    key.depth_compare = 7; // VK_COMPARE_OP_ALWAYS
+    depth_write_state = scheduler.GetDepthStencilCache().Get(key);
+    no_depth_state = scheduler.GetDepthStencilCache().Get(Metal::DepthStencilKey{});
+}
+
+BlitHelper::~BlitHelper() = default;
+
+void* BlitHelper::GetPipeline(const PipelineKey& key) {
+    std::scoped_lock lock{pipeline_mutex};
+    const auto it =
+        std::ranges::find(pipelines, key, &std::pair<PipelineKey, Metal::Object>::first);
+    if (it != pipelines.end()) {
+        return it->second.Get();
+    }
+    const Metal::RenderPipelineDesc desc{
+        .library = library.Get(),
+        .vertex_function = Metal::BlitShaders::FullscreenTriangle,
+        .fragment_function = key.fragment,
+        .color_format = key.color_format,
+        .depth_format = key.depth_format,
+        .stencil_format = key.stencil_format,
+        .samples = key.samples,
+    };
+    const std::string label = fmt::format("{} {}x", key.fragment, key.samples);
+    pipelines.emplace_back(key, Metal::CreateRenderPipeline(device, desc, label));
+    return pipelines.back().second.Get();
 }
 
 void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_samples,
                                            vk::Format src_pixel_format, vk::Format dst_pixel_format,
-                                           vk::Image source, vk::Image dest) {
-    const vk::ImageViewUsageCreateInfo color_usage_ci{.usage = vk::ImageUsageFlagBits::eSampled};
-    const vk::ImageViewCreateInfo color_view_ci = {
-        .pNext = &color_usage_ci,
-        .image = source,
-        .viewType = vk::ImageViewType::e2D,
-        .format = src_pixel_format,
-        .subresourceRange{
-            .aspectMask = vk::ImageAspectFlagBits::eColor,
-            .baseMipLevel = 0U,
-            .levelCount = 1U,
-            .baseArrayLayer = 0U,
-            .layerCount = 1U,
-        },
-    };
-    const auto [color_view_result, color_view] =
-        instance.GetDevice().createImageView(color_view_ci);
-    ASSERT_MSG(color_view_result == vk::Result::eSuccess, "Failed to create image view: {}",
-               vk::to_string(color_view_result));
-    const vk::ImageViewUsageCreateInfo depth_usage_ci{
-        .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment};
-    const vk::ImageViewCreateInfo depth_view_ci = {
-        .pNext = &depth_usage_ci,
-        .image = dest,
-        .viewType = vk::ImageViewType::e2D,
-        .format = dst_pixel_format,
-        .subresourceRange{
-            .aspectMask = vk::ImageAspectFlagBits::eDepth,
-            .baseMipLevel = 0U,
-            .levelCount = 1U,
-            .baseArrayLayer = 0U,
-            .layerCount = 1U,
-        },
-    };
-    const auto [depth_view_result, depth_view] =
-        instance.GetDevice().createImageView(depth_view_ci);
-    ASSERT_MSG(depth_view_result == vk::Result::eSuccess, "Failed to create image view: {}",
-               vk::to_string(depth_view_result));
-    scheduler.DeferOperation([device = instance.GetDevice(), color_view, depth_view] {
-        device.destroyImageView(color_view);
-        device.destroyImageView(depth_view);
+                                           void* source, void* dest) {
+    // The textures' own formats and sample count: the guest's may have been mapped or clamped.
+    const u32 src_format = Metal::TexturePixelFormat(source);
+    const u32 dst_format = Metal::TexturePixelFormat(dest);
+    const u32 samples = Metal::TextureSampleCount(dest);
+    if (samples != num_samples || src_format != Metal::VkToMtl::PixelFormat(src_pixel_format) ||
+        dst_format != Metal::VkToMtl::PixelFormat(dst_pixel_format)) {
+        LOG_DEBUG(Render, "Colour to MS depth: textures {} -> {} x{} (guest {} -> {} x{})",
+                  src_format, dst_format, samples, vk::to_string(src_pixel_format),
+                  vk::to_string(dst_pixel_format), num_samples);
+    }
+    const bool has_stencil = Metal::VkToMtl::HasStencilPixelFormat(dst_format);
+
+    // A 2D view: the source may be an array texture or have mips.
+    Metal::Object src_view = Metal::CreateTextureView(
+        source, src_format, Metal::TextureType::Tex2D, 0, 1, 0, 1, IdentitySwizzle);
+    ASSERT_MSG(src_view, "Colour to MS depth: no 2D view of the colour texture");
+
+    void* const pipeline = GetPipeline({
+        .fragment = Metal::BlitShaders::ColorToMsDepth,
+        .color_format = 0,
+        .depth_format = dst_format,
+        .stencil_format = has_stencil ? dst_format : 0,
+        .samples = samples,
     });
 
-    Vulkan::RenderState state{};
-    state.width = width;
-    state.height = height;
-    state.num_layers = 1;
-    state.depth_stencil_attachment.image_view = depth_view;
-    state.depth_stencil_attachment.image_layout = vk::ImageLayout::eDepthAttachmentOptimal;
-    state.depth_stencil_attachment.has_depth = true;
-    state.depth_stencil_attachment.depth_clear = true;
-    scheduler.BeginRendering(state);
-
-    const auto cmdbuf = scheduler.CommandBuffer();
-    const vk::DescriptorImageInfo image_info = {
-        .sampler = VK_NULL_HANDLE,
-        .imageView = color_view,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-    };
-    const vk::WriteDescriptorSet texture_write = {
-        .dstSet = VK_NULL_HANDLE,
-        .dstBinding = 0U,
-        .dstArrayElement = 0U,
-        .descriptorCount = 1U,
-        .descriptorType = vk::DescriptorType::eSampledImage,
-        .pImageInfo = &image_info,
-    };
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
-                                texture_write);
-
-    const MsPipelineKey key{num_samples, dst_pixel_format, false};
-    auto it = std::ranges::find(color_to_ms_depth_pl, key, &MsPipeline::first);
-    if (it == color_to_ms_depth_pl.end()) {
-        CreateColorToMSDepthPipeline(key);
-        it = --color_to_ms_depth_pl.end();
-    }
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
-
-    const vk::Viewport viewport = {
-        .x = 0,
-        .y = 0,
-        .width = float(state.width),
-        .height = float(state.height),
-        .minDepth = 0.f,
-        .maxDepth = 1.f,
-    };
-    cmdbuf.setViewportWithCount(viewport);
-
-    const vk::Rect2D scissor = {
-        .offset = {0, 0},
-        .extent = {state.width, state.height},
-    };
-    cmdbuf.setScissorWithCount(scissor);
-
-    cmdbuf.draw(3, 1, 0, 0);
-
-    scheduler.EndRendering();
-    scheduler.GetDynamicState().Invalidate();
+    Metal::RenderPassDesc pass{};
+    pass.depth.texture = dest;
+    pass.depth.has_stencil = has_stencil; // the stencil is loaded and stored (kept)
+    pass.depth.clear_depth = true;
+    pass.width = width;
+    pass.height = height;
+    DrawFullscreen(scheduler, pass, pipeline, depth_write_state, std::move(src_view));
 }
 
 void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
-                                     vk::Format pixel_format, bool src_msaa, vk::Image source,
-                                     vk::Image dest) {
-    const vk::ImageViewUsageCreateInfo src_usage_ci{.usage = vk::ImageUsageFlagBits::eSampled};
-    const vk::ImageViewCreateInfo src_view_ci = {
-        .pNext = &src_usage_ci,
-        .image = source,
-        .viewType = vk::ImageViewType::e2D,
-        .format = pixel_format,
-        .subresourceRange{
-            .aspectMask = vk::ImageAspectFlagBits::eColor,
-            .baseMipLevel = 0U,
-            .levelCount = 1U,
-            .baseArrayLayer = 0U,
-            .layerCount = 1U,
-        },
-    };
-    const auto [src_view_result, src_view] = instance.GetDevice().createImageView(src_view_ci);
-    ASSERT_MSG(src_view_result == vk::Result::eSuccess, "Failed to create image view: {}",
-               vk::to_string(src_view_result));
+                                     vk::Format pixel_format, bool src_msaa, void* source,
+                                     void* dest) {
+    // The textures' own sample counts: the guest's may have been clamped.
+    const u32 samples = Metal::TextureSampleCount(dest);
+    const u32 src_samples = Metal::TextureSampleCount(source);
+    if (samples != num_samples || (src_samples > 1) != src_msaa) {
+        LOG_DEBUG(Render, "MS image copy: textures have {} -> {} samples (guest {}, MSAA source {})",
+                  src_samples, samples, num_samples, src_msaa);
+    }
+    const bool msaa_source = src_samples > 1;
 
-    const vk::ImageViewUsageCreateInfo dst_usage_ci{.usage =
-                                                        vk::ImageUsageFlagBits::eColorAttachment};
-    const vk::ImageViewCreateInfo dst_view_ci = {
-        .pNext = &dst_usage_ci,
-        .image = dest,
-        .viewType = vk::ImageViewType::e2D,
-        .format = pixel_format,
-        .subresourceRange{
-            .aspectMask = vk::ImageAspectFlagBits::eColor,
-            .baseMipLevel = 0U,
-            .levelCount = 1U,
-            .baseArrayLayer = 0U,
-            .layerCount = 1U,
-        },
-    };
-    const auto [dst_view_result, dst_view] = instance.GetDevice().createImageView(dst_view_ci);
-    ASSERT_MSG(dst_view_result == vk::Result::eSuccess, "Failed to create image view: {}",
-               vk::to_string(dst_view_result));
-    scheduler.DeferOperation([device = instance.GetDevice(), src_view, dst_view] {
-        device.destroyImageView(src_view);
-        device.destroyImageView(dst_view);
+    Metal::Object src_view = Metal::CreateTextureView(
+        source, Metal::TexturePixelFormat(source),
+        msaa_source ? Metal::TextureType::Tex2DMultisample : Metal::TextureType::Tex2D, 0, 1, 0, 1,
+        IdentitySwizzle);
+    ASSERT_MSG(src_view, "MS image copy: no 2D view of the source texture");
+
+    const u32 flavour = NumericFlavour(pixel_format);
+    void* const pipeline = GetPipeline({
+        .fragment = msaa_source ? Metal::BlitShaders::MsImageBlitMsaa[flavour]
+                                : Metal::BlitShaders::MsImageBlit[flavour],
+        .color_format = Metal::TexturePixelFormat(dest),
+        .depth_format = 0,
+        .stencil_format = 0,
+        .samples = samples,
     });
 
-    Vulkan::RenderState state{};
-    state.width = width;
-    state.height = height;
-    state.num_layers = 1;
-    state.num_color_attachments = 1;
-    state.color_attachments[0].image_view = dst_view;
-    state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
-    state.color_attachments[0].is_clear = true;
-    scheduler.BeginRendering(state);
-
-    const auto cmdbuf = scheduler.CommandBuffer();
-    const vk::DescriptorImageInfo image_info = {
-        .sampler = VK_NULL_HANDLE,
-        .imageView = src_view,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-    };
-    const vk::WriteDescriptorSet texture_write = {
-        .dstSet = VK_NULL_HANDLE,
-        .dstBinding = 0U,
-        .dstArrayElement = 0U,
-        .descriptorCount = 1U,
-        .descriptorType = vk::DescriptorType::eSampledImage,
-        .pImageInfo = &image_info,
-    };
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
-                                texture_write);
-
-    const MsPipelineKey key{num_samples, pixel_format, src_msaa};
-    auto it = std::ranges::find(ms_image_copy_pl, key, &MsPipeline::first);
-    if (it == ms_image_copy_pl.end()) {
-        CreateMsCopyPipeline(key);
-        it = --ms_image_copy_pl.end();
-    }
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
-
-    const vk::Viewport viewport = {
-        .x = 0,
-        .y = 0,
-        .width = float(state.width),
-        .height = float(state.height),
-        .minDepth = 0.f,
-        .maxDepth = 1.f,
-    };
-    cmdbuf.setViewportWithCount(viewport);
-
-    const vk::Rect2D scissor = {
-        .offset = {0, 0},
-        .extent = {state.width, state.height},
-    };
-    cmdbuf.setScissorWithCount(scissor);
-
-    cmdbuf.draw(3, 1, 0, 0);
-
-    scheduler.EndRendering();
-    scheduler.GetDynamicState().Invalidate();
-}
-
-void BlitHelper::CreateShaders() {
-    const auto device = instance.GetDevice();
-    fs_tri_vertex = Vulkan::CompileSPV(FS_TRI_VERT, device);
-    color_to_ms_depth_frag = Vulkan::CompileSPV(COLOR_TO_MS_DEPTH_FRAG, device);
-    src_msaa_copy_frag = Vulkan::CompileSPV(MS_IMAGE_BLIT_MSAA_FRAG, device);
-    src_non_msaa_copy_frag = Vulkan::CompileSPV(MS_IMAGE_BLIT_FRAG, device);
-}
-
-void BlitHelper::CreatePipelineLayouts() {
-    const vk::DescriptorSetLayoutBinding texture_binding = {
-        .binding = 0,
-        .descriptorType = vk::DescriptorType::eSampledImage,
-        .descriptorCount = 1,
-        .stageFlags = vk::ShaderStageFlagBits::eFragment,
-    };
-    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
-        .bindingCount = 1U,
-        .pBindings = &texture_binding,
-    };
-    auto [desc_layout_result, desc_layout] =
-        instance.GetDevice().createDescriptorSetLayoutUnique(desc_layout_ci);
-    single_texture_descriptor_set_layout = std::move(desc_layout);
-    const vk::DescriptorSetLayout set_layout = *single_texture_descriptor_set_layout;
-    const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
-        .pushConstantRangeCount = 0U,
-        .pPushConstantRanges = nullptr,
-    };
-    auto [layout_result, pipeline_layout] =
-        instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create graphics pipeline layout: {}", vk::to_string(layout_result));
-    Vulkan::SetObjectName(instance.GetDevice(), *pipeline_layout, "Single texture pipeline layout");
-    single_texture_pl_layout = std::move(pipeline_layout);
-}
-
-void BlitHelper::CreateColorToMSDepthPipeline(const MsPipelineKey& key) {
-    const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
-        .topology = vk::PrimitiveTopology::eTriangleList,
-    };
-    const vk::PipelineMultisampleStateCreateInfo multisampling = {
-        .rasterizationSamples = ToSampleCount(key.num_samples),
-    };
-    const vk::PipelineDepthStencilStateCreateInfo depth_state = {
-        .depthTestEnable = true,
-        .depthWriteEnable = true,
-        .depthCompareOp = vk::CompareOp::eAlways,
-    };
-    const std::array dynamic_states = {vk::DynamicState::eViewportWithCount,
-                                       vk::DynamicState::eScissorWithCount};
-    const vk::PipelineDynamicStateCreateInfo dynamic_info = {
-        .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
-        .pDynamicStates = dynamic_states.data(),
-    };
-
-    std::array<vk::PipelineShaderStageCreateInfo, 2> shader_stages;
-    shader_stages[0] = {
-        .stage = vk::ShaderStageFlagBits::eVertex,
-        .module = fs_tri_vertex,
-        .pName = "main",
-    };
-    shader_stages[1] = {
-        .stage = vk::ShaderStageFlagBits::eFragment,
-        .module = color_to_ms_depth_frag,
-        .pName = "main",
-    };
-
-    const vk::PipelineRenderingCreateInfo pipeline_rendering_ci = {
-        .colorAttachmentCount = 0U,
-        .pColorAttachmentFormats = nullptr,
-        .depthAttachmentFormat = key.attachment_format,
-        .stencilAttachmentFormat = vk::Format::eUndefined,
-    };
-
-    const vk::PipelineColorBlendStateCreateInfo color_blending{};
-    const vk::PipelineViewportStateCreateInfo viewport_info{};
-    const vk::PipelineVertexInputStateCreateInfo vertex_input_info{};
-    const vk::PipelineRasterizationStateCreateInfo raster_state{.lineWidth = 1.f};
-
-    const vk::GraphicsPipelineCreateInfo pipeline_info = {
-        .pNext = &pipeline_rendering_ci,
-        .stageCount = static_cast<u32>(shader_stages.size()),
-        .pStages = shader_stages.data(),
-        .pVertexInputState = &vertex_input_info,
-        .pInputAssemblyState = &input_assembly,
-        .pViewportState = &viewport_info,
-        .pRasterizationState = &raster_state,
-        .pMultisampleState = &multisampling,
-        .pDepthStencilState = &depth_state,
-        .pColorBlendState = &color_blending,
-        .pDynamicState = &dynamic_info,
-        .layout = *single_texture_pl_layout,
-    };
-
-    auto [pipeline_result, pipeline] =
-        instance.GetDevice().createGraphicsPipelineUnique(VK_NULL_HANDLE, pipeline_info);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
-               vk::to_string(pipeline_result));
-    Vulkan::SetObjectName(instance.GetDevice(), *pipeline, "Color to MS Depth {}", key.num_samples);
-
-    color_to_ms_depth_pl.emplace_back(key, std::move(pipeline));
-}
-
-void BlitHelper::CreateMsCopyPipeline(const MsPipelineKey& key) {
-    const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
-        .topology = vk::PrimitiveTopology::eTriangleList,
-    };
-    const vk::PipelineMultisampleStateCreateInfo multisampling = {
-        .rasterizationSamples = ToSampleCount(key.num_samples),
-    };
-    const vk::PipelineDepthStencilStateCreateInfo depth_state = {
-        .depthTestEnable = false,
-        .depthWriteEnable = false,
-        .depthCompareOp = vk::CompareOp::eAlways,
-    };
-    const std::array dynamic_states = {vk::DynamicState::eViewportWithCount,
-                                       vk::DynamicState::eScissorWithCount};
-    const vk::PipelineDynamicStateCreateInfo dynamic_info = {
-        .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
-        .pDynamicStates = dynamic_states.data(),
-    };
-
-    std::array<vk::PipelineShaderStageCreateInfo, 2> shader_stages;
-    shader_stages[0] = {
-        .stage = vk::ShaderStageFlagBits::eVertex,
-        .module = fs_tri_vertex,
-        .pName = "main",
-    };
-    shader_stages[1] = {
-        .stage = vk::ShaderStageFlagBits::eFragment,
-        .module = key.src_msaa ? src_msaa_copy_frag : src_non_msaa_copy_frag,
-        .pName = "main",
-    };
-
-    const vk::PipelineRenderingCreateInfo pipeline_rendering_ci = {
-        .colorAttachmentCount = 1u,
-        .pColorAttachmentFormats = &key.attachment_format,
-        .depthAttachmentFormat = vk::Format::eUndefined,
-        .stencilAttachmentFormat = vk::Format::eUndefined,
-    };
-
-    const vk::PipelineColorBlendAttachmentState attachment = {
-        .blendEnable = false,
-        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
-    };
-
-    const vk::PipelineColorBlendStateCreateInfo color_blending = {
-        .logicOpEnable = false,
-        .logicOp = vk::LogicOp::eCopy,
-        .attachmentCount = 1u,
-        .pAttachments = &attachment,
-    };
-    const vk::PipelineViewportStateCreateInfo viewport_info{};
-    const vk::PipelineVertexInputStateCreateInfo vertex_input_info{};
-    const vk::PipelineRasterizationStateCreateInfo raster_state{.lineWidth = 1.f};
-
-    const vk::GraphicsPipelineCreateInfo pipeline_info = {
-        .pNext = &pipeline_rendering_ci,
-        .stageCount = static_cast<u32>(shader_stages.size()),
-        .pStages = shader_stages.data(),
-        .pVertexInputState = &vertex_input_info,
-        .pInputAssemblyState = &input_assembly,
-        .pViewportState = &viewport_info,
-        .pRasterizationState = &raster_state,
-        .pMultisampleState = &multisampling,
-        .pDepthStencilState = &depth_state,
-        .pColorBlendState = &color_blending,
-        .pDynamicState = &dynamic_info,
-        .layout = *single_texture_pl_layout,
-    };
-
-    auto [pipeline_result, pipeline] =
-        instance.GetDevice().createGraphicsPipelineUnique(VK_NULL_HANDLE, pipeline_info);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
-               vk::to_string(pipeline_result));
-    Vulkan::SetObjectName(instance.GetDevice(), *pipeline, "Non MS Image to MS Image {}",
-                          key.num_samples);
-
-    ms_image_copy_pl.emplace_back(key, std::move(pipeline));
+    Metal::RenderPassDesc pass{};
+    pass.colors[0].texture = dest;
+    pass.colors[0].clear = true;
+    pass.width = width;
+    pass.height = height;
+    DrawFullscreen(scheduler, pass, pipeline, no_depth_state, std::move(src_view));
 }
 
 } // namespace VideoCore

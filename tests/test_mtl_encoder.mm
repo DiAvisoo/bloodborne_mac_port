@@ -14,11 +14,13 @@
 #include <map>
 #include <thread>
 #include <vector>
+#include "video_core/renderer_metal/mtl_blit_shaders.h"
 #include "video_core/renderer_metal/mtl_buffer.h"
 #include "video_core/renderer_metal/mtl_object.h"
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
 #include "video_core/renderer_metal/mtl_depth_stencil.h"
+#include "video_core/renderer_metal/mtl_render_pipeline.h"
 #include "video_core/renderer_metal/mtl_specialize.h"
 #include "video_core/renderer_metal/mtl_texture.h"
 #include "video_core/renderer_metal/mtl_timeline.h"
@@ -770,6 +772,167 @@ void TestResolvePasses() {
     Expect(device.ErrorCount() == 0, "resolve passes ran without errors");
 }
 
+
+/// The blit helper's MSL (mtl_blit_shaders.h) through CompileLibrary/CreateRenderPipeline and the
+/// encoder, as BlitHelper records it: every program compiles into a pipeline; a 1x RGBA32Float
+/// texture copies into every sample of a 4x one, that one copies sample by sample into another
+/// 4x one, and its channels become the four samples of a 4x D32S8 depth texture.
+void TestBlitShaders() {
+    namespace BS = Metal::BlitShaders;
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    const Metal::Object library = Metal::CompileLibrary(device, BS::Source, "blit test");
+    Metal::DepthStencilCache depth_states{device};
+    const auto pipeline = [&](const char* fragment, MTLPixelFormat color, MTLPixelFormat depth,
+                              MTLPixelFormat stencil, u32 samples) {
+        return Metal::CreateRenderPipeline(device,
+                                           {.library = library.Get(),
+                                            .vertex_function = BS::FullscreenTriangle,
+                                            .fragment_function = fragment,
+                                            .color_format = u32(color),
+                                            .depth_format = u32(depth),
+                                            .stencil_format = u32(stencil),
+                                            .samples = samples},
+                                           fragment);
+    };
+    constexpr MTLPixelFormat flavours[3] = {MTLPixelFormatRGBA32Float, MTLPixelFormatRGBA32Uint,
+                                            MTLPixelFormatRGBA32Sint};
+    bool all_built = true;
+    for (u32 f = 0; f < 3; ++f) {
+        all_built &= bool(pipeline(BS::MsImageBlit[f], flavours[f], MTLPixelFormatInvalid,
+                                   MTLPixelFormatInvalid, 4));
+        all_built &= bool(pipeline(BS::MsImageBlitMsaa[f], flavours[f], MTLPixelFormatInvalid,
+                                   MTLPixelFormatInvalid, 1));
+    }
+    all_built &= bool(pipeline(BS::DepthResample, MTLPixelFormatInvalid, MTLPixelFormatDepth32Float,
+                               MTLPixelFormatInvalid, 1));
+    all_built &= bool(pipeline(BS::DepthResampleStencil, MTLPixelFormatInvalid,
+                               MTLPixelFormatDepth32Float_Stencil8,
+                               MTLPixelFormatDepth32Float_Stencil8, 1));
+    all_built &= bool(pipeline(BS::DepthResampleStencilBits, MTLPixelFormatInvalid,
+                               MTLPixelFormatDepth32Float_Stencil8,
+                               MTLPixelFormatDepth32Float_Stencil8, 1));
+    Expect(all_built, "every blit program builds a render pipeline");
+
+    constexpr u32 n = 16, samples = 4;
+    const auto texture = [&](MTLPixelFormat format, u32 sample_count) {
+        MTLTextureDescriptor* d = [MTLTextureDescriptor new];
+        d.textureType = sample_count > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
+        d.pixelFormat = format;
+        d.width = n;
+        d.height = n;
+        d.sampleCount = sample_count;
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModePrivate;
+        return [dev newTextureWithDescriptor:d];
+    };
+    id<MTLTexture> color = texture(MTLPixelFormatRGBA32Float, 1);
+    id<MTLTexture> ms_a = texture(MTLPixelFormatRGBA32Float, samples);
+    id<MTLTexture> ms_b = texture(MTLPixelFormatRGBA32Float, samples);
+    id<MTLTexture> ms_depth = texture(MTLPixelFormatDepth32Float_Stencil8, samples);
+
+    // Texel (x, y) = (x, y, 0.25, 0.75) / 16: four distinct depths per pixel.
+    id<MTLBuffer> pixels = SharedBuffer(device, n * n * 16);
+    for (u32 y = 0; y < n; ++y) {
+        for (u32 x = 0; x < n; ++x) {
+            float* t = static_cast<float*>(pixels.contents) + (y * n + x) * 4;
+            t[0] = float(x) / 16.0f;
+            t[1] = float(y) / 16.0f;
+            t[2] = 0.25f;
+            t[3] = 0.75f;
+        }
+    }
+    encoder.CopyBufferToTexture(Ref(pixels), n * 16, n * n * 16, (__bridge void*)color, 0, 0, {},
+                                {n, n, 1});
+
+    Metal::DepthStencilKey always_write{};
+    always_write.depth_test = always_write.depth_write = true;
+    always_write.depth_compare = 7;
+    const auto draw = [&](const Metal::RenderPassDesc& pass, const Metal::Object& pso,
+                          void* depth_state, id<MTLTexture> source) {
+        encoder.BeginRenderPass(pass);
+        encoder.SetRenderPipeline(pso.Get());
+        encoder.SetDepthStencil(depth_state);
+        encoder.SetCullMode(Metal::CullMode::None);
+        encoder.SetViewport({0, 0, float(n), float(n), 0, 1});
+        encoder.SetScissor({0, 0, n, n});
+        encoder.SetTexture(Metal::Stage::Fragment, 0, (__bridge void*)source);
+        encoder.Draw(Metal::Primitive::Triangle, 3);
+        encoder.EndRenderPass();
+    };
+    const Metal::Object copy_1x = pipeline(BS::MsImageBlit[0], MTLPixelFormatRGBA32Float,
+                                           MTLPixelFormatInvalid, MTLPixelFormatInvalid, samples);
+    const Metal::Object copy_ms = pipeline(BS::MsImageBlitMsaa[0], MTLPixelFormatRGBA32Float,
+                                           MTLPixelFormatInvalid, MTLPixelFormatInvalid, samples);
+    const Metal::Object to_depth =
+        pipeline(BS::ColorToMsDepth, MTLPixelFormatInvalid, MTLPixelFormatDepth32Float_Stencil8,
+                 MTLPixelFormatDepth32Float_Stencil8, samples);
+    Metal::RenderPassDesc pass{};
+    pass.width = pass.height = n;
+    pass.colors[0].texture = (__bridge void*)ms_a;
+    pass.colors[0].clear = true;
+    draw(pass, copy_1x, depth_states.Get({}), color);
+    pass.colors[0].texture = (__bridge void*)ms_b;
+    draw(pass, copy_ms, depth_states.Get({}), ms_a);
+    Metal::RenderPassDesc depth_pass{};
+    depth_pass.width = depth_pass.height = n;
+    depth_pass.depth.texture = (__bridge void*)ms_depth;
+    depth_pass.depth.has_stencil = true;
+    depth_pass.depth.clear_depth = true;
+    draw(depth_pass, to_depth, depth_states.Get(always_write), color);
+
+    // Every sample of the results, read by kernels.
+    NSError* error = nil;
+    id<MTLLibrary> readers = [dev newLibraryWithSource:@R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void read_ms_color(texture2d_ms<float> t [[texture(0)]], device float4* out [[buffer(0)]],
+                          uint2 p [[thread_position_in_grid]]) {
+    for (uint s = 0; s < 4; ++s) out[(p.y * 16 + p.x) * 4 + s] = t.read(p, s);
+}
+kernel void read_ms_depth(depth2d_ms<float> t [[texture(0)]], device float* out [[buffer(0)]],
+                          uint2 p [[thread_position_in_grid]]) {
+    for (uint s = 0; s < 4; ++s) out[(p.y * 16 + p.x) * 4 + s] = t.read(p, s);
+}
+)" options:nil error:&error];
+    if (!readers) {
+        std::printf("FAIL: reader kernels: %s\n", error.localizedDescription.UTF8String);
+        std::exit(1);
+    }
+    id<MTLBuffer> out_b = SharedBuffer(device, n * n * samples * 16);
+    id<MTLBuffer> out_depth = SharedBuffer(device, n * n * samples * 4);
+    id<MTLComputePipelineState> read_color = Kernel(device, readers, @"read_ms_color");
+    id<MTLComputePipelineState> read_depth = Kernel(device, readers, @"read_ms_depth");
+    encoder.SetComputePipeline((__bridge void*)read_color);
+    encoder.SetTexture(Metal::Stage::Compute, 0, (__bridge void*)ms_b);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(out_b));
+    encoder.Dispatch({1, 1, 1}, {n, n, 1});
+    encoder.SetComputePipeline((__bridge void*)read_depth);
+    encoder.SetTexture(Metal::Stage::Compute, 0, (__bridge void*)ms_depth);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(out_depth));
+    encoder.Dispatch({1, 1, 1}, {n, n, 1});
+    encoder.KeepAlive(Metal::Object::Retain((__bridge void*)pixels));
+    device.Wait(encoder.Submit());
+
+    bool copies_ok = true, depth_ok = true;
+    for (u32 y = 0; y < n; ++y) {
+        for (u32 x = 0; x < n; ++x) {
+            const float expect[4] = {float(x) / 16.0f, float(y) / 16.0f, 0.25f, 0.75f};
+            for (u32 s = 0; s < samples; ++s) {
+                const float* c = static_cast<const float*>(out_b.contents) + ((y * n + x) * 4 + s) * 4;
+                for (u32 ch = 0; ch < 4; ++ch) {
+                    copies_ok &= c[ch] == expect[ch];
+                }
+                const float d = static_cast<const float*>(out_depth.contents)[(y * n + x) * 4 + s];
+                depth_ok &= d == expect[s];
+            }
+        }
+    }
+    Expect(copies_ok, "1x -> 4x and 4x -> 4x MSAA copies keep every sample");
+    Expect(depth_ok, "colour channel N becomes depth sample N (4x D32S8)");
+    Expect(device.ErrorCount() == 0, "blit draws ran without errors");
+}
 } // namespace
 
 /// Two schedulers' timelines on one device: each counts its own commits 1, 2, ... and a tick of
@@ -1031,6 +1194,7 @@ int main() {
         TestIndirectResidency();
         TestDepthAspectCopy();
         TestResolvePasses();
+        TestBlitShaders();
         TestSpecialize();
         TestDepthStencilCache();
         TestTimelines();

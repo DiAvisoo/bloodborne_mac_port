@@ -208,6 +208,14 @@ Object CreateSampler(Device& device, const SamplerDesc& desc) {
     return Object::Adopt((__bridge_retained void*)state);
 }
 
+u32 TexturePixelFormat(void* texture) {
+    return u32(((__bridge id<MTLTexture>)texture).pixelFormat);
+}
+
+u32 TextureSampleCount(void* texture) {
+    return u32(((__bridge id<MTLTexture>)texture).sampleCount);
+}
+
 bool SupportsSampleCount(Device& device, u32 samples) {
     id<MTLDevice> mtl_device = (__bridge id<MTLDevice>)device.NativeDevice();
     return [mtl_device supportsTextureSampleCount:samples];
