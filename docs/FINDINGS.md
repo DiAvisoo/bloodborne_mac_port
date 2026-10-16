@@ -799,3 +799,30 @@ save as the Huax-1839 comparison (1080p native, upscaler off, uncapped, alternat
 Ours ~28% faster on the M4 Max; same scene, both 1920x1080, image correct in both. Their ~74 here is
 consistent with their 50–60 on an M2 Max, which suggests ours would do ~65–75 there, and that issue
 #2's 2–3 FPS on an M2 Max is a bug in ours, not the hardware.
+
+## 2026-10-16 night: the whole frame through our own Metal encoding (branch metal-backend)
+
+`BB_METAL_FRAME=1` (arm64 host): a layer over vulkan.hpp's dispatcher owns every command buffer and
+encodes it in Metal (`renderer_metal/mtl_vk_layer.mm`, `mtl_frame.mm`); MoltenVK still creates the
+resources. Pipelines: the game's built from our pipeline keys (Huax-1839's PSO builder), every other
+one translated from its Vulkan create info. Hunter's Dream, upscaler off, uncapped, alternating:
+
+| | Metal frame path | MoltenVK |
+|---|---|---|
+| 1080p native | 97.1, 96.4, 96.3, 95.9 (96.4) | 94.4, 94.5, 94.7 (94.5) |
+| 1440p native | 67.7, 67.7 | 67.9, 67.2 |
+| 1080p FSR 3.1 Quality (with overlay) | 99.9 | — |
+| 1080p MetalFX Quality | 100.3 | 107.2 |
+| Walk pacing (late game / display frames) | 0.9 per 5 s / 3–4 | 1.4–2.4 / 8–9 |
+
+The Metal path also draws the geometry-shader draws MoltenVK cannot (emulated with compute), and
+6 walks ran clean. What mattered, in order: unretained-reference command buffers (Metal's
+completion thread was saturated releasing resources, "frame done" late by ~7 ms); a residency set
+for the device-address buffers with only the guest arena declared per encoder, read-only on
+render encoders (declaring writes serialized every pass); tessellated draws in runs (78% follow
+another: one compute pass for the run's kernels, one reopened render pass for the patch draws);
+render encoders opened at the first draw (~45 passes per frame have no draws); tessellation
+scratch reused across frames (fresh GPU memory stalled the run ~1 ms per frame).
+Did not work: committing the frame in chunks so the GPU starts early (`BB_METAL_CHUNK`): the
+renderer writes guest data into GPU memory from the CPU while recording, and an early chunk read
+data meant for later draws (broken geometry while walking).
