@@ -29,12 +29,15 @@ Each item: what was done for now, what the refinement is, and where it lives.
   texture is set"); without the layer it draws correctly. Fix: one rule for both (key the formats
   on the same condition as the attachment, or bind the depth buffer whenever it is valid), then a
   clean `MTL_DEBUG_LAYER=1` run (M5 gate). Pipeline keys change: one cache rebuild.
-- **Metal-native (M4): window resize and the full-screen switch not yet checked while
-  presenting** (the screen was locked during the first-light runs). Check: resize a windowed game
-  (System Events `set size of front window` on `bbgpu-host`) and switch to full screen; expect a
-  refit with black bars and no stall (`Present` fits each drawable's own size; 0x0 skips).
-  0.4.0 screenshots of the `cages-20261016` and `loadcrash-20261014-134937` saves for the
-  side-by-side are still to be taken the same way.
+- **Metal-native (M4 → M5): the figure in the cage at the Central Yharnam lamp is missing.**
+  0.4.0 draws a creature behind the bars of the cage left of the lamp post (`cages-20261016`
+  save, +40/+50 s after Cross); the Metal-native renderer shows the cage empty in both captures
+  (scratchpad `t4-m-cages-*.png` vs `t4-w-cages-*.png`, 2026-10-16). Nothing is logged (no skipped
+  draw, failed pipeline or error). Start with a frame capture of that view on both.
+- **Metal-native (M4): full-screen switch not checked while presenting.** A window resize
+  (1200x900 points via System Events) refits with black bars and no stall (2026-10-16). The
+  `BB_FULLSCREEN=1` start and the green-button switch were only tried with the screen locked
+  (no switch on 0.4.0 either then).
 - **Metal-native (M4): presenter parts off until M5/M6.** HDR (`SetHDR` is a no-op, the layer is
   BGRA8 sRGB; was a MoltenVK HDR10 swapchain), display timing (`IsDisplayTimingSupported` false,
   `TakePastTimings` empty: the spike log's present-to-display column reads 0), the settings

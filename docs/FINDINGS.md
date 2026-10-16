@@ -673,6 +673,9 @@ BB_FRAME_STATS=1   # per-frame stall breakdown
 BB_PASS_STATS=1    # why render passes end, split passes
 BB_MENU_TRACE=1    # menu clicks and setting changes
 BB_TRACE=1         # import calls, unbound imports
+# Metal-native renderer: write what is on screen as a PNG (works with the screen locked).
+# Write the trigger atomically (temp file + mv); its first line is the PNG path.
+BB_SNAPSHOT_TRIGGER=/tmp/snap.trigger …   # then: echo /tmp/a.png > /tmp/t.tmp && mv /tmp/t.tmp /tmp/snap.trigger
 # CPU profile while the game runs
 sample $(pgrep -x bb-probe) 10 1 -file profile.txt
 # GPU timeline while the game runs
@@ -850,26 +853,45 @@ and in magenta the draw is small motes spread through the room.
 The game presents through a `CAMetalLayer` with no Vulkan swapchain and no MoltenVK in the frame.
 Runs: split mode, windowed 2992x1672 Retina drawable (1496x836 points), native 1080p, upscaler
 off, `fps_cap=60`, test data in `$MAIN/out/macdata`, saves restored from `save-backups/` before
-and after. The screen was locked during the runs (the window server captures nothing then), so
-pictures come from the presenter's new `BB_SNAPSHOT_TRIGGER` readback of the drawable.
+and after. The screen was locked from 21:12 until between 21:54 and 22:04 (window captures failed: "could not
+create image from window"), so those runs' pictures come from the presenter's new
+`BB_SNAPSHOT_TRIGGER` readback of the drawable; the later runs use window captures. Runs from
+22:15 on skip the intro videos (`skip_intro=1`): their startup times are not comparable with the
+earlier ones.
 
 | | Metal-native (this branch) | 0.4.0 (MoltenVK), same ini and save |
 |---|---|---|
-| Title screen | 60.0 FPS, worst 16.7 ms (every 5 s window after the first) | — |
-| Central Yharnam lamp (`cages-20261016`) | 60.0 FPS, worst 16.7 ms; one 90–180 ms frame per run around the load | 60.0 FPS, worst 16.7 ms; one 95 ms frame around the load |
-| Hunter's Dream (`loadcrash-20261014-134937`) | 60.0 FPS, worst 16.7 ms | not run |
-| First window to first `Frame stats` (incl. run.sh's no-op build) | 22 s cold, 20–24 s warm | 23 s |
-| First 5 s window | 55 FPS, worst ~410 ms: the 2nd frame's `PrepareFrame` waits ~344 ms for the preloaded pipelines, which build on the pool in the background | 60.6 FPS, worst 39.8 ms (preload of 644 pipelines, 321 ms, before the first frame) |
-| Draws (city) | ~1,400/frame, 67 tessellated | — |
+| Title screen | 60.0 FPS, worst 16.7 ms (screen locked) / 17–40 ms (display on) | 60.0 FPS, 16.7 ms locked / 17–29 ms display on |
+| Central Yharnam lamp (`cages-20261016`), warm cache | 60.0 FPS steady; around the load one window of 58–59 FPS with a 92–144 ms frame | 60.0 FPS steady; one 89–106 ms frame around the load |
+| Same, partly cold cache (Task 2's cache, 28 pipelines) | load windows 124 ms and 389 ms | — |
+| Same, empty cache | load window 399 ms (391 shader/pipeline compiles) | — |
+| Hunter's Dream (`loadcrash-20261014-134937`), warm for the city only | 60.0 FPS steady; load windows 148 ms, **542 ms with 39 compiles** (Dream pipelines not in the archive yet), 47.6 ms | not run |
+| Draws per frame (city / Dream) | 884–888 / 815–843 (67 tessellated in the city) | 886–887 / — |
+| First window to first `Frame stats` (incl. run.sh's no-op build), intro playing | 22 s cold, 20–24 s warm | 23 s |
+| Same with `skip_intro=1` | 12 s (title up 12 s after the first stats line) | 12 s |
+| First 5 s window | 55 FPS, worst ~410 ms: the 2nd frame's `PrepareFrame` waits ~344 ms for the preloaded pipelines, which build on the pool in the background | 60.6 FPS, worst 39.8–53.9 ms (preload of 644 pipelines, 321 ms, before the first frame) |
+
+The late 181–185 ms windows in the first runs came from the snapshot hook itself (the PNG was
+written on Metal's serial completion thread); after moving it to its own thread the later runs
+show none.
 
 - **Pictures:** title (logo, hunter, Play Online/Offline, copyright line) with correct colours and
-  gamma; the city save at the lamp (cages, fence, HUD with Oil Urn and blood echoes) and Hunter's
-  Dream at the headstone with its prompt. `BB_HIGH_DPI=0` gives a 1496x836 drawable with the same
-  picture. 0.4.0 pictures of the same saves are still to be taken (locked screen).
+  gamma, identical by eye to 0.4.0's (`t4-master-fs-a.png` vs `t4-r2-t.png`). The city save at the
+  lamp (cages, fence, HUD with Oil Urn and blood echoes) matches 0.4.0 except one thing: **the
+  figure in the cage left of the pillar (behind the bars) is drawn on 0.4.0 and missing on
+  Metal-native** at +40 and +50 s (`t4-m-cages-a/b.png` vs `t4-w-cages-a/b.png`, and the crops
+  `crop-t4-*`). No skipped draw, failed pipeline or error is logged. Hunter's Dream at the headstone
+  with its prompt is correct (no 0.4.0 capture). `BB_HIGH_DPI=0` gives a 1496x836 drawable with
+  the same picture.
+- **Window resize:** the window resized by System Events to 1200x900 points while in the city
+  refits the picture at 16:9 with black bars above and below (`t4-resize2-a.png`); no stall, 60.0
+  FPS with worst frames 17–33 ms afterwards. The full-screen switch was not tried with the screen
+  unlocked.
 - **Binary archive:** cold cache (empty GPU dir): writes of 21, 28, 29 and 205 pipelines, 0 from
   the archive; the save load compiled 391 shaders/pipelines (worst frame 399 ms, during the load
   screen). Warm (same dir): **195 pipelines from the archive, 0 compiled**, save-load worst frame
-  92 ms.
+  92 ms. (From 2026-10-16 22:12 the "compiled" count covers every pipeline kind; before, render
+  pipelines added to a loaded archive only.)
 - **Validation (`MTL_DEBUG_LAYER=1`, nslog, title + city, ~34 FPS under the layer):** two distinct
   messages. `depthStencilState must not be nil` (once per frame: the post-process pass after the
   rasterizer's draws) is fixed: `Encoder::SetDepthStencil(nullptr)` now binds a no-test state.
@@ -881,10 +903,8 @@ pictures come from the presenter's new `BB_SNAPSHOT_TRIGGER` readback of the dra
 - **GC on 16 GB:** `Device::AllocatedSize()` 17.0 GiB at the title, 18.9 GiB in the city;
   resident buffers (guest arena and guest buffers) 16.5 GiB in both. The collector compares the
   difference: 0.45 GiB at the title, 2.4 GiB in the city, against a trigger of 26.2 GiB here
-  (70% of the M4 Max's recommended working set). On a 16 GB Mac the trigger is ~7.5 GiB, well
-  above 2.4 GiB: the arena is not counted. 0 images freed.
+  (70% of the M4 Max's recommended working set). On a 16 GB Mac the trigger is **estimated** at
+  ~7.5 GiB (70% of a ~10.7 GiB recommended working set; not measured), well above 2.4 GiB: the
+  arena is not counted. 0 images freed.
 - **vblank 480 Hz** in the stats is by design (`BB_VBLANK_HZ=0` for the uncapped preset; the
   frame limit stays 60 here) and is the same on 0.4.0.
-- **Not checked yet:** a window resize and the full-screen switch while presenting (System
-  Events cannot reach the window while the screen is locked; `BB_FULLSCREEN=1` did not switch on
-  0.4.0 either while locked).
