@@ -119,7 +119,7 @@ id<MTLTexture> Texture(Metal::Device& device, u32 width, u32 height) {
     return [dev newTextureWithDescriptor:desc];
 }
 
-[[maybe_unused]] u32 Pixel(id<MTLBuffer> readback, u32 width, u32 x, u32 y) {
+u32 Pixel(id<MTLBuffer> readback, u32 width, u32 x, u32 y) {
     u32 value;
     std::memcpy(&value, static_cast<const u8*>(readback.contents) + (y * width + x) * 4, 4);
     return value;
@@ -317,6 +317,177 @@ void TestLargeBytes() {
     Expect(device.ErrorCount() == 0, "compute ran without errors");
 }
 
+constexpr u32 kSize = 64;
+constexpr u32 kRed = 0xff0000ffu, kGreen = 0xff00ff00u, kBlue = 0xffff0000u, kBlack = 0xff000000u,
+              kYellow = 0xff00ffffu; // RGBA8 bytes read as a little-endian u32
+
+id<MTLRenderPipelineState> SolidPipeline(Metal::Device& device, id<MTLLibrary> library,
+                                         NSString* vertex) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+    desc.vertexFunction = [library newFunctionWithName:vertex];
+    desc.fragmentFunction = [library newFunctionWithName:@"solid"];
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    NSError* error = nil;
+    id<MTLRenderPipelineState> pipeline = [dev newRenderPipelineStateWithDescriptor:desc
+                                                                              error:&error];
+    if (!pipeline) {
+        std::printf("FAIL: render pipeline: %s\n", error.localizedDescription.UTF8String);
+        std::exit(1);
+    }
+    return pipeline;
+}
+
+Metal::RenderPassDesc ColorPass(id<MTLTexture> target, bool clear, u32 rgba) {
+    Metal::RenderPassDesc desc;
+    desc.colors[0].texture = (__bridge void*)target;
+    desc.colors[0].clear = clear;
+    desc.colors[0].clear_color = {double(rgba & 0xff) / 255.0, double((rgba >> 8) & 0xff) / 255.0,
+                                  double((rgba >> 16) & 0xff) / 255.0, 1.0};
+    desc.width = kSize;
+    desc.height = kSize;
+    return desc;
+}
+
+/// Records a copy of `texture` into a new shared buffer (kSize x kSize RGBA8).
+id<MTLBuffer> Readback(Metal::Device& device, Metal::Encoder& encoder, id<MTLTexture> texture) {
+    id<MTLBuffer> out = SharedBuffer(device, kSize * kSize * 4);
+    encoder.CopyTextureToBuffer((__bridge void*)texture, 0, 0, {}, {kSize, kSize, 1}, Ref(out),
+                                kSize * 4, kSize * kSize * 4);
+    return out;
+}
+
+void FillTexture(Metal::Device& device, Metal::Encoder& encoder, id<MTLTexture> texture, u32 rgba) {
+    id<MTLBuffer> pixels = SharedBuffer(device, kSize * kSize * 4);
+    for (u32 i = 0; i < kSize * kSize; ++i) {
+        static_cast<u32*>(pixels.contents)[i] = rgba;
+    }
+    encoder.CopyBufferToTexture(Ref(pixels), kSize * 4, kSize * kSize * 4, (__bridge void*)texture,
+                                0, 0, {}, {kSize, kSize, 1});
+    encoder.KeepAlive(Metal::Object::Retain((__bridge void*)pixels));
+}
+
+void SetColor(Metal::Encoder& encoder, u32 rgba) {
+    const float color[4] = {float(rgba & 0xff) / 255.0f, float((rgba >> 8) & 0xff) / 255.0f,
+                            float((rgba >> 16) & 0xff) / 255.0f, 1.0f};
+    encoder.SetBytes(Metal::Stage::Fragment, 0, color, sizeof(color));
+}
+
+void TestClearOnlyPass() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLTexture> cleared = Texture(device, kSize, kSize);
+    id<MTLTexture> untouched = Texture(device, kSize, kSize);
+    FillTexture(device, encoder, cleared, kBlue);
+    FillTexture(device, encoder, untouched, kBlue);
+    encoder.BeginRenderPass(ColorPass(cleared, true, kYellow));
+    encoder.EndRenderPass();
+    encoder.BeginRenderPass(ColorPass(untouched, false, 0));
+    encoder.EndRenderPass();
+    id<MTLBuffer> a = Readback(device, encoder, cleared);
+    id<MTLBuffer> b = Readback(device, encoder, untouched);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(a, kSize, 5, 5) == kYellow && Pixel(a, kSize, 63, 63) == kYellow,
+           "a pass that only clears still clears");
+    Expect(Pixel(b, kSize, 5, 5) == kBlue, "a pass with no draws and no clears leaves the target");
+}
+
+void TestPassReopenKeepsDrawing() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = TestLibrary(device);
+    id<MTLRenderPipelineState> solid = SolidPipeline(device, library, @"fullscreen");
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    id<MTLBuffer> scratch = SharedBuffer(device, 16);
+
+    encoder.BeginRenderPass(ColorPass(target, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)solid);
+    encoder.SetViewport({0, 0, float(kSize), float(kSize), 0, 1});
+    encoder.SetScissor({0, 0, kSize / 2, kSize});
+    SetColor(encoder, kRed);
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.FillBuffer(Ref(scratch), 16, 0); // interrupts the pass
+    encoder.SetScissor({kSize / 2, 0, kSize / 2, kSize});
+    SetColor(encoder, kGreen);
+    encoder.Draw(Metal::Primitive::Triangle, 3); // reopens the pass
+    encoder.EndRenderPass();
+    id<MTLBuffer> out = Readback(device, encoder, target);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize, 1, 1) == kRed, "the draw before the interruption is kept (Load)");
+    Expect(Pixel(out, kSize, kSize - 2, 1) == kGreen, "the draw after the interruption lands");
+    Expect(device.ErrorCount() == 0, "no errors reopening a pass");
+}
+
+void TestStatePersistsAcrossPasses() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = TestLibrary(device);
+    id<MTLRenderPipelineState> solid = SolidPipeline(device, library, @"fullscreen");
+    id<MTLTexture> first = Texture(device, kSize, kSize);
+    id<MTLTexture> second = Texture(device, kSize, kSize);
+
+    encoder.BeginRenderPass(ColorPass(first, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)solid);
+    encoder.SetViewport({0, 0, float(kSize), float(kSize), 0, 1});
+    encoder.SetScissor({0, 0, kSize, kSize / 2}); // top half only
+    SetColor(encoder, kGreen);
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.EndRenderPass();
+    // Second pass: nothing set again; pipeline, viewport, scissor and the color must carry over.
+    encoder.BeginRenderPass(ColorPass(second, true, kBlack));
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.EndRenderPass();
+    id<MTLBuffer> out = Readback(device, encoder, second);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize, 3, 3) == kGreen, "state set in one pass applies in the next");
+    Expect(Pixel(out, kSize, 3, kSize - 3) == kBlack, "including the scissor");
+}
+
+void TestIndexedDraw() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = TestLibrary(device);
+    id<MTLRenderPipelineState> quad = SolidPipeline(device, library, @"indexed_quad");
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    // Left half of clip space as two triangles from four corners.
+    const float corners[8] = {-1, -1, 0, -1, -1, 1, 0, 1};
+    id<MTLBuffer> indices = SharedBuffer(device, 12);
+    const u16 index_data[6] = {0, 1, 2, 2, 1, 3};
+    std::memcpy(indices.contents, index_data, sizeof(index_data));
+
+    encoder.BeginRenderPass(ColorPass(target, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)quad);
+    encoder.SetViewport({0, 0, float(kSize), float(kSize), 0, 1});
+    encoder.SetScissor({0, 0, kSize, kSize});
+    encoder.SetBytes(Metal::Stage::Vertex, 0, corners, sizeof(corners));
+    SetColor(encoder, kBlue);
+    encoder.DrawIndexed(Metal::Primitive::Triangle, 6, Metal::IndexType::U16, Ref(indices));
+    encoder.EndRenderPass();
+    id<MTLBuffer> out = Readback(device, encoder, target);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize, 2, kSize / 2) == kBlue, "DrawIndexed draws the left half");
+    Expect(Pixel(out, kSize, kSize - 2, kSize / 2) == kBlack, "and not the right half");
+}
+
+
+/// IsFree/Wait mean the command buffer completed (its handlers ran), not only that the GPU
+/// reached the signal: owners free resources at that point, and Metal (validation layer) counts
+/// a command buffer as using them until it completes.
+void TestWaitMeansCompleted() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLBuffer> buffer = SharedBuffer(device, 4096);
+    bool completed = true;
+    for (int i = 0; i < 200 && completed; ++i) {
+        encoder.FillBuffer(Ref(buffer), 4096, u32(i & 0xff) * 0x01010101u);
+        id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)encoder.CommandBuffer();
+        const u64 tick = encoder.Submit();
+        device.Wait(tick);
+        completed = cmd.status == MTLCommandBufferStatusCompleted;
+    }
+    Expect(completed, "after Wait(tick) the tick's command buffer has completed");
+}
+
 } // namespace
 
 int main() {
@@ -326,8 +497,13 @@ int main() {
         TestDeviceLifetime();
         TestBlits();
         TestKeepAlive();
+        TestWaitMeansCompleted();
         TestCompute();
         TestLargeBytes();
+        TestClearOnlyPass();
+        TestPassReopenKeepsDrawing();
+        TestStatePersistsAcrossPasses();
+        TestIndexedDraw();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

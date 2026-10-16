@@ -52,6 +52,34 @@ void ForEachBit(u32 mask, F&& f) {
     }
 }
 
+MTLPrimitiveType ToMtl(Primitive primitive) {
+    switch (primitive) {
+    case Primitive::Point:
+        return MTLPrimitiveTypePoint;
+    case Primitive::Line:
+        return MTLPrimitiveTypeLine;
+    case Primitive::LineStrip:
+        return MTLPrimitiveTypeLineStrip;
+    case Primitive::Triangle:
+        return MTLPrimitiveTypeTriangle;
+    case Primitive::TriangleStrip:
+        return MTLPrimitiveTypeTriangleStrip;
+    }
+    UNREACHABLE();
+}
+
+MTLCullMode ToMtl(CullMode mode) {
+    switch (mode) {
+    case CullMode::None:
+        return MTLCullModeNone;
+    case CullMode::Front:
+        return MTLCullModeFront;
+    case CullMode::Back:
+        return MTLCullModeBack;
+    }
+    UNREACHABLE();
+}
+
 } // namespace
 
 struct Encoder::Impl {
@@ -178,6 +206,100 @@ struct Encoder::Impl {
             [e setSamplerState:(__bridge id<MTLSamplerState>)s.samplers[slot] atIndex:slot];
         });
         s.buffers_dirty = s.textures_dirty = s.samplers_dirty = 0;
+    }
+
+    id<MTLRenderCommandEncoder> Render() {
+        if (!render) {
+            ASSERT_MSG(in_pass, "Draw outside a render pass");
+            EndCompute();
+            EndBlit();
+            @autoreleasepool {
+                render = [Cmd() renderCommandEncoderWithDescriptor:pass_opened ? pass_load
+                                                                               : pass_first];
+            }
+            pass_opened = true;
+            render_dirty = render_used;
+            vertex.Reapply();
+            fragment.Reapply();
+        }
+        return render;
+    }
+
+    void ApplyStage(id<MTLRenderCommandEncoder> e, StageState& s, bool is_vertex) {
+        ForEachBit(s.buffers_dirty, [&](u32 slot) {
+            const StageState::Slot& b = s.buffers[slot];
+            if (!b.bytes.empty()) {
+                if (is_vertex) {
+                    [e setVertexBytes:b.bytes.data() length:b.bytes.size() atIndex:slot];
+                } else {
+                    [e setFragmentBytes:b.bytes.data() length:b.bytes.size() atIndex:slot];
+                }
+            } else if (is_vertex) {
+                [e setVertexBuffer:(__bridge id<MTLBuffer>)b.buffer offset:b.offset atIndex:slot];
+            } else {
+                [e setFragmentBuffer:(__bridge id<MTLBuffer>)b.buffer offset:b.offset atIndex:slot];
+            }
+        });
+        ForEachBit(s.textures_dirty, [&](u32 slot) {
+            id<MTLTexture> t = (__bridge id<MTLTexture>)s.textures[slot];
+            if (is_vertex) {
+                [e setVertexTexture:t atIndex:slot];
+            } else {
+                [e setFragmentTexture:t atIndex:slot];
+            }
+        });
+        ForEachBit(s.samplers_dirty, [&](u32 slot) {
+            id<MTLSamplerState> st = (__bridge id<MTLSamplerState>)s.samplers[slot];
+            if (is_vertex) {
+                [e setVertexSamplerState:st atIndex:slot];
+            } else {
+                [e setFragmentSamplerState:st atIndex:slot];
+            }
+        });
+        s.buffers_dirty = s.textures_dirty = s.samplers_dirty = 0;
+    }
+
+    void ApplyRender() {
+        id<MTLRenderCommandEncoder> e = Render();
+        const u32 d = render_dirty;
+        if (d & BitPipeline) {
+            [e setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)render_pipeline];
+        }
+        if (d & BitDepthStencil) {
+            [e setDepthStencilState:(__bridge id<MTLDepthStencilState>)depth_stencil];
+        }
+        if (d & BitViewport) {
+            [e setViewport:(MTLViewport){viewport.x, viewport.y, viewport.width, viewport.height,
+                                         viewport.min_depth, viewport.max_depth}];
+        }
+        if (d & BitScissor) {
+            [e setScissorRect:(MTLScissorRect){scissor.x, scissor.y, scissor.width,
+                                               scissor.height}];
+        }
+        if (d & BitCull) {
+            [e setCullMode:ToMtl(cull)];
+        }
+        if (d & BitWinding) {
+            [e setFrontFacingWinding:winding == Winding::Clockwise ? MTLWindingClockwise
+                                                                    : MTLWindingCounterClockwise];
+        }
+        if (d & BitBias) {
+            [e setDepthBias:bias[0] slopeScale:bias[1] clamp:bias[2]];
+        }
+        if (d & BitStencilRef) {
+            [e setStencilFrontReferenceValue:stencil_front backReferenceValue:stencil_back];
+        }
+        if (d & BitBlend) {
+            [e setBlendColorRed:blend[0] green:blend[1] blue:blend[2] alpha:blend[3]];
+        }
+        render_dirty = 0;
+        ApplyStage(e, vertex, true);
+        ApplyStage(e, fragment, false);
+    }
+
+    void MarkRender(u32 bit) {
+        render_dirty |= bit;
+        render_used |= bit;
     }
 
     StageState& StateOf(Stage stage) {
@@ -363,47 +485,161 @@ void Encoder::Dispatch(Size3 groups, Size3 threads_per_group) {
 
 // ---- Render passes and draws (Task 5) ----
 
-void Encoder::BeginRenderPass(const RenderPassDesc&) {
-    UNREACHABLE_MSG("Metal::Encoder render passes: Task 5");
+void Encoder::BeginRenderPass(const RenderPassDesc& desc) {
+    ASSERT_MSG(!impl->in_pass, "BeginRenderPass inside a render pass");
+    EndEncoding();
+    MTLRenderPassDescriptor* first = [MTLRenderPassDescriptor renderPassDescriptor];
+    bool clears = false, attachments = false;
+    for (u32 i = 0; i < RenderPassDesc::MaxColors; ++i) {
+        const ColorAttachment& c = desc.colors[i];
+        if (!c.texture) {
+            continue;
+        }
+        attachments = true;
+        MTLRenderPassColorAttachmentDescriptor* a = first.colorAttachments[i];
+        a.texture = (__bridge id<MTLTexture>)c.texture;
+        a.level = c.level;
+        a.slice = c.slice;
+        a.loadAction = c.clear ? MTLLoadActionClear : MTLLoadActionLoad;
+        a.storeAction = MTLStoreActionStore;
+        a.clearColor = MTLClearColorMake(c.clear_color[0], c.clear_color[1], c.clear_color[2],
+                                         c.clear_color[3]);
+        clears |= c.clear;
+    }
+    const DepthAttachment& d = desc.depth;
+    if (d.texture) {
+        attachments = true;
+        MTLRenderPassDepthAttachmentDescriptor* a = first.depthAttachment;
+        a.texture = (__bridge id<MTLTexture>)d.texture;
+        a.level = d.level;
+        a.slice = d.slice;
+        a.loadAction = d.clear_depth ? MTLLoadActionClear : MTLLoadActionLoad;
+        a.storeAction = MTLStoreActionStore;
+        a.clearDepth = d.depth;
+        clears |= d.clear_depth;
+        if (d.has_stencil) {
+            MTLRenderPassStencilAttachmentDescriptor* s = first.stencilAttachment;
+            s.texture = a.texture;
+            s.level = d.level;
+            s.slice = d.slice;
+            s.loadAction = d.clear_stencil ? MTLLoadActionClear : MTLLoadActionLoad;
+            s.storeAction = MTLStoreActionStore;
+            s.clearStencil = d.stencil;
+            clears |= d.clear_stencil;
+        }
+    }
+    if (!attachments) {
+        first.renderTargetWidth = desc.width;
+        first.renderTargetHeight = desc.height;
+        first.defaultRasterSampleCount = 1;
+    }
+    MTLRenderPassDescriptor* load = [first copy];
+    for (u32 i = 0; i < RenderPassDesc::MaxColors; ++i) {
+        load.colorAttachments[i].loadAction = MTLLoadActionLoad;
+    }
+    load.depthAttachment.loadAction = MTLLoadActionLoad;
+    load.stencilAttachment.loadAction = MTLLoadActionLoad;
+    impl->pass_first = first;
+    impl->pass_load = load;
+    impl->pass_clears = clears;
+    impl->pass_opened = false;
+    impl->in_pass = true;
 }
+
 void Encoder::EndRenderPass() {
-    UNREACHABLE_MSG("Metal::Encoder render passes: Task 5");
+    ASSERT_MSG(impl->in_pass, "EndRenderPass outside a render pass");
+    if (!impl->pass_opened && impl->pass_clears) {
+        impl->Render(); // a pass that only clears still has to clear
+    }
+    impl->EndRender();
+    impl->in_pass = false;
+    impl->pass_first = nil;
+    impl->pass_load = nil;
 }
+
+void Encoder::SetRenderPipeline(void* pipeline) {
+    if (pipeline != impl->render_pipeline) {
+        impl->render_pipeline = pipeline;
+        impl->MarkRender(Impl::BitPipeline);
+    }
+}
+
+void Encoder::SetDepthStencil(void* state) {
+    if (state != impl->depth_stencil) {
+        impl->depth_stencil = state;
+        impl->MarkRender(Impl::BitDepthStencil);
+    }
+}
+
+void Encoder::SetViewport(const Viewport& viewport) {
+    impl->viewport = viewport;
+    impl->MarkRender(Impl::BitViewport);
+}
+
+void Encoder::SetScissor(const Scissor& scissor) {
+    impl->scissor = scissor;
+    impl->MarkRender(Impl::BitScissor);
+}
+
+void Encoder::SetCullMode(CullMode mode) {
+    impl->cull = mode;
+    impl->MarkRender(Impl::BitCull);
+}
+
+void Encoder::SetFrontFace(Winding winding) {
+    impl->winding = winding;
+    impl->MarkRender(Impl::BitWinding);
+}
+
+void Encoder::SetDepthBias(float constant, float slope, float clamp) {
+    impl->bias[0] = constant;
+    impl->bias[1] = slope;
+    impl->bias[2] = clamp;
+    impl->MarkRender(Impl::BitBias);
+}
+
+void Encoder::SetStencilReference(u32 front, u32 back) {
+    impl->stencil_front = front;
+    impl->stencil_back = back;
+    impl->MarkRender(Impl::BitStencilRef);
+}
+
+void Encoder::SetBlendColor(float r, float g, float b, float a) {
+    impl->blend[0] = r;
+    impl->blend[1] = g;
+    impl->blend[2] = b;
+    impl->blend[3] = a;
+    impl->MarkRender(Impl::BitBlend);
+}
+
+void Encoder::Draw(Primitive primitive, u32 vertex_count, u32 instance_count, u32 first_vertex,
+                   u32 first_instance) {
+    ASSERT_MSG(impl->render_pipeline, "Draw without a render pipeline");
+    impl->ApplyRender();
+    [impl->render drawPrimitives:ToMtl(primitive)
+                     vertexStart:first_vertex
+                     vertexCount:vertex_count
+                   instanceCount:instance_count
+                    baseInstance:first_instance];
+}
+
+void Encoder::DrawIndexed(Primitive primitive, u32 index_count, IndexType type, BufferRef indices,
+                          u32 instance_count, s32 base_vertex, u32 first_instance) {
+    ASSERT_MSG(impl->render_pipeline, "Draw without a render pipeline");
+    impl->ApplyRender();
+    [impl->render drawIndexedPrimitives:ToMtl(primitive)
+                             indexCount:index_count
+                              indexType:type == IndexType::U32 ? MTLIndexTypeUInt32
+                                                               : MTLIndexTypeUInt16
+                            indexBuffer:(__bridge id<MTLBuffer>)indices.buffer
+                      indexBufferOffset:indices.offset
+                          instanceCount:instance_count
+                             baseVertex:base_vertex
+                           baseInstance:first_instance];
+}
+
 bool Encoder::InRenderPass() const noexcept {
     return impl->in_pass;
-}
-void Encoder::SetRenderPipeline(void*) {
-    UNREACHABLE_MSG("Metal::Encoder render state: Task 5");
-}
-void Encoder::SetDepthStencil(void*) {
-    UNREACHABLE_MSG("Metal::Encoder render state: Task 5");
-}
-void Encoder::SetViewport(const Viewport&) {
-    UNREACHABLE_MSG("Metal::Encoder render state: Task 5");
-}
-void Encoder::SetScissor(const Scissor&) {
-    UNREACHABLE_MSG("Metal::Encoder render state: Task 5");
-}
-void Encoder::SetCullMode(CullMode) {
-    UNREACHABLE_MSG("Metal::Encoder render state: Task 5");
-}
-void Encoder::SetFrontFace(Winding) {
-    UNREACHABLE_MSG("Metal::Encoder render state: Task 5");
-}
-void Encoder::SetDepthBias(float, float, float) {
-    UNREACHABLE_MSG("Metal::Encoder render state: Task 5");
-}
-void Encoder::SetStencilReference(u32, u32) {
-    UNREACHABLE_MSG("Metal::Encoder render state: Task 5");
-}
-void Encoder::SetBlendColor(float, float, float, float) {
-    UNREACHABLE_MSG("Metal::Encoder render state: Task 5");
-}
-void Encoder::Draw(Primitive, u32, u32, u32, u32) {
-    UNREACHABLE_MSG("Metal::Encoder draws: Task 5");
-}
-void Encoder::DrawIndexed(Primitive, u32, IndexType, BufferRef, u32, s32, u32) {
-    UNREACHABLE_MSG("Metal::Encoder draws: Task 5");
 }
 
 } // namespace Metal
