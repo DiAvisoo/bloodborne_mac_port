@@ -152,6 +152,7 @@ private:
     /// a detached thread: one still writing at exit leaves a truncated file (debug tool).
     std::string snapshot_trigger;
     /// The PNG path when the trigger file exists (and removes it); empty otherwise.
+    bool SnapshotRequested() const;
     std::string TakeSnapshotRequest();
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;

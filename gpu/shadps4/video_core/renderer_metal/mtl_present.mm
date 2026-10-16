@@ -39,6 +39,13 @@ FitRect FitImage(u32 src_width, u32 src_height, u32 dst_width, u32 dst_height) {
             width, height};
 }
 
+bool ShouldAcquireDrawable(bool window_visible, s32 width, s32 height, bool snapshot_requested) {
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    return window_visible || snapshot_requested;
+}
+
 struct PresentPasses::Impl {
     Object library;
     Object post_process; ///< id<MTLRenderPipelineState>, colour frame_format

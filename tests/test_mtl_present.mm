@@ -131,6 +131,16 @@ void TestFitImage() {
     Expect(same(FitImage(1920, 1080, 1920, 0), 0, 0, 0, 0), "FitImage zero target height");
 }
 
+void TestShouldAcquireDrawable() {
+    Expect(ShouldAcquireDrawable(true, 1920, 1080, false), "visible window: acquire");
+    Expect(!ShouldAcquireDrawable(false, 1920, 1080, false),
+           "minimised/hidden/occluded window keeps its size: skip (nextDrawable would block)");
+    Expect(ShouldAcquireDrawable(false, 1920, 1080, true),
+           "snapshot request on an occluded window: acquire (locked-screen snapshots)");
+    Expect(!ShouldAcquireDrawable(true, 0, 1080, false), "zero width: skip");
+    Expect(!ShouldAcquireDrawable(true, 1920, 0, true), "zero height: skip, even for a snapshot");
+}
+
 /// 4x4 texels whose bytes cycle through {0, 1, 64, 128, 200, 255}.
 std::vector<u8> TestBytes() {
     constexpr u8 values[] = {0, 1, 64, 128, 200, 255};
@@ -609,6 +619,7 @@ void TestBoundedWaits(Device& device) {
 int main() {
     @autoreleasepool {
         TestFitImage();
+        TestShouldAcquireDrawable();
         Device device;
         PresentPasses passes{device, kBGRA8, kBGRA8};
         TestPostProcessGamma(device, passes);

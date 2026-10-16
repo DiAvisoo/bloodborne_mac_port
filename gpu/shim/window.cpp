@@ -64,6 +64,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_GetWindowSizeInPixels(window, &w, &h);
     width = w;
     height = h;
+    UpdateVisible();
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
     std::printf("Window: %dx%d pixels, density %.1f\n", w, h, SDL_GetWindowPixelDensity(window));
 }
@@ -93,6 +94,18 @@ void WindowSDL::UpdateTextTitle() {
     const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + text + "_  (Enter = OK, Esc = cancel)"
                                           : base_title;
     SDL_SetWindowTitle(window, title.c_str());
+}
+
+void WindowSDL::UpdateVisible() {
+    // SDL keeps these flags from the window events (MINIMIZED/RESTORED, HIDDEN/SHOWN and, from
+    // NSWindow's occlusionState, OCCLUDED/EXPOSED).
+    const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
+    const bool now = !(flags & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_OCCLUDED));
+    if (now != visible.exchange(now, std::memory_order_relaxed)) {
+        std::printf("Window: %s\n", now ? "visible: presenting"
+                                         : "minimised, hidden or occluded: frames not presented");
+        std::fflush(stdout);
+    }
 }
 
 bool WindowSDL::PollEvents() {
@@ -141,6 +154,15 @@ bool WindowSDL::PollEvents() {
             height = h;
             break;
         }
+        case SDL_EVENT_WINDOW_MINIMIZED:
+        case SDL_EVENT_WINDOW_RESTORED:
+        case SDL_EVENT_WINDOW_MAXIMIZED:
+        case SDL_EVENT_WINDOW_HIDDEN:
+        case SDL_EVENT_WINDOW_SHOWN:
+        case SDL_EVENT_WINDOW_OCCLUDED:
+        case SDL_EVENT_WINDOW_EXPOSED:
+            UpdateVisible();
+            break;
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
             // bbport: say which, so an unexpected close can be traced.

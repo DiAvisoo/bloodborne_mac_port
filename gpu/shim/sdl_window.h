@@ -28,6 +28,9 @@ public:
     SDL_Window* GetSDLWindow() const { return window; }
     WindowSystemInfo GetWindowInfo() const { return window_info; }
     bool IsOpen() const { return is_open.load(std::memory_order_relaxed); }
+    /// False while the window is minimised, hidden or fully occluded (macOS keeps the size then,
+    /// and the window server composites nothing): the presenter skips frames. Any thread.
+    bool IsVisible() const { return visible.load(std::memory_order_relaxed); }
     /// Processes pending window events. Returns false once the user closed the window.
     bool PollEvents();
     /// Keyboard text entry for the system IME dialog; typed text shows in the title bar.
@@ -38,6 +41,8 @@ public:
 private:
     std::atomic<s32> width, height;
     std::atomic<bool> is_open{true};
+    std::atomic<bool> visible{true};
+    void UpdateVisible();
     std::mutex text_mutex;
     bool text_requested{}, text_active{};
     int text_state{};

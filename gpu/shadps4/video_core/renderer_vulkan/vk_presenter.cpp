@@ -301,8 +301,12 @@ Frame* Presenter::PrepareBlankFrame(bool) {
     return frame;
 }
 
+bool Presenter::SnapshotRequested() const {
+    return !snapshot_trigger.empty() && access(snapshot_trigger.c_str(), F_OK) == 0;
+}
+
 std::string Presenter::TakeSnapshotRequest() {
-    if (snapshot_trigger.empty() || access(snapshot_trigger.c_str(), F_OK) != 0) {
+    if (!SnapshotRequested()) {
         return {};
     }
     std::string path;
@@ -325,8 +329,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
     // nextDrawable and the present passes create autoreleased objects, and this thread
     // (bb:Present) has no pool of its own: without one, drawables never return to the layer.
     Metal::WithAutoreleasePool([&] {
-        if (window.GetWidth() <= 0 || window.GetHeight() <= 0) {
-            pool->Free(frame); // minimised
+        // Minimised, hidden or occluded: nextDrawable would block up to 1 s. The frame returns
+        // to the pool at once, so PrepareFrame's Take never waits on a skipped present.
+        if (!Metal::ShouldAcquireDrawable(window.IsVisible(), window.GetWidth(),
+                                          window.GetHeight(), SnapshotRequested())) {
+            pool->Free(frame);
             return;
         }
         Metal::Drawable drawable = Metal::NextDrawable(layer);

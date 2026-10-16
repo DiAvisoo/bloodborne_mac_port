@@ -26,6 +26,14 @@ struct FitRect {
 FitRect FitImage(u32 src_width, u32 src_height, u32 dst_width, u32 dst_height);
 
 /// post_process.frag's push constants (12 bytes, shader layout).
+/// Whether Present should ask the layer for a drawable. A minimised, hidden or fully occluded
+/// macOS window keeps its pixel size, and nextDrawable on a layer the window server does not
+/// composite can block up to its 1 s timeout per frame (the frame pool fills and the game stalls):
+/// such frames are skipped. A snapshot request (BB_SNAPSHOT_TRIGGER) still acquires, since
+/// snapshots are taken while the screen is locked. A zero-sized window never acquires.
+bool ShouldAcquireDrawable(bool window_visible, s32 width, s32 height, bool snapshot_requested);
+
+/// post_process.frag's push constants (12 bytes, shader layout).
 struct PostProcessSettings {
     float gamma{1.0f};
     u32 hdr{};
