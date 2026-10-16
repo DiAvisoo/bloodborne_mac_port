@@ -134,6 +134,9 @@ inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, 
     copy_threads_wait_ns{0}, host_copy_waits{0};
 /// The texture cache collector: the usage it compares, the mark it starts at, images it freed.
 inline std::atomic<std::uint64_t> gc_used_bytes{0}, gc_trigger_bytes{0}, gc_freed_images{0};
+/// Metal: MTLDevice.currentAllocatedSize and the resident guest buffers it includes (the GC
+/// compares the difference).
+inline std::atomic<std::uint64_t> gc_allocated_bytes{0}, gc_resident_bytes{0};
 /// Seconds of a steady clock, updated at every guest submission (cheap ages for caches).
 inline std::atomic<std::uint32_t> coarse_second{0};
 /// Images the collector passed over (GPU-written, not evictable without memory pressure).

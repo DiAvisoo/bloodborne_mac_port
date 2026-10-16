@@ -143,7 +143,7 @@ if [[ ${1:-} == --test ]]; then
         # Metal-native M4: the present helper (offscreen CAMetalLayer), plain and under validation.
         /usr/bin/clang++ -arch arm64 -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -std=c++20 -fobjc-arc -O2 -g \
             -Wall -Wextra -Werror -Igpu/shim -Igpu/shadps4 -I"$ARM64_PREFIX/include" tests/test_mtl_present.mm gpu/shim/common/logging/log.cpp gpu/shim/common/assert.cpp out/gpu-arm64/libbbmetal_core.a -L"$ARM64_PREFIX/lib" -lfmt \
-            -framework Metal -framework QuartzCore -framework CoreGraphics -framework Foundation -o out/mtl-present-test
+            -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework Foundation -o out/mtl-present-test
         out/mtl-present-test
         MTL_DEBUG_LAYER=1 out/mtl-present-test
     fi

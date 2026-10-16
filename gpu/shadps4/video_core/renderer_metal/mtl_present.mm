@@ -2,6 +2,7 @@
 // bbport: presenting to a CAMetalLayer (Metal-native renderer, M4). See mtl_present.h.
 
 #import <Foundation/Foundation.h>
+#import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
@@ -145,6 +146,65 @@ Drawable NextDrawable(void* layer) {
     result.height = u32(texture.height);
     result.drawable = Object::Adopt((__bridge_retained void*)drawable);
     return result;
+}
+
+Object EncodeSnapshot(Device& device, void* command_buffer, void* texture, u32 width,
+                      u32 height) {
+    if (width == 0 || height == 0) {
+        return {};
+    }
+    id<MTLBuffer> buffer =
+        [(__bridge id<MTLDevice>)device.NativeDevice() newBufferWithLength:NSUInteger(width) * height * 4
+                                                                   options:MTLResourceStorageModeShared];
+    if (buffer == nil) {
+        return {};
+    }
+    buffer.label = @"Snapshot";
+    id<MTLBlitCommandEncoder> blit =
+        [(__bridge id<MTLCommandBuffer>)command_buffer blitCommandEncoder];
+    blit.label = @"Snapshot";
+    [blit copyFromTexture:(__bridge id<MTLTexture>)texture
+                     sourceSlice:0
+                     sourceLevel:0
+                    sourceOrigin:MTLOriginMake(0, 0, 0)
+                      sourceSize:MTLSizeMake(width, height, 1)
+                        toBuffer:buffer
+               destinationOffset:0
+          destinationBytesPerRow:NSUInteger(width) * 4
+        destinationBytesPerImage:NSUInteger(width) * height * 4];
+    [blit endEncoding];
+    return Object::Adopt((__bridge_retained void*)buffer);
+}
+
+bool WriteSnapshotPng(const char* path, void* buffer, u32 width, u32 height) {
+    @autoreleasepool {
+        id<MTLBuffer> source = (__bridge id<MTLBuffer>)buffer;
+        if (source == nil || source.length < NSUInteger(width) * height * 4) {
+            return false;
+        }
+        CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGDataProviderRef provider = CGDataProviderCreateWithData(
+            nullptr, source.contents, size_t(width) * height * 4, nullptr);
+        // BGRA8 bytes = little-endian 32-bit pixels with alpha first (ARGB); alpha is 1.
+        CGImageRef image = CGImageCreate(width, height, 8, 32, size_t(width) * 4, srgb,
+                                         kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+                                         provider, nullptr, false, kCGRenderingIntentDefault);
+        bool ok = false;
+        NSURL* url = [NSURL fileURLWithPath:@(path)];
+        CGImageDestinationRef destination = CGImageDestinationCreateWithURL(
+            (__bridge CFURLRef)url, CFSTR("public.png"), 1, nullptr);
+        if (image != nullptr && destination != nullptr) {
+            CGImageDestinationAddImage(destination, image, nullptr);
+            ok = CGImageDestinationFinalize(destination);
+        }
+        if (destination != nullptr) {
+            CFRelease(destination);
+        }
+        CGImageRelease(image);
+        CGDataProviderRelease(provider);
+        CGColorSpaceRelease(srgb);
+        return ok;
+    }
 }
 
 void WithAutoreleasePool(const std::function<void()>& body) {

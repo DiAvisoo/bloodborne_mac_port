@@ -775,6 +775,15 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            // Texture-cache collector input: Metal's allocation minus the resident guest
+            // buffers (the arena) against the trigger.
+            std::printf("GPU memory: %.0f MiB allocated, %.0f MiB resident buffers; collector "
+                        "usage %.0f MiB, trigger %.0f MiB, %llu images freed\n",
+                        BbStats::gc_allocated_bytes.load() / 1048576.0,
+                        BbStats::gc_resident_bytes.load() / 1048576.0,
+                        BbStats::gc_used_bytes.load() / 1048576.0,
+                        BbStats::gc_trigger_bytes.load() / 1048576.0,
+                        static_cast<unsigned long long>(BbStats::gc_freed_images.load()));
             // Frame timeline: where each frame's time goes on the GPU side (ms per frame).
             if (frames) {
                 const auto per_frame = [&](std::atomic<u64>& total) {

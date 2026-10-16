@@ -75,6 +75,15 @@ struct Drawable {
 /// autorelease pool.
 Drawable NextDrawable(void* layer);
 
+/// Debug snapshot of what is shown (BB_SNAPSHOT_TRIGGER; screenshots while the screen is locked
+/// or asleep, when the window server captures nothing): encodes a copy of `texture` (BGRA8,
+/// width x height; a drawable needs framebuffer_only off) into a new shared id<MTLBuffer> on
+/// `command_buffer`. Null when the buffer cannot be made.
+Object EncodeSnapshot(Device& device, void* command_buffer, void* texture, u32 width, u32 height);
+/// After that command buffer completed: writes the copy (`buffer`, an id<MTLBuffer>) as an sRGB
+/// PNG at `path`. False on failure.
+bool WriteSnapshotPng(const char* path, void* buffer, u32 width, u32 height);
+
 /// Runs `body` inside @autoreleasepool (for plain C++ callers on threads without a pool).
 void WithAutoreleasePool(const std::function<void()>& body);
 

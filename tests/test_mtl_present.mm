@@ -6,7 +6,9 @@
 // autorelease pools and the queue's destructor (and its bounded waits). Links bbmetal_core alone; no window.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <ImageIO/ImageIO.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -231,6 +233,42 @@ void TestAlphaSwizzle(Device& device, PresentPasses& passes) {
     Expect(ok, "alpha 0 through a swizzle-One view comes out 255");
 }
 
+/// The post-process pass after the rasterizer left a depth-stencil state bound: its "no depth
+/// state" must not reach Metal as nil (validation: "depthStencilState must not be nil", seen once
+/// per frame in game). Under MTL_DEBUG_LAYER=1 a nil state aborts here.
+void TestPostProcessAfterDepthState(Device& device, PresentPasses& passes) {
+    constexpr u32 kSize = 4;
+    const std::vector<u8> src = TestBytes();
+    Object input = Upload(device, kBGRA8Srgb, kSize, kSize, src.data());
+    Object output = CreateTexture(device,
+                                  TextureDesc{.pixel_format = kBGRA8,
+                                              .width = kSize,
+                                              .height = kSize,
+                                              .render_target = true},
+                                  "test output", nullptr);
+    MTLDepthStencilDescriptor* desc = [MTLDepthStencilDescriptor new];
+    desc.depthCompareFunction = MTLCompareFunctionLess;
+    desc.depthWriteEnabled = YES;
+    id<MTLDepthStencilState> depth_state = [Dev(device) newDepthStencilStateWithDescriptor:desc];
+    id<MTLBuffer> readback = SharedBuffer(device, kSize * kSize * 4);
+    Encoder encoder{device};
+    // Twice: a fresh pass re-applies the state used before it.
+    for (int i = 0; i < 2; ++i) {
+        encoder.SetDepthStencil((__bridge void*)depth_state);
+        passes.PostProcess(encoder, input.Get(), output.Get(), kSize, kSize, {.gamma = 1.0f});
+    }
+    encoder.CopyTextureToBuffer(output.Get(), 0, 0, {}, {kSize, kSize, 1}, Ref(readback),
+                                kSize * 4, kSize * kSize * 4);
+    device.Wait(encoder.Submit());
+    const u8* out = static_cast<const u8*>(readback.contents);
+    bool ok = true;
+    for (u32 i = 0; i < kSize * kSize; ++i) {
+        ok &= Near(out[i * 4 + 0], src[i * 4 + 0]) && Near(out[i * 4 + 1], src[i * 4 + 1]) &&
+              Near(out[i * 4 + 2], src[i * 4 + 2]);
+    }
+    Expect(ok, "post-process after a depth-stencil state: gamma 1.0 round-trips");
+}
+
 CAMetalLayer* OffscreenLayer(Device& device, u32 width, u32 height, u32 max_drawables) {
     CAMetalLayer* layer = [CAMetalLayer layer];
     ConfigureLayer(device, (__bridge void*)layer,
@@ -337,6 +375,64 @@ void TestPresentLetterbox(Device& device, PresentPasses& passes, PresentQueue& q
         ok &= px[i] == 0xff000000u;
     }
     Expect(ok, "present without a frame clears to black");
+}
+
+/// Debug snapshot (BB_SNAPSHOT_TRIGGER): the letterboxed drawable is read back on the present
+/// command buffer and written as a PNG once it completed.
+void TestSnapshot(Device& device, PresentPasses& passes, PresentQueue& queue) {
+    static constexpr u32 kW = 32, kH = 32;
+    Object frame = RedFrame(device);
+    CAMetalLayer* layer = OffscreenLayer(device, kW, kH, 2);
+    char path[] = "/tmp/mtl-present-test-XXXXXX.png";
+    const int fd = mkstemps(path, 4);
+    Expect(fd >= 0, "snapshot temp file");
+    close(fd);
+    std::atomic<bool> written{false};
+    Object readback; // lives until the command buffer completed
+    WithAutoreleasePool([&] {
+        Drawable drawable = NextDrawable((__bridge void*)layer);
+        if (!drawable.drawable) {
+            Expect(false, "snapshot drawable");
+            return;
+        }
+        void* cb = queue.Begin();
+        passes.Present(cb, frame.Get(), 16, 9, drawable.texture, kW, kH);
+        readback = EncodeSnapshot(device, cb, drawable.texture, kW, kH);
+        Expect(bool(readback), "snapshot readback buffer");
+        void* const buffer = readback.Get();
+        queue.Commit(cb, nullptr, [&written, buffer, &path] {
+            written = WriteSnapshotPng(path, buffer, kW, kH);
+        });
+    });
+    queue.WaitIdle();
+    Expect(written, "snapshot PNG written");
+    NSData* data = [NSData dataWithContentsOfFile:@(path)];
+    CGImageSourceRef source =
+        data ? CGImageSourceCreateWithData((__bridge CFDataRef)data, nullptr) : nullptr;
+    CGImageRef image = source ? CGImageSourceCreateImageAtIndex(source, 0, nullptr) : nullptr;
+    Expect(image != nullptr, "snapshot PNG decodes");
+    if (image != nullptr) {
+        Expect(CGImageGetWidth(image) == kW && CGImageGetHeight(image) == kH, "snapshot size");
+        // Redraw into known RGBA8 bytes to compare pixels.
+        std::vector<u8> rgba(kW * kH * 4);
+        CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef ctx = CGBitmapContextCreate(rgba.data(), kW, kH, 8, kW * 4, srgb,
+                                                 kCGImageAlphaPremultipliedLast);
+        CGContextDrawImage(ctx, CGRectMake(0, 0, kW, kH), image);
+        CGContextRelease(ctx);
+        CGColorSpaceRelease(srgb);
+        const u8* centre = &rgba[(kH / 2 * kW + kW / 2) * 4];
+        const u8* corner = &rgba[0];
+        Expect(centre[0] == 255 && centre[1] == 0 && centre[2] == 0 && centre[3] == 255,
+               "snapshot: red inside the fit rect");
+        Expect(corner[0] == 0 && corner[1] == 0 && corner[2] == 0 && corner[3] == 255,
+               "snapshot: black letterbox");
+        CGImageRelease(image);
+    }
+    if (source != nullptr) {
+        CFRelease(source);
+    }
+    unlink(path);
 }
 
 void TestEventWait(Device& device, PresentQueue& queue) {
@@ -505,10 +601,12 @@ int main() {
         TestPostProcessGamma(device, passes);
         TestPostProcessSrgbInput(device, passes);
         TestAlphaSwizzle(device, passes);
+        TestPostProcessAfterDepthState(device, passes);
         TestLayerConfig(device);
         {
             PresentQueue queue{device};
             TestPresentLetterbox(device, passes, queue);
+            TestSnapshot(device, passes, queue);
             TestEventWait(device, queue);
             TestAutoreleaseLoop(device, passes, queue);
         }

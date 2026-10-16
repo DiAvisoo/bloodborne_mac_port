@@ -8,6 +8,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -145,6 +146,11 @@ private:
     std::unique_ptr<Rasterizer> rasterizer;
     VideoCore::TextureCache& texture_cache;
     void* layer; ///< CAMetalLayer* (the window's, SDL_Metal_GetLayer)
+    /// bbport: BB_SNAPSHOT_TRIGGER (empty: off). Present writes the drawable as a PNG when this
+    /// file exists (its first line, else "<trigger>.png"), then removes it.
+    std::string snapshot_trigger;
+    /// The PNG path when the trigger file exists (and removes it); empty otherwise.
+    std::string TakeSnapshotRequest();
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
     std::unique_ptr<Metal::PresentQueue> present_queue;

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <condition_variable>
 #include <pthread.h>
 #include <thread>
@@ -356,6 +357,14 @@ bool PsoCache::WriteArchive() {
     }
     ++counters.archive_writes;
     impl->unwritten -= unwritten;
+    // One line per write (at most every kWriteInterval): whether the archive serves the
+    // session (hits) or pipelines still compile.
+    std::printf("Metal binary archive: wrote %llu pipelines; this session %llu from the archive, "
+                "%llu compiled\n",
+                static_cast<unsigned long long>(descriptors.count - add_failures),
+                static_cast<unsigned long long>(counters.archive_hits.load()),
+                static_cast<unsigned long long>(counters.archive_adds.load()));
+    std::fflush(stdout);
     return true;
 }
 

@@ -1004,6 +1004,8 @@ void TextureCache::GarbageCollectImages() {
         const u64 allocated = device.AllocatedSize();
         const u64 resident = device.ResidentBytes();
         total_used_memory = allocated > resident ? allocated - resident : 0;
+        BbStats::gc_allocated_bytes.store(allocated, std::memory_order_relaxed);
+        BbStats::gc_resident_bytes.store(resident, std::memory_order_relaxed);
         // bbport: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
         // much more than images (buffers backing guest memory), and the startup budget left
         // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the

@@ -28,7 +28,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <optional>
+#include <unistd.h>
 
 namespace Vulkan {
 
@@ -103,7 +105,12 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       present_queue{std::make_unique<Metal::PresentQueue>(device)},
       pool{std::make_shared<FramePool>()} {
     ASSERT_MSG(layer != nullptr, "Presenter: the window has no CAMetalLayer");
-    const Metal::LayerConfig config = LayerConfigFromEnv();
+    if (const char* env = std::getenv("BB_SNAPSHOT_TRIGGER"); env && *env) {
+        snapshot_trigger = env;
+    }
+    Metal::LayerConfig config = LayerConfigFromEnv();
+    // Snapshots read the drawable back.
+    config.framebuffer_only = snapshot_trigger.empty();
     Metal::ConfigureLayer(device, layer, config);
     for (u32 i = 0; i < FramePool::Count; ++i) {
         pool->frames[i].id = i;
@@ -294,6 +301,25 @@ Frame* Presenter::PrepareBlankFrame(bool) {
     return frame;
 }
 
+std::string Presenter::TakeSnapshotRequest() {
+    if (snapshot_trigger.empty() || access(snapshot_trigger.c_str(), F_OK) != 0) {
+        return {};
+    }
+    std::string path;
+    if (FILE* file = std::fopen(snapshot_trigger.c_str(), "r")) {
+        char line[1024]{};
+        if (std::fgets(line, sizeof(line), file)) {
+            path = line;
+            while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) {
+                path.pop_back();
+            }
+        }
+        std::fclose(file);
+    }
+    std::remove(snapshot_trigger.c_str());
+    return path.empty() ? snapshot_trigger + ".png" : path;
+}
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame, u32) {
     last_present = {NowNs(), 0, 0, 0};
     // nextDrawable and the present passes create autoreleased objects, and this thread
@@ -330,8 +356,29 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         pp_pass.Passes().Present(command_buffer, source, frame->width, frame->height,
                                  drawable.texture, drawable.width, drawable.height);
         // The settings overlay (BbOverlay::Visible) draws here again in M5.
-        present_queue->Commit(command_buffer, drawable.drawable.Get(),
-                              [pool = pool, frame] { pool->Free(frame); });
+        std::string snapshot_path = TakeSnapshotRequest();
+        std::shared_ptr<Metal::Object> snapshot;
+        if (!snapshot_path.empty()) {
+            snapshot = std::make_shared<Metal::Object>(Metal::EncodeSnapshot(
+                device, command_buffer, drawable.texture, drawable.width, drawable.height));
+        }
+        present_queue->Commit(
+            command_buffer, drawable.drawable.Get(),
+            [pool = pool, frame, snapshot, path = std::move(snapshot_path),
+             width = drawable.width, height = drawable.height] {
+                pool->Free(frame);
+                if (snapshot && *snapshot) {
+                    // Off the completion thread: it is serial, and the PNG takes ~150 ms that
+                    // later presents would wait behind.
+                    std::thread([snapshot, path, width, height] {
+                        const bool ok = Metal::WriteSnapshotPng(path.c_str(), snapshot->Get(),
+                                                                width, height);
+                        std::printf("Snapshot: %s %ux%u %s\n", path.c_str(), width, height,
+                                    ok ? "written" : "FAILED");
+                        std::fflush(stdout);
+                    }).detach();
+                }
+            });
         last_present.submitted = NowNs();
         last_present.presented = last_present.submitted;
     });
