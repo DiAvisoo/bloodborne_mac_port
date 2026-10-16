@@ -948,3 +948,31 @@ show none.
 - **Caged figure (Central Yharnam lamp):** still missing after the fix (crop 950,1000 300x300 of
   the +40/+50 s snapshots, scratchpad `res/t3-cmp2.png`, 0.4.0 vs M4 vs this). The depth-format
   mismatch was not the cause; the diagnostics continue (M5 Task 11).
+
+## 2026-10-17: Metal-native M5 Task 5, camera motion; what object motion costs
+
+- **Measuring uncapped:** `fps_cap=0` with `BB_VBLANK_HZ=480` alone still showed exactly 60.0 FPS
+  on the Metal-native renderer: CAMetalLayer display sync was on (acquire waited ~13 ms). Add
+  **`BB_PRESENT_MODE=Immediate`** (display sync off, `vk_presenter.cpp`; on 0.4.0 the MoltenVK
+  swapchain present mode). Both builds below were measured with both variables.
+- **Object motion on vs off** (cages save, Central Yharnam spawn, standing, 2560x1440 native,
+  `upscaler=taa preset=0`, uncapped; three alternating runs each, mean of the last six
+  `Frame stats` lines per run). Metal-native's upscaler is still a stand-in (TAA not running);
+  0.4.0 runs TAA.
+
+  | Build | object_motion=0 | object_motion=1 | Cost |
+  |---|---|---|---|
+  | metal-native (1a23e5f) | 86.4 FPS (86.2-86.5), 11.58 ms | 67.8 FPS (67.3-68.2), 14.75 ms | +3.17 ms (-21.5%) |
+  | 0.4.0 (MoltenVK, 62a4c15) | 61.5 FPS (61.2-61.7), 16.27 ms | 51.0 FPS (50.9-51.3), 19.59 ms | +3.32 ms (-17%) |
+
+  The cost in milliseconds is the same: it is inherited from 0.4.0, not a Metal-native
+  regression.
+- **Not pass splits:** `BB_PASS_STATS=1` gives the same passes per frame with object motion on
+  (9,148 begins/s at 68.4 FPS = 134/frame) and off (11,773/s at 87.6 FPS = 134/frame), and the
+  same split-pass reasons (shader-HLE copies, MultiCopy, CopyImage). Not the per-draw position
+  stores/loads either: with them disabled (toggle bit 29, every draw gets parameter 0) the
+  frame rate stays at 64.6 (same session's on/off: 64/80.5). Not the buffer declarations: the
+  positions buffer declared read/write on every encoder or only on motion passes measures the
+  same. What remains is the motion pipelines themselves (the extra RGBA32F colour attachment 7
+  on the G-buffer passes, the motion shader variants); GPU timings per pass (M5 Task 10) can
+  split those.
