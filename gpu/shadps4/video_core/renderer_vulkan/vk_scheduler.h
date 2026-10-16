@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -12,88 +13,80 @@
 #include <memory>
 #include <source_location>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 #include <mutex>
 #include <thread>
 #include <queue>
 
+#include <boost/container/static_vector.hpp>
+
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/interval_set.h"
+#include "common/logging/log.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
-#include "video_core/renderer_vulkan/vk_resource_pool.h"
-#include "video_core/renderer_vulkan/vk_semaphore.h"
-
-namespace tracy {
-class VkCtxScope;
-}
+#include "video_core/buffer_cache/buffer_copy.h"
+#include "video_core/renderer_metal/mtl_depth_stencil.h"
+#include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_encoder.h"
+#include "video_core/renderer_metal/mtl_raster_util.h"
+#include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
 
-/// bbport: BB_PASS_LOG=<file>: numbered command buffers and the render passes recorded into them
-/// (vk_scheduler.cpp).
+/// bbport: BB_PASS_LOG=<file>: the render passes recorded into each submission, by the tick it
+/// signals (vk_scheduler.cpp).
 namespace BbPassLog {
 bool Enabled();
-u64 Assign(vk::CommandBuffer cmdbuf);
-void Pass(vk::CommandBuffer cmdbuf, const std::string& label);
+void Pass(u64 tick, const std::string& label);
 } // namespace BbPassLog
 
-class Instance;
-
+/// One render target of a pass: the image's own texture or a plain view of it.
 struct RenderAttachment {
-    vk::ImageView image_view;
-    vk::ImageLayout image_layout;
-    std::array<u32, 4> clear_value;
-    union {
-        u32 is_clear;
-        struct {
-            bool has_depth;
-            bool depth_clear;
-            bool has_stencil;
-            bool stencil_clear;
-        };
-    };
+    void* texture{}; ///< id<MTLTexture>
+    u32 level{}, slice{}, depth_plane{};
+    /// Colors: clear on load. The depth attachment: clear its depth on load.
+    bool clear{};
+    /// The depth attachment only: clear its stencil on load (independent of the depth clear).
+    bool clear_stencil{};
+    vk::ClearValue clear_value{};
+
+    bool operator==(const RenderAttachment& other) const noexcept {
+        // The clear value is a union of 16 bytes without padding.
+        return texture == other.texture && level == other.level && slice == other.slice &&
+               depth_plane == other.depth_plane && clear == other.clear &&
+               clear_stencil == other.clear_stencil &&
+               std::memcmp(&clear_value, &other.clear_value, sizeof(clear_value)) == 0;
+    }
 };
-static_assert(std::has_unique_object_representations_v<RenderAttachment>);
 
 struct RenderState {
-    std::array<RenderAttachment, 8> color_attachments;
-    RenderAttachment depth_stencil_attachment;
-    u16 width;
-    u16 height;
-    u16 num_layers;
-    u16 num_color_attachments;
+    std::array<RenderAttachment, 8> colors{};
+    u32 num_colors{};
+    RenderAttachment depth{};
+    bool has_depth{}, has_stencil{}, stencil_only{};
+    u32 width{}, height{};
 
+    /// The Metal render pass: colors and depth/stencil stored, loaded unless cleared.
+    Metal::RenderPassDesc ToDesc() const;
+
+    /// Memberwise (no memcmp: the struct has padding). Color slots past num_colors are ignored.
     bool operator==(const RenderState& other) const noexcept {
-        return std::memcmp(this, &other, sizeof(RenderState)) == 0;
-    }
-};
-static_assert(std::has_unique_object_representations_v<RenderState>);
-
-struct SubmitInfo {
-    std::array<vk::Semaphore, 4> wait_semas;
-    std::array<u64, 4> wait_ticks;
-    std::array<vk::Semaphore, 4> signal_semas;
-    std::array<u64, 4> signal_ticks;
-    vk::Fence fence;
-    u32 num_wait_semas;
-    u32 num_signal_semas;
-
-    void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
-        wait_semas[num_wait_semas] = semaphore;
-        wait_ticks[num_wait_semas++] = tick;
-    }
-
-    void AddSignal(vk::Semaphore semaphore, u64 tick = 1) {
-        signal_semas[num_signal_semas] = semaphore;
-        signal_ticks[num_signal_semas++] = tick;
-    }
-
-    void AddSignal(vk::Fence fence) {
-        this->fence = fence;
+        if (num_colors != other.num_colors || has_depth != other.has_depth ||
+            has_stencil != other.has_stencil || stencil_only != other.stencil_only ||
+            width != other.width || height != other.height || !(depth == other.depth)) {
+            return false;
+        }
+        for (u32 i = 0; i < num_colors; ++i) {
+            if (!(colors[i] == other.colors[i])) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -183,178 +176,147 @@ struct DynamicState {
     float line_width{};
     bool feedback_loop_enabled{};
 
-    /// Commits the dynamic state to the provided command buffer (a null one only clears the
-    /// flags that committing clears).
-    void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
-
-    /// bbport: passes each dirty state change to `emit` as a small command closure holding only
-    /// its own values (recording a copy of the whole state per draw was a hot spot), and clears
-    /// the flags it emitted. Flags whose test is disabled stay dirty, as in Commit.
+    /// bbport: passes each dirty state change to `emit` as a small closure taking a
+    /// Metal::Encoder& and holding only its own values (recording a copy of the whole state per
+    /// draw was a hot spot), and clears the flags it emitted. Flags whose test is disabled stay
+    /// dirty. The depth/stencil fields become one MTLDepthStencilState, looked up here (on the
+    /// producer thread) in `depth_stencil`.
     template <typename Emit>
-    void CommitWith(bool depth_bounds_supported, bool color_write_mask_supported,
-                    bool feedback_loop_supported, Emit&& emit) {
-        using Face = vk::StencilFaceFlagBits;
+    void CommitWith(Metal::DepthStencilCache& depth_stencil, Emit&& emit) {
         if (dirty_state.viewports) {
             dirty_state.viewports = false;
-            emit([v = viewports](vk::CommandBuffer c) { c.setViewportWithCount(v); });
+            if (!viewports.empty()) {
+                // Vulkan's y axis kept through a negative Metal height (mtl_raster_util.h).
+                const vk::Viewport& v = viewports[0];
+                const auto m = Metal::RasterUtil::ToMetalViewport(v.x, v.y, v.width, v.height,
+                                                                  v.minDepth, v.maxDepth);
+                const Metal::Viewport viewport{float(m.origin_x), float(m.origin_y),
+                                               float(m.width),    float(m.height),
+                                               float(m.znear),    float(m.zfar)};
+                emit([viewport](Metal::Encoder& e) { e.SetViewport(viewport); });
+            }
         }
         if (dirty_state.scissors) {
             dirty_state.scissors = false;
-            emit([v = scissors](vk::CommandBuffer c) { c.setScissorWithCount(v); });
-        }
-        if (dirty_state.depth_test_enabled) {
-            dirty_state.depth_test_enabled = false;
-            emit([v = depth_test_enabled](vk::CommandBuffer c) { c.setDepthTestEnable(v); });
-        }
-        if (dirty_state.depth_write_enabled) {
-            // Must be set in a command buffer even if depth test is disabled.
-            dirty_state.depth_write_enabled = false;
-            emit([v = depth_write_enabled](vk::CommandBuffer c) { c.setDepthWriteEnable(v); });
-        }
-        if (depth_test_enabled && dirty_state.depth_compare_op) {
-            dirty_state.depth_compare_op = false;
-            emit([v = depth_compare_op](vk::CommandBuffer c) { c.setDepthCompareOp(v); });
-        }
-        if (dirty_state.depth_bounds_test_enabled) {
-            dirty_state.depth_bounds_test_enabled = false;
-            if (depth_bounds_supported) {
-                emit([v = depth_bounds_test_enabled](vk::CommandBuffer c) {
-                    c.setDepthBoundsTestEnable(v);
-                });
+            if (!scissors.empty()) {
+                // Metal wants the scissor inside the target: negative offsets are cut here, the
+                // encoder clamps the far edges to the pass.
+                const vk::Rect2D& r = scissors[0];
+                const s64 x0 = std::max<s64>(r.offset.x, 0);
+                const s64 y0 = std::max<s64>(r.offset.y, 0);
+                const s64 x1 = std::max<s64>(s64(r.offset.x) + r.extent.width, x0);
+                const s64 y1 = std::max<s64>(s64(r.offset.y) + r.extent.height, y0);
+                const Metal::Scissor scissor{u32(x0), u32(y0), u32(x1 - x0), u32(y1 - y0)};
+                emit([scissor](Metal::Encoder& e) { e.SetScissor(scissor); });
             }
         }
-        if (depth_bounds_test_enabled && dirty_state.depth_bounds) {
-            dirty_state.depth_bounds = false;
-            if (depth_bounds_supported) {
-                emit([lo = depth_bounds_min, hi = depth_bounds_max](vk::CommandBuffer c) {
-                    c.setDepthBounds(lo, hi);
-                });
+
+        // Depth and stencil: one state object for all of the fields below.
+        const bool stencil_faces_dirty =
+            dirty_state.stencil_front_ops || dirty_state.stencil_back_ops ||
+            dirty_state.stencil_front_write_mask || dirty_state.stencil_back_write_mask ||
+            dirty_state.stencil_front_compare_mask || dirty_state.stencil_back_compare_mask;
+        if (dirty_state.depth_test_enabled || dirty_state.depth_write_enabled ||
+            (depth_test_enabled && dirty_state.depth_compare_op) ||
+            dirty_state.stencil_test_enabled || (stencil_test_enabled && stencil_faces_dirty)) {
+            Metal::DepthStencilKey key{};
+            key.depth_test = depth_test_enabled;
+            key.depth_write = depth_write_enabled;
+            if (depth_test_enabled) {
+                key.depth_compare = static_cast<u8>(depth_compare_op);
+                dirty_state.depth_compare_op = false;
             }
-        }
-        if (dirty_state.depth_bias_enabled) {
-            dirty_state.depth_bias_enabled = false;
-            emit([v = depth_bias_enabled](vk::CommandBuffer c) { c.setDepthBiasEnable(v); });
-        }
-        if (depth_bias_enabled && dirty_state.depth_bias) {
-            dirty_state.depth_bias = false;
-            emit([k = depth_bias_constant, clamp = depth_bias_clamp,
-                  slope = depth_bias_slope](vk::CommandBuffer c) { c.setDepthBias(k, clamp, slope); });
-        }
-        if (dirty_state.stencil_test_enabled) {
+            key.stencil_test = stencil_test_enabled;
+            if (stencil_test_enabled) {
+                const auto face = [](const StencilOps& o, u32 compare_mask, u32 write_mask) {
+                    return Metal::StencilFace{
+                        .fail = static_cast<u8>(o.fail_op),
+                        .pass = static_cast<u8>(o.pass_op),
+                        .depth_fail = static_cast<u8>(o.depth_fail_op),
+                        .compare = static_cast<u8>(o.compare_op),
+                        .read_mask = static_cast<u8>(compare_mask),
+                        .write_mask = static_cast<u8>(write_mask),
+                    };
+                };
+                key.front = face(stencil_front_ops, stencil_front_compare_mask,
+                                 stencil_front_write_mask);
+                key.back = face(stencil_back_ops, stencil_back_compare_mask,
+                                stencil_back_write_mask);
+                dirty_state.stencil_front_ops = dirty_state.stencil_back_ops = false;
+                dirty_state.stencil_front_write_mask = dirty_state.stencil_back_write_mask = false;
+                dirty_state.stencil_front_compare_mask = dirty_state.stencil_back_compare_mask =
+                    false;
+            }
+            dirty_state.depth_test_enabled = dirty_state.depth_write_enabled = false;
             dirty_state.stencil_test_enabled = false;
-            emit([v = stencil_test_enabled](vk::CommandBuffer c) { c.setStencilTestEnable(v); });
+            void* const state = depth_stencil.Get(key);
+            emit([state](Metal::Encoder& e) { e.SetDepthStencil(state); });
         }
-        if (stencil_test_enabled) {
-            const auto ops = [&](Face face, const StencilOps& o) {
-                emit([face, o](vk::CommandBuffer c) {
-                    c.setStencilOp(face, o.fail_op, o.pass_op, o.depth_fail_op, o.compare_op);
-                });
-            };
-            if (dirty_state.stencil_front_ops && dirty_state.stencil_back_ops &&
-                stencil_front_ops == stencil_back_ops) {
-                ops(Face::eFrontAndBack, stencil_front_ops);
-            } else {
-                if (dirty_state.stencil_front_ops) {
-                    ops(Face::eFront, stencil_front_ops);
-                }
-                if (dirty_state.stencil_back_ops) {
-                    ops(Face::eBack, stencil_back_ops);
-                }
-            }
-            dirty_state.stencil_front_ops = dirty_state.stencil_back_ops = false;
-
-            const auto reference = [&](Face face, u32 v) {
-                emit([face, v](vk::CommandBuffer c) { c.setStencilReference(face, v); });
-            };
-            if (dirty_state.stencil_front_reference && dirty_state.stencil_back_reference &&
-                stencil_front_reference == stencil_back_reference) {
-                reference(Face::eFrontAndBack, stencil_front_reference);
-            } else {
-                if (dirty_state.stencil_front_reference) {
-                    reference(Face::eFront, stencil_front_reference);
-                }
-                if (dirty_state.stencil_back_reference) {
-                    reference(Face::eBack, stencil_back_reference);
-                }
-            }
+        if (stencil_test_enabled &&
+            (dirty_state.stencil_front_reference || dirty_state.stencil_back_reference)) {
             dirty_state.stencil_front_reference = dirty_state.stencil_back_reference = false;
-
-            const auto write_mask = [&](Face face, u32 v) {
-                emit([face, v](vk::CommandBuffer c) { c.setStencilWriteMask(face, v); });
-            };
-            if (dirty_state.stencil_front_write_mask && dirty_state.stencil_back_write_mask &&
-                stencil_front_write_mask == stencil_back_write_mask) {
-                write_mask(Face::eFrontAndBack, stencil_front_write_mask);
-            } else {
-                if (dirty_state.stencil_front_write_mask) {
-                    write_mask(Face::eFront, stencil_front_write_mask);
-                }
-                if (dirty_state.stencil_back_write_mask) {
-                    write_mask(Face::eBack, stencil_back_write_mask);
-                }
-            }
-            dirty_state.stencil_front_write_mask = dirty_state.stencil_back_write_mask = false;
-
-            const auto compare_mask = [&](Face face, u32 v) {
-                emit([face, v](vk::CommandBuffer c) { c.setStencilCompareMask(face, v); });
-            };
-            if (dirty_state.stencil_front_compare_mask && dirty_state.stencil_back_compare_mask &&
-                stencil_front_compare_mask == stencil_back_compare_mask) {
-                compare_mask(Face::eFrontAndBack, stencil_front_compare_mask);
-            } else {
-                if (dirty_state.stencil_front_compare_mask) {
-                    compare_mask(Face::eFront, stencil_front_compare_mask);
-                }
-                if (dirty_state.stencil_back_compare_mask) {
-                    compare_mask(Face::eBack, stencil_back_compare_mask);
-                }
-            }
-            dirty_state.stencil_front_compare_mask = dirty_state.stencil_back_compare_mask = false;
+            emit([front = stencil_front_reference, back = stencil_back_reference](
+                     Metal::Encoder& e) { e.SetStencilReference(front, back); });
         }
-        if (dirty_state.primitive_restart_enable) {
-            dirty_state.primitive_restart_enable = false;
-            emit([v = primitive_restart_enable](vk::CommandBuffer c) {
-                c.setPrimitiveRestartEnable(v);
-            });
-        }
-        if (dirty_state.rasterizer_discard_enable) {
-            dirty_state.rasterizer_discard_enable = false;
-            emit([v = rasterizer_discard_enable](vk::CommandBuffer c) {
-                c.setRasterizerDiscardEnable(v);
+        if (dirty_state.depth_bias_enabled || (depth_bias_enabled && dirty_state.depth_bias)) {
+            dirty_state.depth_bias_enabled = false;
+            if (depth_bias_enabled) {
+                dirty_state.depth_bias = false;
+            }
+            const bool on = depth_bias_enabled;
+            emit([k = on ? depth_bias_constant : 0.0f, slope = on ? depth_bias_slope : 0.0f,
+                  clamp = on ? depth_bias_clamp : 0.0f](Metal::Encoder& e) {
+                e.SetDepthBias(k, slope, clamp);
             });
         }
         if (dirty_state.cull_mode) {
             dirty_state.cull_mode = false;
-            emit([v = cull_mode](vk::CommandBuffer c) { c.setCullMode(v); });
+            emit([mode = ToMetalCull(cull_mode)](Metal::Encoder& e) { e.SetCullMode(mode); });
         }
         if (dirty_state.front_face) {
             dirty_state.front_face = false;
-            emit([v = front_face](vk::CommandBuffer c) { c.setFrontFace(v); });
+            const auto winding = front_face == vk::FrontFace::eClockwise
+                                     ? Metal::Winding::Clockwise
+                                     : Metal::Winding::CounterClockwise;
+            emit([winding](Metal::Encoder& e) { e.SetFrontFace(winding); });
         }
         if (dirty_state.blend_constants) {
             dirty_state.blend_constants = false;
-            emit([v = blend_constants](vk::CommandBuffer c) { c.setBlendConstants(v.data()); });
-        }
-        if (dirty_state.color_write_masks) {
-            dirty_state.color_write_masks = false;
-            if (color_write_mask_supported) {
-                emit([v = color_write_masks](vk::CommandBuffer c) { c.setColorWriteMaskEXT(0, v); });
-            }
-        }
-        if (dirty_state.line_width) {
-            dirty_state.line_width = false;
-            emit([v = line_width](vk::CommandBuffer c) { c.setLineWidth(v); });
-        }
-        if (dirty_state.feedback_loop_enabled && feedback_loop_supported) {
-            dirty_state.feedback_loop_enabled = false;
-            emit([v = feedback_loop_enabled](vk::CommandBuffer c) {
-                c.setAttachmentFeedbackLoopEnableEXT(v ? vk::ImageAspectFlagBits::eColor
-                                                       : vk::ImageAspectFlagBits::eNone);
+            emit([v = blend_constants](Metal::Encoder& e) {
+                e.SetBlendColor(v[0], v[1], v[2], v[3]);
             });
+        }
+        // Metal: these belong to the pipeline key (M3) or have no equivalent.
+        dirty_state.primitive_restart_enable = false;
+        dirty_state.rasterizer_discard_enable = false;
+        dirty_state.color_write_masks = false;
+        dirty_state.line_width = false;
+        dirty_state.feedback_loop_enabled = false;
+        dirty_state.depth_bounds_test_enabled = false;
+        if (depth_bounds_test_enabled) {
+            dirty_state.depth_bounds = false;
         }
     }
 
-    /// bbport: true when Commit() would record anything. Flags that Commit() defers (their
+    /// Metal has no front-and-back culling: logged once, culls back faces.
+    static Metal::CullMode ToMetalCull(vk::CullModeFlags mode) {
+        if (mode == vk::CullModeFlagBits::eFrontAndBack) {
+            static std::once_flag logged;
+            std::call_once(logged, [] {
+                LOG_WARNING(Render, "Front-and-back culling is not in Metal: culling back");
+            });
+            return Metal::CullMode::Back;
+        }
+        if (mode == vk::CullModeFlagBits::eFront) {
+            return Metal::CullMode::Front;
+        }
+        if (mode == vk::CullModeFlagBits::eBack) {
+            return Metal::CullMode::Back;
+        }
+        return Metal::CullMode::None;
+    }
+
+    /// bbport: true when CommitWith() would emit anything. Flags that CommitWith() defers (their
     /// test is disabled) do not count.
     [[nodiscard]] bool AnyDirty() const noexcept {
         auto pending = dirty_state;
@@ -583,9 +545,7 @@ struct DynamicState {
     }
 };
 
-using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
-
-/// bbport: a block of deferred Vulkan commands. Commands are closures placed in
+/// bbport: a block of deferred encoder commands. Commands are closures placed in
 /// fixed storage (no allocation per command) and run in order on the recording thread.
 class RecordChunk {
 public:
@@ -623,10 +583,10 @@ public:
         return storage + offset;
     }
 
-    void Execute(vk::CommandBuffer cmdbuf) {
+    void Execute(Metal::Encoder& encoder) {
         for (CommandBase* command = first; command;) {
             CommandBase* const next = command->next;
-            command->Execute(cmdbuf);
+            command->Execute(encoder);
             command->~CommandBase();
             command = next;
         }
@@ -655,15 +615,15 @@ private:
 
     struct CommandBase {
         virtual ~CommandBase() = default;
-        virtual void Execute(vk::CommandBuffer cmdbuf) = 0;
+        virtual void Execute(Metal::Encoder& encoder) = 0;
         CommandBase* next{};
     };
     template <typename Func>
     struct TypedCommand final : CommandBase {
         explicit TypedCommand(Func&& func_) : func{std::move(func_)} {}
         explicit TypedCommand(const Func& func_) : func{func_} {}
-        void Execute(vk::CommandBuffer cmdbuf) override {
-            func(cmdbuf);
+        void Execute(Metal::Encoder& encoder) override {
+            func(encoder);
         }
         Func func;
     };
@@ -676,45 +636,42 @@ private:
 
 class Scheduler {
 public:
-    /// `threaded_recording`: Vulkan commands passed to Record() are recorded by a worker thread.
-    explicit Scheduler(const Instance& instance, bool threaded_recording = false);
+    /// `threaded`: commands passed to Record() are encoded by a worker thread.
+    explicit Scheduler(Metal::Device& device, bool threaded);
     ~Scheduler();
 
-    /// Sends the current execution context to the GPU
-    /// and increments the scheduler timeline semaphore.
-    void Flush(SubmitInfo& info);
-
-    /// Sends the current execution context to the GPU
-    /// and increments the scheduler timeline semaphore.
+    /// Commits the current command buffer with the device's next tick.
     void Flush();
 
-    /// Sends the current execution context to the GPU and waits for it to complete.
+    /// Commits the current command buffer and waits for it to complete.
     void Finish();
 
-    /// Waits for the given tick to trigger on the GPU.
+    /// Waits for the given tick (committing the current command buffer first if it is that tick).
     void Wait(u64 tick);
 
-    /// Attempts to execute operations whose tick the GPU has caught up with.
+    /// Runs deferred operations whose tick the GPU has completed.
     void PopPendingOperations();
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
 
-    /// bbport: records a buffer copy into this submission's upload command buffer, which runs
-    /// before all of its commands (Runtime::HoistCopy decides when that is safe). Copies there do
-    /// not end the current render pass: on a tile-based GPU every reopened pass reloads its
-    /// attachments.
-    /// `ordered`: the copy may read or write memory that copies hoisted before it wrote.
-    void RecordHoistedCopy(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
-                           bool ordered = false);
+    /// bbport: hoisted copies are recorded now, on the calling thread, into the upload encoder,
+    /// whose command buffer is committed (untracked) right before the next submission, so they
+    /// run before all of its commands (Runtime::HoistCopy decides when that is safe). Copies
+    /// there do not end the current render pass: on a tile-based GPU every reopened pass reloads
+    /// its attachments.
+    /// `ordered`: the copy may read or write memory that copies hoisted before it wrote (one
+    /// blit encoder runs its copies in order, so nothing is needed for it).
+    void RecordHoistedCopy(Metal::BufferRef src, Metal::BufferRef dst,
+                           std::span<const VideoCore::BufferCopy> copies, bool ordered = false);
 
     /// Ends current rendering scope. bbport: the caller is counted with BB_PASS_STATS=1.
     void EndRendering(std::source_location where = std::source_location::current(),
                       const char* detail = "");
 
     /// Sets a function to be called on every scheduler submission.
-    void SetSubmitCallback(SubmitFunc&& on_submit) {
-        this->on_submit = std::move(on_submit);
+    void SetSubmitCallback(std::function<void()> callback) {
+        on_submit = std::move(callback);
     }
 
     /// Returns the current render state.
@@ -727,35 +684,35 @@ public:
         return dynamic_state;
     }
 
-    /// Returns the current command buffer for recording on the calling thread. With threaded
-    /// recording this first waits until all commands passed to Record() are recorded, then
-    /// records directly (Record() included, so callers may mix both) until the next
-    /// KickRecording() or submission.
-    [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
+    /// Returns the encoder for encoding on the calling thread. With threaded recording this
+    /// first waits until all commands passed to Record() are encoded, then encodes directly
+    /// (Record() included, so callers may mix both) until the next KickRecording() or
+    /// submission.
+    [[gnu::noinline]] Metal::Encoder& DirectEncoder() {
         if (recorder_running && !direct_mode) {
             SyncRecording();
             direct_mode = true;
             direct_recordings.fetch_add(1, std::memory_order_relaxed);
             TraceDirectRecording(__builtin_return_address(0));
         }
-        return current_cmdbuf;
+        return encoder;
     }
 
-    /// BB_RECORDER_TRACE=1: prints the most frequent CommandBuffer() callers every 2000 calls.
+    /// BB_RECORDER_TRACE=1: prints the most frequent DirectEncoder() callers every 2000 calls.
     static void TraceDirectRecording(void* caller);
 
-    /// Records `func(vk::CommandBuffer)` in order with other commands. The closure must own
+    /// Records `func(Metal::Encoder&)` in order with other commands. The closure must own
     /// everything it uses (capture by value): it may run later on the recording thread.
     template <typename Func>
     void Record(Func&& func) {
         if (!recorder_running || direct_mode) {
-            func(current_cmdbuf);
+            func(encoder);
             return;
         }
         if (BbToggle::Disabled(BbToggle::ThreadedRecording)) {
             SyncRecording();
             direct_mode = true;
-            func(current_cmdbuf);
+            func(encoder);
             return;
         }
         const ChunkGuard guard{*this, __builtin_return_address(0)};
@@ -820,7 +777,7 @@ public:
     template <typename Func>
     void RecordHostCopy(Func&& copy) {
         Record([copy = std::forward<Func>(copy), this,
-                seq = ++host_copies_issued](vk::CommandBuffer) {
+                seq = ++host_copies_issued](Metal::Encoder&) {
             copy();
             host_copies_done.store(seq, std::memory_order_release);
         });
@@ -852,26 +809,26 @@ public:
         return !(is_rendering && render_state == state);
     }
 
-    /// CommandBuffer() calls that waited for a recording thread (BB_FRAME_STATS).
+    /// DirectEncoder() calls that waited for a recording thread (BB_FRAME_STATS).
     static inline std::atomic<u64> direct_recordings{0};
 
-    /// Returns the current command buffer tick.
+    /// The tick the next submission signals.
     [[nodiscard]] u64 CurrentTick() const noexcept {
-        return work_semaphore.CurrentTick();
+        return device.CurrentTick();
     }
 
-    /// Returns true when a tick has been triggered by the GPU.
-    [[nodiscard]] bool IsFree(u64 tick) noexcept {
-        if (work_semaphore.IsFree(tick)) {
-            return true;
-        }
-        work_semaphore.Refresh();
-        return work_semaphore.IsFree(tick);
+    /// Returns true when the GPU completed the command buffers up to `tick`.
+    [[nodiscard]] bool IsFree(u64 tick) const {
+        return device.IsFree(tick);
     }
 
-    /// Returns the scheduler timeline semaphore.
-    [[nodiscard]] Semaphore* GetWorkSemaphore() noexcept {
-        return &work_semaphore;
+    [[nodiscard]] Metal::Device& GetDevice() noexcept {
+        return device;
+    }
+
+    /// MTLDepthStencilStates by key (DynamicState::CommitWith).
+    [[nodiscard]] Metal::DepthStencilCache& GetDepthStencilCache() noexcept {
+        return depth_stencil;
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
@@ -892,41 +849,35 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    /// One committer at a time across schedulers (Device::Commit hands out ticks in commit order).
     static std::mutex submit_mutex;
-    std::mutex upload_mutex;          ///< bbport: upload_cmdbuf and command pool commits
-    vk::CommandBuffer upload_cmdbuf{}; ///< bbport: this submission's hoisted copies
-    bool upload_open{};
 
 private:
-    void AllocateWorkerCommandBuffers();
-
     std::unique_ptr<RecordChunk> AcquireChunk();
 
     void RecorderThread(std::stop_token stoken);
 
-    void SubmitExecution(SubmitInfo& info);
+    void SubmitExecution();
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
-    const Instance& instance;
-    Semaphore work_semaphore;
-    CommandPool command_pool;
-    /// bbport: hoisted copies are recorded on the draw thread while the recorder thread records
-    /// current_cmdbuf, so their command buffers come from a pool of their own (a VkCommandPool
-    /// is externally synchronized: MoltenVK allocates each command's object from its pool).
-    CommandPool upload_pool;
+    Metal::Device& device;
+    Metal::Encoder encoder{device};
+    /// bbport: this submission's hoisted copies, recorded on the calling thread while the
+    /// recorder thread encodes into `encoder`.
+    Metal::Encoder upload_encoder{device};
+    std::mutex upload_mutex; ///< upload_encoder and upload_open
+    bool upload_open{};
+    Metal::DepthStencilCache depth_stencil{device};
     DynamicState dynamic_state;
-    SubmitFunc on_submit{};
-    vk::CommandBuffer current_cmdbuf;
-    std::condition_variable_any event_cv;
+    std::function<void()> on_submit{};
     struct PendingOp {
         Common::UniqueFunction<void> callback;
         u64 gpu_tick;
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
-    u32 pending_polls = 0; // bbport
     std::atomic<u32> num_pending_ops{0}; ///< bbport: pending_ops.size(), checked without the lock
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
@@ -969,7 +920,6 @@ private:
         std::make_shared<std::atomic<u64>>(0);
     std::jthread recorder_thread;
     bool recorder_running = false;
-    tracy::VkCtxScope* profiler_scope{};
 };
 
 } // namespace Vulkan

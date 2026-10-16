@@ -24,7 +24,6 @@
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "bbport_threads.h"
 
@@ -33,47 +32,60 @@ namespace Vulkan {
 namespace BbPassLog {
 namespace {
 std::mutex mutex;
-std::unordered_map<VkCommandBuffer, u64> ids;
 std::FILE* file = [] {
     const char* path = std::getenv("BB_PASS_LOG");
     return path && *path ? std::fopen(path, "w") : nullptr;
 }();
-u64 next_id;
 } // namespace
 bool Enabled() {
     return file != nullptr;
 }
-u64 Assign(vk::CommandBuffer cmdbuf) {
-    if (!file) {
-        return 0;
-    }
+void Pass(u64 tick, const std::string& label) {
     std::scoped_lock lock{mutex};
-    return ids[static_cast<VkCommandBuffer>(cmdbuf)] = ++next_id;
-}
-void Pass(vk::CommandBuffer cmdbuf, const std::string& label) {
-    std::scoped_lock lock{mutex};
-    const auto it = ids.find(static_cast<VkCommandBuffer>(cmdbuf));
-    std::fprintf(file, "%llu %s\n", static_cast<unsigned long long>(it == ids.end() ? 0 : it->second),
-                 label.c_str());
+    std::fprintf(file, "%llu %s\n", static_cast<unsigned long long>(tick), label.c_str());
 }
 } // namespace BbPassLog
 
+Metal::RenderPassDesc RenderState::ToDesc() const {
+    Metal::RenderPassDesc desc{};
+    for (u32 i = 0; i < num_colors; ++i) {
+        const RenderAttachment& a = colors[i];
+        auto& c = desc.colors[i];
+        c.texture = a.texture;
+        c.level = a.level;
+        c.slice = a.slice;
+        c.depth_plane = a.depth_plane;
+        c.clear = a.clear;
+        const auto& f = a.clear_value.color.float32;
+        c.clear_color = {f[0], f[1], f[2], f[3]};
+    }
+    if (has_depth || has_stencil) {
+        auto& d = desc.depth;
+        d.texture = depth.texture;
+        d.level = depth.level;
+        d.slice = depth.slice;
+        d.has_stencil = has_stencil;
+        d.stencil_only = stencil_only;
+        d.clear_depth = has_depth && depth.clear;
+        d.clear_stencil = has_stencil && depth.clear_stencil;
+        d.depth = depth.clear_value.depthStencil.depth;
+        d.stencil = depth.clear_value.depthStencil.stencil;
+    }
+    desc.width = width;
+    desc.height = height;
+    return desc;
+}
+
 std::mutex Scheduler::submit_mutex;
 
-Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
-    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore},
-      upload_pool{instance, &work_semaphore} {
+Scheduler::Scheduler(Metal::Device& device_, bool threaded) : device{device_} {
     // bbport: BB_VK_RECORD_THREAD=0 records on the calling thread.
     const char* env = std::getenv("BB_VK_RECORD_THREAD");
-    if (threaded_recording && !(env && env[0] == '0')) {
+    if (threaded && !(env && env[0] == '0')) {
         record_chunk = AcquireChunk();
         recorder_thread = std::jthread(std::bind_front(&Scheduler::RecorderThread, this));
         recorder_running = true;
     }
-#if TRACY_GPU_ENABLED
-    profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
-#endif
-    AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
 }
@@ -86,9 +98,6 @@ Scheduler::~Scheduler() {
         recorder_cv.notify_all();
         recorder_thread.join();
     }
-#if TRACY_GPU_ENABLED
-    std::free(profiler_scope);
-#endif
 }
 
 namespace {
@@ -156,13 +165,12 @@ std::string Where(const std::source_location& where) {
 }
 
 bool SameAttachments(const RenderState& a, const RenderState& b) {
-    if (a.num_color_attachments != b.num_color_attachments ||
-        a.depth_stencil_attachment.image_view != b.depth_stencil_attachment.image_view ||
-        a.width != b.width || a.height != b.height || a.num_layers != b.num_layers) {
+    if (a.num_colors != b.num_colors || a.depth.texture != b.depth.texture ||
+        a.width != b.width || a.height != b.height) {
         return false;
     }
-    for (u32 i = 0; i < a.num_color_attachments; ++i) {
-        if (a.color_attachments[i].image_view != b.color_attachments[i].image_view) {
+    for (u32 i = 0; i < a.num_colors; ++i) {
+        if (a.colors[i].texture != b.colors[i].texture) {
             return false;
         }
     }
@@ -171,21 +179,8 @@ bool SameAttachments(const RenderState& a, const RenderState& b) {
 
 // What differs between two render states, for BB_PASS_STATS.
 std::string StateChange(const RenderState& a, const RenderState& b) {
-    bool views = a.num_color_attachments != b.num_color_attachments ||
-                 a.depth_stencil_attachment.image_view != b.depth_stencil_attachment.image_view ||
-                 a.width != b.width || a.height != b.height || a.num_layers != b.num_layers;
-    for (u32 i = 0; !views && i < a.num_color_attachments; ++i) {
-        views = a.color_attachments[i].image_view != b.color_attachments[i].image_view;
-    }
-    if (views) {
+    if (!SameAttachments(a, b)) {
         return "BeginRendering: other attachments/size";
-    }
-    bool layouts = a.depth_stencil_attachment.image_layout != b.depth_stencil_attachment.image_layout;
-    for (u32 i = 0; !layouts && i < a.num_color_attachments; ++i) {
-        layouts = a.color_attachments[i].image_layout != b.color_attachments[i].image_layout;
-    }
-    if (layouts) {
-        return "BeginRendering: same attachments, other layout";
     }
     return "BeginRendering: same attachments, clear/flags differ";
 }
@@ -204,73 +199,13 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         CountPass(is_rendering ? &reason : nullptr, true);
         if (is_rendering) {
             is_rendering = false; // counted above, not again in EndRendering
-            Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+            Record([](Metal::Encoder& e) { e.EndRenderPass(); });
         }
     }
     EndRendering();
     is_rendering = true;
     render_state = new_state;
-
-    std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
-    for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
-        const auto& cb = render_state.color_attachments[i];
-        color_attachments[i] = vk::RenderingAttachmentInfo{
-            .imageView = cb.image_view,
-            .imageLayout = cb.image_layout,
-            .loadOp = cb.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-            .storeOp = vk::AttachmentStoreOp::eStore,
-            .clearValue = vk::ClearValue{.color = vk::ClearColorValue{.uint32 = cb.clear_value}},
-        };
-    }
-
-    const auto& db = render_state.depth_stencil_attachment;
-    const vk::RenderingAttachmentInfo depth_attachment = {
-        .imageView = db.image_view,
-        .imageLayout = db.image_layout,
-        .loadOp = db.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
-        .clearValue =
-            vk::ClearValue{.depthStencil = vk::ClearDepthStencilValue{.depth = std::bit_cast<float>(
-                                                                          db.clear_value[0])}},
-    };
-    const vk::RenderingAttachmentInfo stencil_attachment = {
-        .imageView = db.image_view,
-        .imageLayout = db.image_layout,
-        .loadOp = db.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
-        .clearValue = vk::ClearValue{.depthStencil =
-                                         vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
-    };
-
-    const vk::RenderingInfo rendering_info = {
-        .renderArea =
-            {
-                .offset = {0, 0},
-                .extent = {render_state.width, render_state.height},
-            },
-        .layerCount = render_state.num_layers,
-        .colorAttachmentCount = render_state.num_color_attachments,
-        .pColorAttachments = color_attachments.data(),
-        .pDepthAttachment = db.has_depth ? &depth_attachment : nullptr,
-        .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
-    };
-
-    if (!recorder_running) {
-        current_cmdbuf.beginRendering(rendering_info);
-        return;
-    }
-    // The attachment infos live on this stack frame: the recorded closure keeps copies.
-    Record([info = rendering_info, color_attachments, depth_attachment,
-            stencil_attachment](vk::CommandBuffer cmdbuf) mutable {
-        info.pColorAttachments = color_attachments.data();
-        if (info.pDepthAttachment) {
-            info.pDepthAttachment = &depth_attachment;
-        }
-        if (info.pStencilAttachment) {
-            info.pStencilAttachment = &stencil_attachment;
-        }
-        cmdbuf.beginRendering(info);
-    });
+    Record([desc = render_state.ToDesc()](Metal::Encoder& e) { e.BeginRenderPass(desc); });
 }
 
 void Scheduler::EndRendering(std::source_location where, const char* detail) {
@@ -282,7 +217,7 @@ void Scheduler::EndRendering(std::source_location where, const char* detail) {
         CountPass(&reason, false);
     }
     is_rendering = false;
-    Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+    Record([](Metal::Encoder& e) { e.EndRenderPass(); });
 }
 
 void Scheduler::TraceDirectRecording(void* caller) {
@@ -342,7 +277,7 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     }
     BbCopy::FlushBatch();
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
-    Record([signal = std::move(signal), done = deferred_signals_done](vk::CommandBuffer) mutable {
+    Record([signal = std::move(signal), done = deferred_signals_done](Metal::Encoder&) mutable {
         BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done)] {
             signal();
             done->fetch_add(1, std::memory_order_release);
@@ -457,7 +392,7 @@ void Scheduler::SyncRecording() {
 }
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
-    Common::SetCurrentThreadName("bb:VkRecorder");
+    Common::SetCurrentThreadName("bb:MtlRecorder");
     while (true) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
@@ -487,8 +422,8 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             queued_chunks.store(recorder_queue.size(), std::memory_order_release);
             recorder_busy = true;
         }
-        // current_cmdbuf only changes after SyncRecording(), which waits for this thread.
-        chunk->Execute(current_cmdbuf);
+        // Direct encoding starts only after SyncRecording(), which waits for this thread.
+        chunk->Execute(encoder);
         {
             std::scoped_lock lk{recorder_mutex};
             free_chunks.push_back(std::move(chunk));
@@ -500,136 +435,59 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
     }
 }
 
-void Scheduler::Flush(SubmitInfo& info) {
-    // When flushing, we only send data to the driver; no waiting is necessary.
-    SubmitExecution(info);
-}
-
 void Scheduler::Flush() {
-    SubmitInfo info{};
-    Flush(info);
+    // When flushing, we only send data to the driver; no waiting is necessary.
+    SubmitExecution();
 }
 
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
-    SubmitInfo info{};
-    SubmitExecution(info);
-    Wait(presubmit_tick);
+    Flush();
+    BbStats::WaitTimer timer{BbStats::tick_wait_ns};
+    device.Wait(presubmit_tick);
 }
 
 void Scheduler::Wait(u64 tick) {
-    if (tick >= work_semaphore.CurrentTick()) {
+    if (tick >= CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
-        SubmitInfo info{};
-        Flush(info);
+        Flush();
     }
     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
-    work_semaphore.Wait(tick);
+    device.Wait(tick);
 }
 
 void Scheduler::PopPendingOperations() {
     if (num_pending_ops.load(std::memory_order_acquire) == 0) {
         return; // every draw comes here
     }
+    // Reading the known GPU tick is an atomic load (Metal completion handlers raise it), so
+    // there is no polling limit.
     std::unique_lock lk(pending_ops_mutex);
-    // bbport: this runs on every draw and dispatch. Querying the timeline semaphore is an
-    // ioctl, so it is skipped when nothing waits and done once per 32 calls (~0.3 ms; reading
-    // the clock per draw instead was itself a hot spot).
-    if (pending_ops.empty()) {
-        return;
-    }
-    if (!work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
-        if ((++pending_polls & 31) != 0 && !BbToggle::Disabled(BbToggle::PendingPollLimit)) {
-            return;
-        }
-        work_semaphore.Refresh();
-    }
-    while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+    while (!pending_ops.empty() && device.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
         num_pending_ops.fetch_sub(1, std::memory_order_release);
     }
 }
 
-void Scheduler::AllocateWorkerCommandBuffers() {
-    const vk::CommandBufferBeginInfo begin_info = {
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-    };
-
-    current_cmdbuf = command_pool.Commit();
-    // bbport: BB_PASS_LOG=<file> numbers each command buffer ("cb#N"): MoltenVK labels the Metal
-    // command buffer and its render encoders with that name, and the rasterizer logs the passes
-    // recorded into it in order, so a Metal System Trace can be joined to them (vk_rasterizer.cpp
-    // MarkPass).
-    if (const u64 id = BbPassLog::Assign(current_cmdbuf)) {
-        SetObjectName(instance.GetDevice(), current_cmdbuf, "cb#{}", id);
-    }
-    Check(current_cmdbuf.begin(begin_info));
-
-    // Invalidate dynamic state so it gets applied to the new command buffer.
-    dynamic_state.Invalidate();
-
-#if TRACY_GPU_ENABLED
-    auto* profiler_ctx = instance.GetProfilerContext();
-    if (profiler_ctx) {
-        static const auto scope_loc =
-            GPU_SCOPE_LOCATION("Guest Frame", MarkersPalette::GpuMarkerColor);
-        new (profiler_scope) tracy::VkCtxScope{profiler_ctx, &scope_loc, current_cmdbuf, true};
-    }
-#endif
-}
-
-void Scheduler::RecordHoistedCopy(vk::Buffer src, vk::Buffer dst,
-                                  std::span<const vk::BufferCopy> copies, bool ordered) {
+void Scheduler::RecordHoistedCopy(Metal::BufferRef src, Metal::BufferRef dst,
+                                  std::span<const VideoCore::BufferCopy> copies,
+                                  [[maybe_unused]] bool ordered) {
     std::scoped_lock lk{upload_mutex};
-    if (upload_open && ordered) {
-        const vk::MemoryBarrier2 after_copies = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
-        };
-        upload_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .memoryBarrierCount = 1,
-            .pMemoryBarriers = &after_copies,
-        });
+    upload_open = true;
+    for (const VideoCore::BufferCopy& c : copies) {
+        upload_encoder.CopyBuffer({src.buffer, src.offset + c.src_offset},
+                                  {dst.buffer, dst.offset + c.dst_offset}, c.size);
     }
-    if (!upload_open) {
-        upload_cmdbuf = upload_pool.Commit();
-        Check(upload_cmdbuf.begin(vk::CommandBufferBeginInfo{
-            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-        }));
-        // After everything submitted before (in-flight reads and writes of the same memory).
-        const vk::MemoryBarrier2 before = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
-        };
-        upload_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .memoryBarrierCount = 1,
-            .pMemoryBarriers = &before,
-        });
-        upload_open = true;
-    }
-    upload_cmdbuf.copyBuffer(src, dst, static_cast<u32>(copies.size()), copies.data());
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info) {
+void Scheduler::SubmitExecution() {
     std::scoped_lock lk{submit_mutex};
-    const u64 signal_value = work_semaphore.NextTick();
-
-#if TRACY_GPU_ENABLED
-    auto* profiler_ctx = instance.GetProfilerContext();
-    if (profiler_ctx) {
-        profiler_scope->~VkCtxScope();
-        TracyVkCollect(profiler_ctx, current_cmdbuf);
-    }
-#endif
+    const u64 signal_value = CurrentTick();
 
     if (on_submit) {
-        on_submit(info);
+        on_submit();
     }
 
     EndRendering();
@@ -640,66 +498,35 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     SyncRecording();
     // Guest memory copies into staging read by this submission (copy threads).
     WaitHostCopies();
-    Check(current_cmdbuf.end());
 
-    const vk::Semaphore timeline = work_semaphore.Handle();
-    info.AddSignal(timeline, signal_value);
-
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-    };
-
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .waitSemaphoreValueCount = info.num_wait_semas,
-        .pWaitSemaphoreValues = info.wait_ticks.data(),
-        .signalSemaphoreValueCount = info.num_signal_semas,
-        .pSignalSemaphoreValues = info.signal_ticks.data(),
-    };
-
-    // bbport: hoisted uploads run first, then this submission's commands see them.
+    // bbport: hoisted uploads are committed first (no tick: the queue runs them before this
+    // submission, whose tick covers them); held until the main commit so no copy recorded
+    // meanwhile lands in a later upload command buffer than the commands that need it.
     std::unique_lock upload_lock{upload_mutex};
-    std::array<vk::CommandBuffer, 2> cmdbufs{current_cmdbuf, {}};
-    u32 num_cmdbufs = 1;
     if (upload_open) {
-        const vk::MemoryBarrier2 after = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        };
-        upload_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .memoryBarrierCount = 1,
-            .pMemoryBarriers = &after,
-        });
-        Check(upload_cmdbuf.end());
-        cmdbufs = {upload_cmdbuf, current_cmdbuf};
-        num_cmdbufs = 2;
+        upload_encoder.SubmitUntracked();
         upload_open = false;
     }
 
-    const vk::SubmitInfo submit_info = {
-        .pNext = &timeline_si,
-        .waitSemaphoreCount = info.num_wait_semas,
-        .pWaitSemaphores = info.wait_semas.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
-        .commandBufferCount = num_cmdbufs,
-        .pCommandBuffers = cmdbufs.data(),
-        .signalSemaphoreCount = info.num_signal_semas,
-        .pSignalSemaphores = info.signal_semas.data(),
-    };
-
-    ImGui::Core::TextureManager::Submit();
+    ImGui::Core::TextureManager::Submit(); // ImGui textures: M5
     const u64 submit_start = bbport::CpuCycles();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    const u64 tick = encoder.Submit();
     BbStats::queue_submit_ns.fetch_add(bbport::CyclesToNs(bbport::CpuCycles() - submit_start),
                                        std::memory_order_relaxed);
     BbStats::queue_submits.fetch_add(1, std::memory_order_relaxed);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
-
-    work_semaphore.Refresh();
-    AllocateWorkerCommandBuffers();
+    ASSERT_MSG(tick == signal_value, "Submission signalled tick {}, expected {}", tick,
+               signal_value);
     upload_lock.unlock();
+
+    // A new command buffer starts without state (Encoder::Submit clears it): apply it again.
+    dynamic_state.Invalidate();
+
+    // The priority-ops thread waits for ticks to be committed before waiting on the GPU; taking
+    // its mutex first means it is either before its check or already waiting (no lost wakeup).
+    {
+        std::scoped_lock ops_lock{priority_pending_ops_mutex};
+    }
+    priority_pending_ops_cv.notify_all();
 
     // Apply pending operations
     PopPendingOperations();
@@ -722,23 +549,24 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             priority_pending_ops.pop();
         }
 
-        work_semaphore.Wait(op.gpu_tick);
+        // Ticks are deferred before they are committed (Device::Wait needs a committed one);
+        // any scheduler's commit on the device may cover it, hence the timed re-check.
+        {
+            std::unique_lock lk(priority_pending_ops_mutex);
+            while (op.gpu_tick >= device.CurrentTick() && !stoken.stop_requested()) {
+                priority_pending_ops_cv.wait_for(lk, std::chrono::milliseconds(1));
+            }
+        }
+        if (stoken.stop_requested()) {
+            break;
+        }
+        device.Wait(op.gpu_tick);
         if (stoken.stop_requested()) {
             break;
         }
 
         op.callback();
     }
-}
-
-void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
-    // A null command buffer only updates the dirty flags, exactly as recording would.
-    CommitWith(instance.IsDepthBoundsSupported(), instance.IsDynamicColorWriteMaskSupported(),
-               instance.IsAttachmentFeedbackLoopLayoutSupported(), [&](auto&& command) {
-                   if (cmdbuf) {
-                       command(cmdbuf);
-                   }
-               });
 }
 
 } // namespace Vulkan
