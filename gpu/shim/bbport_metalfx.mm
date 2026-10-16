@@ -138,10 +138,15 @@ bool Encode(const Frame& f) {
         scaler.motionVectorScaleY = f.motion_scale_y;
         scaler.reset = f.reset;
         scaler.depthReversed = NO;
-        id<MTLCommandBuffer> cmdbuf = [queue commandBuffer];
-        cmdbuf.label = @"bbport MetalFX";
-        [scaler encodeToCommandBuffer:cmdbuf];
-        [cmdbuf commit];
+        if (f.command_buffer) {
+            // The Metal frame path's command buffer: in order with the frame, no extra submit.
+            [scaler encodeToCommandBuffer:(__bridge id<MTLCommandBuffer>)f.command_buffer];
+        } else {
+            id<MTLCommandBuffer> cmdbuf = [queue commandBuffer];
+            cmdbuf.label = @"bbport MetalFX";
+            [scaler encodeToCommandBuffer:cmdbuf];
+            [cmdbuf commit];
+        }
         if (!encoded_once) {
             encoded_once = true;
             std::printf("MetalFX: first frame encoded\n");

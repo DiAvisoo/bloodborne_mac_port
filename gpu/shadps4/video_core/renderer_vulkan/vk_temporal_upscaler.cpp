@@ -30,6 +30,9 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#ifdef BB_METAL_BACKEND
+#include "video_core/renderer_metal/mtl_vk_layer.h"
+#endif
 
 namespace Vulkan {
 
@@ -1099,7 +1102,16 @@ void TemporalUpscaler::Run() {
             const char* env = std::getenv("BB_METALFX_JITTER_SIGN");
             return env ? float(std::atof(env)) : 1.0f;
         }();
-        scheduler.Flush();
+        // bbport Metal frame path: MetalFX encodes into the frame's own Metal command buffer.
+        void* metal_cmd = nullptr;
+#ifdef BB_METAL_BACKEND
+        if (MetalLayer::FrameEnabled()) {
+            metal_cmd = MetalLayer::MetalCommandBuffer(static_cast<VkCommandBuffer>(cmdbuf));
+        }
+#endif
+        if (!metal_cmd) {
+            scheduler.Flush();
+        }
         {
             std::scoped_lock lk{Scheduler::submit_mutex};
             dispatched = BbMetalFx::Encode({
@@ -1120,6 +1132,7 @@ void TemporalUpscaler::Run() {
                 .motion_scale_y = 1.0f,
                 .reset = reset,
                 .hdr = true,
+                .command_buffer = metal_cmd,
             });
         }
         cmdbuf = scheduler.CommandBuffer();

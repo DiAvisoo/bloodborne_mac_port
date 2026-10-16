@@ -812,7 +812,7 @@ one translated from its Vulkan create info. Hunter's Dream, upscaler off, uncapp
 | 1080p native | 97.1, 96.4, 96.3, 95.9 (96.4) | 94.4, 94.5, 94.7 (94.5) |
 | 1440p native | 67.7, 67.7 | 67.9, 67.2 |
 | 1080p FSR 3.1 Quality (with overlay) | 99.9 | — |
-| 1080p MetalFX Quality | 100.3 | 107.2 |
+| 1080p MetalFX Quality (encoded in the frame's command buffer) | 106.7, 106.0 | 106.5, 106.9 |
 | Walk pacing (late game / display frames) | 0.9 per 5 s / 3–4 | 1.4–2.4 / 8–9 |
 
 The Metal path also draws the geometry-shader draws MoltenVK cannot (emulated with compute), and

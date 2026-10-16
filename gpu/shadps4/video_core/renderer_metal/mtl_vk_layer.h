@@ -23,6 +23,10 @@ void* MtlQueue();
 /// Step C (BB_METAL_FRAME=1): every command buffer is encoded in Metal.
 bool FrameEnabled();
 
+/// The id<MTLCommandBuffer> an owned command buffer is encoded into, with every encoder ended,
+/// for work encoded outside the layer in order (MetalFX); null when it is not owned.
+void* MetalCommandBuffer(void* command_buffer);
+
 /// Step B (BB_METAL_PRESENT=1): the presenter's command buffer is encoded in Metal.
 bool PresentEnabled();
 

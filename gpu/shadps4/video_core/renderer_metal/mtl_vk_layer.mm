@@ -569,6 +569,15 @@ bool FrameEnabled() {
     return frame_enabled;
 }
 
+void* MetalCommandBuffer(void* command_buffer) {
+    Owned* o = FindOwned(static_cast<VkCommandBuffer>(command_buffer));
+    if (!o) {
+        return nullptr;
+    }
+    MetalFrame::EndEncoders(*o);
+    return (__bridge void*)o->cmd;
+}
+
 void* MtlDevice() {
     return queue ? (__bridge void*)queue.device : nullptr;
 }

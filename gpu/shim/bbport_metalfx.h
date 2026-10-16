@@ -32,6 +32,9 @@ struct Frame {
     float motion_scale_x, motion_scale_y;
     bool reset; ///< discard history (camera cut, resize)
     bool hdr;   ///< linear HDR color (auto exposure); false for the tonemapped frame
+    /// bbport Metal frame path: id<MTLCommandBuffer> to encode into (in order with the frame,
+    /// not committed here); null: a command buffer of its own, committed.
+    void* command_buffer = nullptr;
 };
 
 #ifdef __APPLE__
