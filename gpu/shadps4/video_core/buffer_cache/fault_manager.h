@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <array>
+
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/renderer_metal/mtl_host_kernel.h"
 
 namespace VideoCore {
 
@@ -14,7 +17,7 @@ class FaultManager {
     static constexpr size_t MaxPendingFaults = 8;
 
 public:
-    explicit FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+    explicit FaultManager(Metal::Device& device, Vulkan::Scheduler& scheduler,
                           BufferCache& buffer_cache, u32 sparse_pagebits, u64 sparse_num_pages);
 
     [[nodiscard]] Buffer* GetFaultBuffer() noexcept {
@@ -34,9 +37,7 @@ private:
     Buffer download_buffer;
     std::array<u64, MaxPendingFaults> fault_areas{};
     u32 current_area{};
-    vk::UniqueDescriptorSetLayout fault_process_desc_layout;
-    vk::UniquePipeline fault_process_pipeline;
-    vk::UniquePipelineLayout fault_process_pipeline_layout;
+    Metal::HostKernel fault_process; ///< fault_buffer_process.comp
 };
 
 } // namespace VideoCore

@@ -91,10 +91,4 @@ struct BufferImageCopy {
     Extent3D image_extent;
 };
 
-struct BufferCopy {
-    u64 src_offset;
-    u64 dst_offset;
-    std::size_t size;
-};
-
 } // namespace VideoCore

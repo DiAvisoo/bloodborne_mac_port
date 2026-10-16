@@ -8,6 +8,7 @@
 
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/buffer_copy.h"
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
@@ -42,7 +43,7 @@ public:
     /// buffer must be unused in this submission too, and the copy runs after the copies hoisted
     /// before it (they may have uploaded its ranges). The caller marks both ranges used.
     bool HoistCopy(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
-                   std::span<const vk::BufferCopy> copies, bool shader_copy = false);
+                   std::span<const VideoCore::BufferCopy> copies, bool shader_copy = false);
 
     Scheduler& GetScheduler() {
         return scheduler;
@@ -60,11 +61,12 @@ public:
     SceneTargets* scene_targets = nullptr;
 
     /// bbport: `where` names the caller in BB_PASS_STATS.
-    void CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
-                    std::span<const vk::BufferCopy> copies,
+    void CopyBuffer(const VideoCore::Buffer& src, const VideoCore::Buffer& dst,
+                    std::span<const VideoCore::BufferCopy> copies,
                     std::source_location where = std::source_location::current());
 
-    void FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value);
+    /// Fills `size` bytes at `offset` with the 32-bit `value` (offset and size multiples of 4).
+    void FillBuffer(const VideoCore::Buffer& dst, u64 offset, u64 size, u32 value);
 
     void InlineData(VideoCore::Buffer* dst, u64 offset, u32 value);
 

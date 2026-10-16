@@ -11,9 +11,9 @@
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/buffer_copy.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
-#include "video_core/renderer_vulkan/vk_semaphore.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -23,10 +23,13 @@ namespace Core {
 class MemoryManager;
 }
 
+namespace Metal {
+class Device;
+}
+
 namespace Vulkan {
-class GraphicsPipeline;
-struct SubmitInfo;
 class Runtime;
+class Scheduler;
 class StagingBufferPool;
 } // namespace Vulkan
 
@@ -41,19 +44,18 @@ class BufferCache {
     static constexpr u64 ARENA_PAGE_BITS = 32;
     static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
     static constexpr u64 NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - ARENA_PAGE_BITS);
+    /// Granularity of the page table (what MoltenVK's sparse alignment gave: 16 KiB, shift 14).
     static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
-#ifdef __APPLE__
     static constexpr u64 MacArenaBase = 0x7000000000; ///< runtime_memory.c USER_MIN (macOS)
     static constexpr u64 MacArenaPages = 4; ///< 16 GiB of guest GPU address space (BB_ARENA_GIB)
     u64 mac_arena_end = 0; ///< end of the arena (smaller where Metal buffers are limited)
-#endif
 
 public:
     /// Read-only bindings up to this size are copied into a stream buffer (bbport: public for
     /// the draw pipeline's constant ring).
     static constexpr u64 STREAM_THRESHOLD = 16_KB;
 
-    explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+    explicit BufferCache(Metal::Device& device, Vulkan::Scheduler& scheduler,
                          Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
                          TextureCache& texture_cache, PageManager& tracker);
     ~BufferCache();
@@ -78,7 +80,7 @@ public:
         return stream_buffer;
     }
 
-    /// Returns minimum granularity of a sparse memory bind.
+    /// Returns the page table granularity (log2 of the block size).
     u32 GetSparsePageShift() const noexcept {
         return block_shift;
     }
@@ -115,23 +117,7 @@ public:
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
-    /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
-    void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
-
 private:
-    struct ArenaBinds {
-        const Buffer* arena;
-        boost::container::small_vector<vk::SparseMemoryBind, 32> binds;
-    };
-
-    ArenaBinds* BindsForArena(const Buffer* arena) {
-        auto it = std::ranges::find(pending_binds, arena, &ArenaBinds::arena);
-        if (it != pending_binds.end()) {
-            return std::addressof(*it);
-        }
-        return &pending_binds.emplace_back(arena);
-    }
-
     const Buffer* GetArena(u64 first_block, u64 last_block);
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
@@ -145,12 +131,12 @@ private:
     static void RunGuestCopy(const BbCopy::Item& item);
     void SmallGuestCopy(const BbCopy::Item& item);
 
-    const Buffer* UploadCopies(const Buffer* arena, std::span<vk::BufferCopy> copies,
+    const Buffer* UploadCopies(const Buffer* arena, std::span<BufferCopy> copies,
                                size_t total_size_bytes);
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
-    const Vulkan::Instance& instance;
+    Metal::Device& device;
     Vulkan::Scheduler& scheduler;
     // bbport: texel buffer ranges known not to alias an image, per image registry generation.
     struct ImageMiss {
@@ -175,22 +161,10 @@ private:
 
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;
-    std::vector<ArenaBinds> pending_binds;
-    Vulkan::Semaphore memory_semaphore;
 
-    struct Backing : public Interval {
-        vk::DeviceMemory memory;
-        u64 offset;
-        constexpr bool CanMergeWith(const Backing& other) const noexcept {
-            return memory == other.memory && offset + (end - start) == other.offset;
-        }
-        constexpr Backing SubRange(u64 a, u64 b) const noexcept {
-            return {{a, b}, memory, offset + (a - start)};
-        }
-    };
-    IntervalList<Backing> resident_ranges;
+    /// Blocks whose page table entries are filled (the arena itself is fully backed).
+    IntervalList<Interval> resident_ranges;
 
-    u32 arena_memory_type_index{};
     u32 block_size{};
     u32 block_shift{};
     u32 blocks_per_arena_page{};
