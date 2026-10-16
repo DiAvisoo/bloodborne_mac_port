@@ -24,7 +24,8 @@ namespace {
         std::call_once(once_, [&] { LOG_WARNING(Render, __VA_ARGS__); });                          \
     } while (0)
 
-/// The kernels' stage-in streams: the pipeline's vertex slots with the draw's buffers.
+/// The kernels' stage-in streams: the pipeline's vertex slots with the draw's buffers, at the
+/// same strides as a plain draw's (StreamStride).
 u32 KernelStreams(std::span<const VertexBufferSlot> slots, const Resources& r, const Nulls& nulls,
                   std::array<Tessellation::VertexBinding, 32>& out) {
     const u32 n = u32(std::min(slots.size(), out.size()));
@@ -35,7 +36,7 @@ u32 KernelStreams(std::span<const VertexBufferSlot> slots, const Resources& r, c
         const bool present = stream && stream->buffer.buffer;
         out[j] = {present ? stream->buffer.buffer : nulls.buffer.buffer,
                   present ? stream->buffer.offset : 0,
-                  slot.constant || !present || !stream->stride ? 16 : stream->stride, slot.slot};
+                  StreamStride(slot, stream), slot.slot};
     }
     return n;
 }

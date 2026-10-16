@@ -167,9 +167,17 @@ struct Resources {
     IndexType index_type{IndexType::U16};
 };
 
-/// Binds the vertex streams at the pipeline's vertex slots with the V#'s stride (0 for constant
-/// streams; a stride of 0 repeats element 0, as in Vulkan); missing streams get the null
-/// stand-in at stride 0 (zero for every vertex).
+/// The attribute stride a vertex slot is bound with, for draws and for the tessellation /
+/// geometry kernels' stage-in streams alike: the V#'s stride (0 repeats element 0, as in
+/// Vulkan); 0 for constant (per-instance, divisor 0) slots and for missing streams (the null
+/// stand-in's element 0, however far the draw indexes). Metal accepts 0 for dynamic-stride
+/// layouts (MTL_DEBUG_LAYER).
+constexpr u32 StreamStride(const VertexBufferSlot& slot, const VertexStream* stream) {
+    return stream && stream->buffer.buffer && !slot.constant ? stream->stride : 0;
+}
+
+/// Binds the vertex streams at the pipeline's vertex slots (StreamStride; missing streams get
+/// the null stand-in).
 void BindVertexStreams(Encoder& e, std::span<const VertexBufferSlot> slots,
                        std::span<const VertexStream> streams, const Nulls& nulls);
 

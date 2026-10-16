@@ -72,6 +72,14 @@ vertex AttrOut fullscreen_attr(AttrIn in [[stage_in]], uint vid [[vertex_id]]) {
 }
 fragment float4 attr_color(AttrOut in [[stage_in]]) { return in.color; }
 
+// A compute kernel's stage-in stream (as the tessellation vertex and geometry export kernels):
+// thread i reads its vertex's attribute 0 from Metal buffer 30.
+struct KernelIn { float4 color [[attribute(0)]]; };
+kernel void stage_in_copy(KernelIn in [[stage_in]], device float4* out [[buffer(1)]],
+                          uint i [[thread_position_in_grid]]) {
+    out[i] = in.color;
+}
+
 fragment float4 push_color(constant float4& color [[buffer(0)]]) { return color; }
 fragment float4 bound_color(constant float4& color [[buffer(1)]]) { return color; }
 
@@ -739,6 +747,98 @@ void TestVertexStreamStrides() {
     Expect(device.ErrorCount() == 0, "vertex stream strides ran without errors");
 }
 
+/// The stride rule shared by draws and the tessellation / geometry kernels' stage-in streams.
+void TestStreamStrideRule() {
+    const VertexBufferSlot per_vertex{0, 30, false};
+    const VertexBufferSlot constant{0, 30, true};
+    const VertexStream strided{BufferRef{reinterpret_cast<void*>(0x1000), 0}, 24};
+    const VertexStream zero{BufferRef{reinterpret_cast<void*>(0x1000), 0}, 0};
+    const VertexStream empty{};
+    Expect(StreamStride(per_vertex, &strided) == 24, "a present stream keeps its V# stride");
+    Expect(StreamStride(per_vertex, &zero) == 0, "a V# stride of 0 stays 0");
+    Expect(StreamStride(per_vertex, &empty) == 0, "a stream without a buffer: stride 0");
+    Expect(StreamStride(per_vertex, nullptr) == 0, "a missing stream: stride 0");
+    Expect(StreamStride(constant, &strided) == 0, "a constant stream: stride 0");
+}
+
+/// A kernel stage-in stream bound with the rule's stride 0 (setBuffer:offset:attributeStride:,
+/// as Tessellation::EncodeVertexKernel binds them), and a Constant-step render layout at 0.
+void TestKernelAndConstantStreamStrides() {
+    Device device;
+    Encoder encoder{device};
+    NullResources null_resources{device};
+    Runs runs{device, null_resources.Get()};
+    Shaders shaders;
+    id<MTLLibrary> library = Library(device);
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    constexpr u32 kSlot = 30;
+    id<MTLBuffer> colors = SharedBuffer(device, 48);
+    const float values[12] = {1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1};
+    std::memcpy(colors.contents, values, sizeof(values));
+
+    // Kernel: four threads, one vertex each, from a V# with stride 0.
+    MTLComputePipelineDescriptor* cdesc = [MTLComputePipelineDescriptor new];
+    cdesc.computeFunction = [library newFunctionWithName:@"stage_in_copy"];
+    cdesc.stageInputDescriptor = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+    cdesc.stageInputDescriptor.attributes[0].format = MTLAttributeFormatFloat4;
+    cdesc.stageInputDescriptor.attributes[0].bufferIndex = kSlot;
+    cdesc.stageInputDescriptor.layouts[kSlot].stride = MTLBufferLayoutStrideDynamic;
+    cdesc.stageInputDescriptor.layouts[kSlot].stepFunction =
+        MTLStepFunctionThreadPositionInGridX;
+    NSError* error = nil;
+    id<MTLComputePipelineState> kernel =
+        [dev newComputePipelineStateWithDescriptor:cdesc
+                                           options:MTLPipelineOptionNone
+                                        reflection:nil
+                                             error:&error];
+    Expect(kernel != nil, "the stage-in kernel builds");
+    id<MTLBuffer> out = SharedBuffer(device, 4 * 16);
+    const VertexBufferSlot kernel_slot{0, kSlot, false};
+    const VertexStream same{Ref(colors), 0};
+    if (kernel) {
+        auto* enc = (__bridge id<MTLComputeCommandEncoder>)encoder.ComputeEncoder();
+        [enc setComputePipelineState:kernel];
+        [enc setBuffer:colors offset:0 attributeStride:StreamStride(kernel_slot, &same)
+               atIndex:kSlot];
+        [enc setBuffer:out offset:0 atIndex:1];
+        [enc setStageInRegion:MTLRegionMake1D(0, 4)];
+        [enc dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+    }
+
+    // Render: a Constant-step layout (per-instance, divisor 0) with a V# stride of 32.
+    MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+    MTLVertexDescriptor* vd = [MTLVertexDescriptor new];
+    vd.attributes[0].format = MTLVertexFormatFloat4;
+    vd.attributes[0].bufferIndex = kSlot;
+    vd.layouts[kSlot].stride = MTLBufferLayoutStrideDynamic;
+    vd.layouts[kSlot].stepFunction = MTLVertexStepFunctionConstant;
+    vd.layouts[kSlot].stepRate = 0;
+    desc.vertexDescriptor = vd;
+    id<MTLRenderPipelineState> pipeline =
+        Pipeline(device, library, @"fullscreen_attr", @"attr_color", desc);
+    const std::array<VertexBufferSlot, 1> slots{VertexBufferSlot{0, kSlot, true}};
+    DrawPipeline p = View(pipeline, &shaders.none, &shaders.none);
+    p.vertex_slots = slots;
+    const std::array<VertexStream, 1> strided{VertexStream{Ref(colors), 32}};
+    id<MTLTexture> target = Target(device);
+    encoder.BeginRenderPass(Pass(target));
+    Expect(runs.Draw(encoder, p, FullState(), Resources{{}, {}, strided, {}, IndexType::U16},
+                     DrawArgs{3}),
+           "a constant stream draws");
+    encoder.EndRenderPass();
+    id<MTLBuffer> image = Readback(device, encoder, target);
+    device.Wait(encoder.Submit());
+    const float* o = static_cast<const float*>(out.contents);
+    bool all_first = kernel != nil;
+    for (u32 i = 0; i < 4; ++i) {
+        all_first = all_first && o[i * 4] == 1.0f && o[i * 4 + 1] == 0.0f && o[i * 4 + 3] == 1.0f;
+    }
+    Expect(all_first, "a kernel stage-in stream at stride 0 gives every vertex element 0");
+    Expect(Pixel(image, 10, 10) == kRed && Pixel(image, 40, 20) == kRed,
+           "a constant render stream at stride 0 reads element 0");
+    Expect(device.ErrorCount() == 0, "kernel and constant stream strides ran without errors");
+}
+
 void TestMaskDepthStencil() {
     DepthStencilKey key;
     key.depth_test = true;
@@ -767,6 +867,8 @@ int main() {
         TestScratchPool();
         TestMaskDepthStencil();
         TestVertexStreamStrides();
+        TestStreamStrideRule();
+        TestKernelAndConstantStreamStrides();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

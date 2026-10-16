@@ -175,12 +175,8 @@ void BindVertexStreams(Encoder& e, std::span<const VertexBufferSlot> slots,
         const VertexStream* stream =
             slot.location < streams.size() ? &streams[slot.location] : nullptr;
         const bool present = stream && stream->buffer.buffer;
-        // Stride 0 (accepted by Metal for dynamic-stride layouts; checked with the debug layer)
-        // reads element 0 for every vertex, as Vulkan does for a V# stride of 0. A missing
-        // stream reads element 0 of the stand-in (zero), however far the draw indexes.
-        // Constant (per-instance, divisor 0) layouts read element 0 whatever the stride.
-        const u32 stride = present && !slot.constant ? stream->stride : 0;
-        e.SetVertexBuffer(slot.slot, present ? stream->buffer : nulls.buffer, stride);
+        e.SetVertexBuffer(slot.slot, present ? stream->buffer : nulls.buffer,
+                          StreamStride(slot, stream));
     }
 }
 
