@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: the texture cache's blit programs in MSL (Metal-native renderer), translated by hand
-// from host_shaders/fs_tri.vert, color_to_ms_depth.frag, ms_image_blit.frag and
-// depth_resample.frag. One library; inputs at textures 0/1, push constants at buffer 0.
+// bbport: the texture cache's and the presenter's blit programs in MSL (Metal-native renderer),
+// translated by hand from host_shaders/fs_tri.vert, color_to_ms_depth.frag, ms_image_blit.frag,
+// depth_resample.frag and post_process.frag. One library; inputs at textures 0/1, push constants
+// at buffer 0.
 
 #pragma once
 
@@ -22,6 +23,10 @@ inline constexpr const char* MsImageBlitMsaa[3] = {
 inline constexpr const char* DepthResample = "depth_resample_fs";
 inline constexpr const char* DepthResampleStencil = "depth_resample_stencil_fs";
 inline constexpr const char* DepthResampleStencilBits = "depth_resample_stencil_bits_fs";
+/// post_process.frag (the presenter's gamma pass): texture 0, sampler 0, PpSettings at buffer 0.
+inline constexpr const char* PostProcess = "post_process_fs";
+/// The present blit: a linear sample of texture 0 (sampler 0) over the viewport.
+inline constexpr const char* Present = "present_fs";
 
 inline constexpr const char* Source = R"msl(
 #include <metal_stdlib>
@@ -113,6 +118,40 @@ fragment DepthOut depth_resample_stencil_bits_fs(FsTriOut in [[stage_in]],
     DepthOut out;
     out.depth = src_depth.read(coord, 0);
     return out;
+}
+
+// post_process.frag: re-encodes the frame with the user's gamma (pp_gamma at gamma 1 is the sRGB
+// encode); srgb_input decodes sRGB-encoded values first (10-bit frames without an sRGB view); hdr
+// passes the frame through. GLSL mix(x, y, bvec) = select(x, y, cond): y where true.
+struct PpSettings {
+    float gamma;
+    uint hdr;
+    uint srgb_input;
+};
+constant float pp_cutoff = 0.0031308, pp_a = 1.055, pp_b = 0.055, pp_d = 12.92;
+static float3 pp_gamma(float3 c, float g) {
+    return select(pp_a * pow(c, float3(1.0 / (2.4 + 1.0 - g))) - pp_b, pp_d * c / g,
+                  c < pp_cutoff);
+}
+static float3 pp_degamma(float3 c) {
+    return select(pow(max(c + pp_b, 0.0) / pp_a, float3(2.4)), c / pp_d, c < pp_d * pp_cutoff);
+}
+fragment float4 post_process_fs(FsTriOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
+                                sampler s [[sampler(0)]], constant PpSettings& pp [[buffer(0)]]) {
+    float4 c = tex.sample(s, in.uv);
+    if (pp.hdr != 0u) {
+        return c;
+    }
+    if (pp.srgb_input != 0u) {
+        c.rgb = pp_degamma(c.rgb);
+    }
+    return float4(pp_gamma(c.rgb, pp.gamma), c.a);
+}
+
+// The present blit: the frame over the viewport (the aspect-fit rect), linear.
+fragment float4 present_fs(FsTriOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
+                           sampler s [[sampler(0)]]) {
+    return tex.sample(s, in.uv);
 }
 )msl";
 

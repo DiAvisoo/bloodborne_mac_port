@@ -140,6 +140,12 @@ if [[ ${1:-} == --test ]]; then
             -framework Metal -framework Foundation -o out/mtl-draw-test
         out/mtl-draw-test
         MTL_DEBUG_LAYER=1 out/mtl-draw-test
+        # Metal-native M4: the present helper (offscreen CAMetalLayer), plain and under validation.
+        /usr/bin/clang++ -arch arm64 -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -std=c++20 -fobjc-arc -O2 -g \
+            -Wall -Wextra -Werror -Igpu/shim -Igpu/shadps4 -I"$ARM64_PREFIX/include" tests/test_mtl_present.mm gpu/shim/common/logging/log.cpp gpu/shim/common/assert.cpp out/gpu-arm64/libbbmetal_core.a -L"$ARM64_PREFIX/lib" -lfmt \
+            -framework Metal -framework QuartzCore -framework CoreGraphics -framework Foundation -o out/mtl-present-test
+        out/mtl-present-test
+        MTL_DEBUG_LAYER=1 out/mtl-present-test
     fi
     # Metal-native M3: scene targets (scaled copies, depth resample, stencil export) through the
     # linked arm64 library; again writing stencil one bit at a time.
