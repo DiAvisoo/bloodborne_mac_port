@@ -5,7 +5,7 @@
 
 #include <string_view>
 #include "common/types.h"
-#include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_metal/mtl_memory_type.h"
 #include "video_core/renderer_metal/mtl_object.h"
 
 namespace Metal {

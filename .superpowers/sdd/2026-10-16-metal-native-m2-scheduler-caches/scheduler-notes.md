@@ -1,0 +1,18 @@
+# Scheduler inventory (read-only survey, 2026-10-16) — paths under gpu/shadps4/video_core/, VS = renderer_vulkan/vk_scheduler
+- Scheduler ctor (VS.h:680, .cpp:63-79): timeline Semaphore, two CommandPools (main, upload), recorder thread (BB_VK_RECORD_THREAD!=0), priority-ops thread. Constructed at presenter.cpp:136 (3 instances: draw/present/flip) — presenter is M4; it will not compile after this task (expected).
+- SubmitExecution (.cpp:619-706) today: lock submit_mutex, NextTick, on_submit(info), EndRendering, SyncRecording, WaitHostCopies, end cmdbuf, timeline signal, under upload_mutex close upload_cmdbuf (+barrier) and prepend it, ImGui TextureManager::Submit (.cpp:692), vkQueueSubmit with info's waits/signals/fence, Refresh, allocate next cmdbuf (AllocateWorkerCommandBuffers .cpp:555: CommandPool::Commit, begin, BbPassLog name, dynamic_state.Invalidate(), Tracy), PopPendingOperations.
+- Finish (.cpp:513), Wait (.cpp:521: flush if tick>=CurrentTick), PopPendingOperations (.cpp:531, polls 1/32).
+- BeginRendering (.cpp:194-274): merges equal RenderState, BB_PASS_STATS (.cpp:95-191 keep). EndRendering(source_location, detail): records endRendering + pass stats.
+- RenderState (VS.h:46-74): vk::ImageViews, layouts, clear values, memcmp compare.
+- DynamicState (VS.h:114-584) + CommitWith emits vkCmdSet* closures; Commit(Instance, cmdbuf) at .cpp:734 (delete). Map: viewports/scissors[0] -> SetViewport/SetScissor; cull_mode; front_face; depth_bias (fold enable); stencil refs; blend constants; depth test/write/compare + stencil enable/ops/masks -> DepthStencilKey (Metal::DepthStencilCache, mtl_depth_stencil.h); color_write_masks, rasterizer_discard, primitive_restart, line_width, feedback_loop, depth_bounds -> keep tracking, emit nothing.
+- CommandBuffer() (VS.h:734): syncs recorder, direct mode, returns current_cmdbuf — 25 external users (presenter 10, upscaler 7, rasterizer 4 debug labels, blit_helper 2, camera_motion 1, fault_manager 1). Replace with DirectEncoder() returning Metal::Encoder&.
+- Record(Func) VS.h:750 (chunked closures, RecordChunk::Push); IsRecordingDeferred/ReserveRecordData/RecordData/KickRecording(.cpp:413)/SyncRecording/WaitHostCopies/RecordHostCopy/SignalAfterHostCopies/WaitDeferredSignals: keep, closures take Metal::Encoder&. Recorder thread name .cpp:460 -> bb:MtlRecorder.
+- direct_mode must survive (Encoder single-threaded; recorder and direct callers never overlap).
+- GetWorkSemaphore (VS.h:873): delete; GetDevice() instead. Users: pipeline_cache 288 (DescriptorHeap), constant_ring 92, presenter (M3/M4 fix them).
+- submit_mutex static (VS.h:895): keep (users presenter 755, upscaler, bbport_overlay.cpp:1574, bbport_metalfx.h:41).
+- upload_mutex/upload_cmdbuf/upload_open (VS.h:896-898) + RecordHoistedCopy (.cpp:583-617; records on calling thread into upload_cmdbuf with barriers) -> upload Metal::Encoder + SubmitUntracked before the main Submit.
+- SetSubmitCallback (VS.h:716): rasterizer.cpp:85 sets FlushBarriers + SubmitPendingArenaBinds -> becomes std::function<void()>.
+- IsRendering/IsRenderingWith/WillBeginRendering: keep (producer-side state).
+- Delete: SubmitInfo (VS.h:76-98), vk_semaphore (users Scheduler, BufferCache memory_semaphore, presenter), vk_resource_pool (CommandPool, DescriptorHeap, ResourcePool — users pipeline_cache.cpp:288, pipeline_common.cpp:242: M3 work), Tracy VkCtx (.cpp:73,573,623), BbPassLog cmdbuf naming (VS.h:38-42) or reimplement as MTLCommandBuffer.label.
+- Rasterizer::Flush returns CurrentTick() read before submit (rasterizer.cpp:1434): untracked upload commit takes no tick, so this stays valid.
+- MoltenVK env (gpu/shim/bbgpu.cpp:234-253 MVK_CONFIG_*) is M7, not this task.

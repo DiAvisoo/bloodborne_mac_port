@@ -1,0 +1,1148 @@
+# Review package: 9de9df8..HEAD
+
+## Commits
+1143430 Metal-native M2: buffers, stream buffer, staging pool and constant ring on MTLBuffer
+
+## Files changed
+ deps                                               |   1 +
+ gpu/CMakeLists.txt                                 |   3 +-
+ gpu/shadps4/video_core/buffer_cache/buffer.cpp     | 177 ++++-----------------
+ gpu/shadps4/video_core/buffer_cache/buffer.h       | 124 ++++++---------
+ gpu/shadps4/video_core/renderer_metal/mtl_buffer.h |  22 +++
+ .../video_core/renderer_metal/mtl_buffer.mm        |  50 ++++++
+ .../video_core/renderer_vulkan/vk_constant_ring.h  |  27 ++--
+ .../renderer_vulkan/vk_staging_buffer_pool.cpp     |  25 ++-
+ .../renderer_vulkan/vk_staging_buffer_pool.h       |  19 +--
+ tests/test_mtl_encoder.mm                          |  16 ++
+ 10 files changed, 196 insertions(+), 268 deletions(-)
+
+## Diff
+diff --git a/deps b/deps
+new file mode 120000
+index 0000000..8644109
+--- /dev/null
++++ b/deps
+@@ -0,0 +1 @@
++../bloodborne_mac_port/deps
+\ No newline at end of file
+diff --git a/gpu/CMakeLists.txt b/gpu/CMakeLists.txt
+index a1834f1..fb0495e 100644
+--- a/gpu/CMakeLists.txt
++++ b/gpu/CMakeLists.txt
+@@ -185,40 +185,41 @@ if (APPLE)
+     target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_METAL_EXT)
+     if (BB_ARM64)
+         # Native Metal back end: SPIR-V -> MSL through SPIRV-Cross (deps/arm64, bootstrap_deps.sh).
+         find_package(spirv_cross_core CONFIG REQUIRED)
+         find_package(spirv_cross_glsl CONFIG REQUIRED)
+         find_package(spirv_cross_msl CONFIG REQUIRED)
+         # Metal-native core (docs/superpowers/plans/2026-10-16-metal-native-m2-scheduler-caches.md):
+         # device, encoder and helpers with no renderer dependencies; unit tests link it alone.
+         set(METAL_CORE_SOURCES
+             shadps4/video_core/renderer_metal/mtl_object.cpp
++            shadps4/video_core/renderer_metal/mtl_buffer.mm
+             shadps4/video_core/renderer_metal/mtl_device.mm
+             shadps4/video_core/renderer_metal/mtl_encoder.mm
+             shadps4/video_core/renderer_metal/mtl_depth_stencil.mm
+             shadps4/video_core/renderer_metal/mtl_specialize.cpp
+             shadps4/video_core/renderer_metal/mtl_timeline.cpp
+             shadps4/video_core/renderer_metal/vk_to_mtl.mm)
+         add_library(bbmetal_core STATIC ${METAL_CORE_SOURCES})
+         target_include_directories(bbmetal_core PRIVATE shim shadps4 ${SHADER_INCLUDE})
+         target_compile_features(bbmetal_core PRIVATE cxx_std_20)
+         target_link_libraries(bbmetal_core PRIVATE fmt::fmt)
+         set_target_properties(bbmetal_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+         foreach(source IN LISTS METAL_CORE_SOURCES)
+             if (source MATCHES "\\.mm$")
+                 set_source_files_properties(${source} TARGET_DIRECTORY bbmetal_core PROPERTIES
+                     COMPILE_OPTIONS "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
+             endif()
+         endforeach()
+         file(GLOB METAL_SOURCES CONFIGURE_DEPENDS shadps4/video_core/renderer_metal/*.cpp
+              shadps4/video_core/renderer_metal/*.mm)
+-        list(REMOVE_ITEM METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_object.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_device.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_encoder.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_depth_stencil.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_specialize.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_timeline.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/vk_to_mtl.mm)
++        list(REMOVE_ITEM METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_object.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_buffer.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_device.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_encoder.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_depth_stencil.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_specialize.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_timeline.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/vk_to_mtl.mm)
+         target_sources(bbgpu PRIVATE ${METAL_SOURCES})
+         target_link_libraries(bbgpu PRIVATE bbmetal_core "-framework Metal" "-framework Foundation")
+         foreach(source IN LISTS METAL_SOURCES)
+             if (source MATCHES "\\.mm$")
+                 # No Vulkan Metal-surface types here: under ARC their CAMetalLayer pointer breaks
+                 # vulkan.hpp's constexpr templates.
+                 set_source_files_properties(${source} PROPERTIES COMPILE_OPTIONS
+                     "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
+             endif()
+         endforeach()
+diff --git a/gpu/shadps4/video_core/buffer_cache/buffer.cpp b/gpu/shadps4/video_core/buffer_cache/buffer.cpp
+index 9924556..3d83134 100644
+--- a/gpu/shadps4/video_core/buffer_cache/buffer.cpp
++++ b/gpu/shadps4/video_core/buffer_cache/buffer.cpp
+@@ -1,197 +1,81 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <numeric>
+ 
++#include <fmt/format.h>
++
+ #include "common/alignment.h"
+ #include "common/assert.h"
+ #include "video_core/buffer_cache/buffer.h"
+-#include "video_core/renderer_vulkan/vk_instance.h"
+-#include "video_core/renderer_vulkan/vk_platform.h"
+-#include "video_core/renderer_vulkan/vk_scheduler.h"
+-
+-#include <vk_mem_alloc.h>
++#include "video_core/renderer_metal/mtl_buffer.h"
++#include "video_core/renderer_metal/mtl_device.h"
++#include "video_core/renderer_metal/mtl_timeline.h"
+ 
+ namespace VideoCore {
+ 
+ std::string_view BufferTypeName(MemoryType type) {
+     switch (type) {
+     case MemoryType::HostUncached:
+         return "HostUncached";
+     case MemoryType::HostCached:
+         return "HostCached";
+     case MemoryType::Stream:
+         return "Stream";
+     case MemoryType::DeviceLocal:
+         return "DeviceLocal";
+-    case MemoryType::Sparse:
+-        return "Sparse";
+     default:
+         return "Invalid";
+     }
+ }
+ 
+-[[nodiscard]] VkMemoryPropertyFlags MemoryUsagePreferredVmaFlags(MemoryType type) {
+-    return type != MemoryType::DeviceLocal ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+-                                           : VkMemoryPropertyFlagBits{};
+-}
+-
+-[[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryType type) {
+-    switch (type) {
+-    case MemoryType::HostUncached:
+-    case MemoryType::Stream:
+-        return VMA_ALLOCATION_CREATE_MAPPED_BIT |
+-               VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+-    case MemoryType::HostCached:
+-        return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+-    case MemoryType::DeviceLocal:
+-    default:
+-        return {};
+-    }
+-}
+-
+-[[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryType type) {
+-    switch (type) {
+-    case MemoryType::DeviceLocal:
+-    case MemoryType::Stream:
+-        return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+-    case MemoryType::HostUncached:
+-    case MemoryType::HostCached:
+-        return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+-    default:
+-        return VMA_MEMORY_USAGE_UNKNOWN;
+-    }
+-}
+-
+-UniqueBuffer::UniqueBuffer(vk::Device device_, VmaAllocator allocator_)
+-    : device{device_}, allocator{allocator_} {}
+-
+-UniqueBuffer::~UniqueBuffer() {
+-    Destroy();
+-}
+-
+ void UniqueBuffer::Destroy() {
+-    if (allocation) {
+-        vmaDestroyBuffer(allocator, buffer, allocation);
+-    } else if (buffer) {
+-        device.destroyBuffer(buffer);
+-    }
+-    buffer = VK_NULL_HANDLE;
+-    allocation = VK_NULL_HANDLE;
+-    bda_addr = 0;
++    buffer.Reset();
++    gpu_address = 0;
++    contents = nullptr;
+ }
+ 
+-void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
+-                          VmaAllocationInfo* out_alloc_info) {
+-    const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+-    if (mem_type != MemoryType::Sparse) {
+-        const VmaAllocationCreateFlags bda_flag =
+-            with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+-        const VmaAllocationCreateInfo alloc_ci = {
+-            .flags =
+-                VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(mem_type),
+-            .usage = MemoryUsageVma(mem_type),
+-            .requiredFlags = 0,
+-            .preferredFlags = MemoryUsagePreferredVmaFlags(mem_type),
+-            .pool = VK_NULL_HANDLE,
+-            .pUserData = nullptr,
+-        };
+-
+-        const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
+-        VkBuffer unsafe_buffer{};
+-        VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+-                                          &allocation, out_alloc_info);
+-        ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
+-                   vk::to_string(vk::Result{result}));
+-        buffer = vk::Buffer{unsafe_buffer};
+-    } else {
+-        buffer_ci.flags |=
+-            vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+-        buffer = Vulkan::Check(device.createBuffer(buffer_ci));
+-    }
+-
+-    if (with_bda) {
+-        const vk::BufferDeviceAddressInfo bda_info = {
+-            .buffer = buffer,
+-        };
+-        auto bda_result = device.getBufferAddress(bda_info);
+-        ASSERT_MSG(bda_result != 0, "Failed to get buffer device address");
+-        bda_addr = bda_result;
+-    }
++void UniqueBuffer::Create(Metal::Device& device, u64 size, MemoryType type,
++                          std::string_view label) {
++    Destroy();
++    buffer = Metal::CreateBuffer(device, size, type, label, &gpu_address, &contents);
++    ASSERT_MSG(buffer, "Failed allocating buffer of {:#x} bytes", size);
+ }
+ 
+-Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
+-               MemoryType mem_type_, std::string_view debug_name)
+-    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
+-      buffer{instance.GetDevice(), instance.GetAllocator()} {
+-
+-    vk::BufferCreateInfo buffer_ci = {
+-        .size = size_bytes,
+-        .usage = AllFlags,
+-        .sharingMode = vk::SharingMode::eExclusive,
+-    };
+-    VmaAllocationInfo alloc_info{};
+-    buffer.Create(buffer_ci, mem_type, &alloc_info);
+-
+-    const auto device = instance.GetDevice();
++Buffer::Buffer(Metal::Device& device, MemoryType mem_type_, VAddr cpu_addr_, u64 size_bytes_,
++               std::string_view debug_name)
++    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_} {
+     if (!debug_name.empty()) {
+-        Vulkan::SetObjectName(device, Handle(), debug_name);
++        buffer.Create(device, size_bytes, mem_type, debug_name);
+     } else {
+-        Vulkan::SetObjectName(device, Handle(), "Buffer {:#x}:{:#x}", cpu_addr, size_bytes);
+-    }
+-
+-    if (mem_type != MemoryType::Sparse) {
+-        VkMemoryPropertyFlags property_flags{};
+-        vmaGetAllocationMemoryProperties(instance.GetAllocator(), buffer.allocation,
+-                                         &property_flags);
+-        if (alloc_info.pMappedData) {
+-            mapped_data = std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
+-        }
+-        is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+-    }
+-}
+-
+-void Buffer::Flush(u64 offset, u64 size) {
+-    if (mapped_data.empty() || is_coherent) {
+-        return;
++        buffer.Create(device, size_bytes, mem_type,
++                      fmt::format("Buffer {:#x}:{:#x}", cpu_addr, size_bytes));
+     }
+-    vmaFlushAllocation(buffer.allocator, buffer.allocation, offset, size);
+-}
+-
+-void Buffer::Invalidate(u64 offset, u64 size) {
+-    if (mapped_data.empty() || is_coherent) {
+-        return;
++    if (buffer.Contents()) {
++        mapped_data = std::span<u8>{buffer.Contents(), size_bytes};
+     }
+-    vmaInvalidateAllocation(buffer.allocator, buffer.allocation, offset, size);
+ }
+ 
+ constexpr u64 WATCHES_INITIAL_RESERVE = 0x100;
+ constexpr u64 WATCHES_RESERVE_CHUNK = 0x100;
+ 
+-StreamBuffer::StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_,
++StreamBuffer::StreamBuffer(Metal::Device& device, Metal::Timeline& timeline_,
+                            MemoryType mem_type, u64 size_bytes)
+-    : Buffer{instance, 0, size_bytes, mem_type}, scheduler{scheduler_},
+-      non_coherent_atom_size{instance.NonCoherentAtomSize()} {
++    : Buffer{device, mem_type, 0, size_bytes,
++             fmt::format("StreamBuffer({}):{:#x}", BufferTypeName(mem_type), size_bytes)},
++      timeline{timeline_} {
+     ReserveWatches(current_watches, WATCHES_INITIAL_RESERVE);
+     ReserveWatches(previous_watches, WATCHES_INITIAL_RESERVE);
+-    Vulkan::SetObjectName(instance.GetDevice(), Handle(), "StreamBuffer({}):{:#x}",
+-                          BufferTypeName(mem_type), size_bytes);
+ }
+ 
+ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
+-    if (!mapped_data.empty() && !is_coherent) {
+-        size = Common::AlignUp(size, non_coherent_atom_size);
+-        alignment =
+-            alignment > 0 ? std::lcm(alignment, non_coherent_atom_size) : non_coherent_atom_size;
+-    }
+-
+     if (size > this->size_bytes) {
+         return false;
+     }
+ 
+     if (alignment > 0) {
+         offset = Common::AlignUp(offset, alignment);
+     }
+ 
+     if (offset + size > this->size_bytes) {
+         // The buffer would overflow, save the amount of used watches and reset the state.
+@@ -215,40 +99,35 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
+ 
+ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) {
+     if (!PrepareMap(size, alignment, allow_wait)) {
+         return {nullptr, 0};
+     }
+     u8* const data = mapped_data.empty() ? nullptr : mapped_data.data() + offset;
+     return {data, offset};
+ }
+ 
+ void StreamBuffer::Commit() {
+-    if (mem_type == MemoryType::HostCached) {
+-        Invalidate(offset, mapped_size);
+-    } else {
+-        Flush(offset, mapped_size);
+-    }
+     AdvanceAndWatch();
+ }
+ 
+ std::optional<u64> StreamBuffer::Reserve(u64 size, u64 alignment, bool allow_wait) {
+     if (!PrepareMap(size, alignment, allow_wait)) {
+         return std::nullopt;
+     }
+     const u64 reserved_offset = offset;
+     AdvanceAndWatch();
+     return reserved_offset;
+ }
+ 
+ void StreamBuffer::AdvanceAndWatch() {
+     offset += mapped_size;
+-    const u64 tick = scheduler.CurrentTick();
++    const u64 tick = timeline.CurrentTick();
+     last_tick = tick;
+ 
+     // Extend the last watch if it belongs to the same tick.
+     if (current_watch_cursor != 0 && current_watches[current_watch_cursor - 1].tick == tick) {
+         current_watches[current_watch_cursor - 1].upper_bound = offset;
+         return;
+     }
+ 
+     if (current_watch_cursor + 1 >= current_watches.size()) {
+         // Ensure that there are enough watches.
+@@ -263,21 +142,21 @@ void StreamBuffer::AdvanceAndWatch() {
+ void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {
+     watches.resize(watches.size() + grow_size);
+ }
+ 
+ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_wait) {
+     if (!invalidation_mark) {
+         return true;
+     }
+     while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
+         auto& watch = previous_watches[wait_cursor];
+-        if (!scheduler.IsFree(watch.tick) && !allow_wait) {
++        if (!timeline.IsFree(watch.tick) && !allow_wait) {
+             return false;
+         }
+-        scheduler.Wait(watch.tick);
++        timeline.Wait(watch.tick);
+         wait_bound = watch.upper_bound;
+         ++wait_cursor;
+     }
+     return true;
+ }
+ 
+ } // namespace VideoCore
+diff --git a/gpu/shadps4/video_core/buffer_cache/buffer.h b/gpu/shadps4/video_core/buffer_cache/buffer.h
+index 2b0a821..d232152 100644
+--- a/gpu/shadps4/video_core/buffer_cache/buffer.h
++++ b/gpu/shadps4/video_core/buffer_cache/buffer.h
+@@ -1,95 +1,71 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #pragma once
+ 
+ #include <cstddef>
++#include <cstring>
+ #include <optional>
+ #include <span>
+ #include <string_view>
+ #include <utility>
+ #include <vector>
+ 
+ #include "common/assert.h"
+ #include "common/types.h"
+-#include "video_core/renderer_vulkan/vk_common.h"
++#include "video_core/renderer_metal/mtl_object.h"
+ 
+-namespace Vulkan {
+-class Instance;
+-class Scheduler;
+-} // namespace Vulkan
+-
+-VK_DEFINE_HANDLE(VmaAllocation)
+-VK_DEFINE_HANDLE(VmaAllocator)
+-
+-struct VmaAllocationInfo;
++namespace Metal {
++class Device;
++class Timeline;
++} // namespace Metal
+ 
+ namespace VideoCore {
+ 
+ /// Hints and requirements for the backing memory type of a commit
+ enum class MemoryType : u8 {
+-    DeviceLocal,  ///< Requests device local buffer.
+-    HostUncached, ///< Requires a host visible memory type optimized for CPU to GPU uploads
+-    HostCached,   ///< Requires a host visible memory type optimized for GPU to CPU readbacks
+-    Stream,       ///< Requests device local host visible buffer, falling back host memory.
+-    Sparse,       ///< Requires an unbacked sparse resident buffer.
++    DeviceLocal,  ///< Private storage (GPU only; no CPU mapping).
++    HostUncached, ///< Shared, write-combined: optimized for CPU to GPU uploads.
++    HostCached,   ///< Shared, cached: optimized for GPU to CPU readbacks.
++    Stream,       ///< Shared, host-written every frame.
+ };
+ 
+-constexpr vk::BufferUsageFlags ReadFlags =
+-    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
+-    vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
+-    vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+-
+-constexpr vk::BufferUsageFlags AllFlags =
+-    ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
+-
+-struct UniqueBuffer {
+-    explicit UniqueBuffer(vk::Device device, VmaAllocator allocator);
+-    ~UniqueBuffer();
+-
+-    UniqueBuffer(const UniqueBuffer&) = delete;
+-    UniqueBuffer& operator=(const UniqueBuffer&) = delete;
+-
+-    UniqueBuffer(UniqueBuffer&& other) noexcept
+-        : device{other.device}, buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
+-          bda_addr{std::exchange(other.bda_addr, 0)},
+-          allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+-          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)} {}
+-
+-    UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
+-        if (this != &other) {
+-            Destroy();
+-            device = other.device;
+-            buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
+-            bda_addr = std::exchange(other.bda_addr, 0);
+-            allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
+-            allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+-        }
+-        return *this;
+-    }
+-
+-    void Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
+-                VmaAllocationInfo* out_alloc_info);
+-
++/// One MTLBuffer. Metal tracks hazards and shared storage is coherent, so there is nothing to
++/// flush or invalidate.
++class UniqueBuffer {
++public:
++    /// Creates the MTLBuffer (asserts on failure). Replaces any previous one.
++    void Create(Metal::Device& device, u64 size, MemoryType type, std::string_view label = "");
+     void Destroy();
+ 
+-    vk::Device device;
+-    vk::Buffer buffer{};
+-    vk::DeviceAddress bda_addr{};
+-    VmaAllocator allocator;
+-    VmaAllocation allocation{};
++    /// id<MTLBuffer>, unretained.
++    [[nodiscard]] void* Handle() const noexcept {
++        return buffer.Get();
++    }
++    [[nodiscard]] u64 GpuAddress() const noexcept {
++        return gpu_address;
++    }
++    /// The CPU pointer of a shared buffer; null for DeviceLocal (private storage).
++    [[nodiscard]] u8* Contents() const noexcept {
++        return contents;
++    }
++
++private:
++    Metal::Object buffer;
++    u64 gpu_address{};
++    u8* contents{};
+ };
+ 
+ struct Buffer {
+-    explicit Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
+-                    MemoryType mem_type, std::string_view debug_name = "");
++    explicit Buffer(Metal::Device& device, MemoryType mem_type, VAddr cpu_addr_, u64 size_bytes_,
++                    std::string_view debug_name = "");
+ 
+     Buffer& operator=(const Buffer&) = delete;
+     Buffer(const Buffer&) = delete;
+ 
+     Buffer& operator=(Buffer&&) = default;
+     Buffer(Buffer&&) = default;
+ 
+     [[nodiscard]] bool IsInBounds(VAddr addr, u64 size) const noexcept {
+         return addr >= cpu_addr && addr + size <= cpu_addr + SizeBytes();
+     }
+@@ -99,51 +75,50 @@ struct Buffer {
+     }
+ 
+     [[nodiscard]] u64 Offset(VAddr other_cpu_addr) const noexcept {
+         return other_cpu_addr - cpu_addr;
+     }
+ 
+     size_t SizeBytes() const {
+         return size_bytes;
+     }
+ 
+-    vk::Buffer Handle() const noexcept {
+-        return buffer.buffer;
++    /// id<MTLBuffer>, unretained.
++    void* Handle() const noexcept {
++        return buffer.Handle();
+     }
+ 
+-    vk::DeviceAddress BufferDeviceAddress() const noexcept {
+-        ASSERT_MSG(buffer.bda_addr != 0, "Can't get BDA from a non BDA buffer");
+-        return buffer.bda_addr;
++    Metal::BufferRef Ref(u64 offset = 0) const noexcept {
++        return {Handle(), offset};
+     }
+ 
+-    /// Makes host writes in provided range visible to the device.
+-    void Flush(u64 offset, u64 size);
+-
+-    /// Makes device writes in provided range visible to the host.
+-    void Invalidate(u64 offset, u64 size);
++    /// The buffer's GPU virtual address (for shaders that read it by address).
++    u64 GpuAddress() const noexcept {
++        return buffer.GpuAddress();
++    }
+ 
+     VAddr cpu_addr = 0;
+     size_t size_bytes = 0;
+-    std::span<u8> mapped_data{};
+-    bool is_coherent{};
++    std::span<u8> mapped_data{}; ///< shared storage only
+     MemoryType mem_type{MemoryType::DeviceLocal};
+     UniqueBuffer buffer;
+ };
+ 
+ struct StreamBuffer : public Buffer {
+-    explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+-                          MemoryType mem_type, u64 size_bytes);
++    /// `timeline`: the ticks of the scheduler whose commands use this buffer.
++    explicit StreamBuffer(Metal::Device& device, Metal::Timeline& timeline, MemoryType mem_type,
++                          u64 size_bytes);
+ 
+     /// Reserves a region of memory from the stream buffer. Must be followed by Commit().
+     std::pair<u8*, u64> Map(u64 size, u64 alignment = 0, bool allow_wait = true);
+ 
+-    /// Ensures that reserved bytes of memory are available to the GPU.
++    /// Marks the reserved bytes as used (shared storage needs no flush).
+     void Commit();
+ 
+     /// Reserves and commits a region in one step.
+     std::optional<u64> Reserve(u64 size, u64 alignment = 0, bool allow_wait = true);
+ 
+     /// Tick of the most recent commit into this buffer, 0 if never used.
+     [[nodiscard]] u64 LastTick() const noexcept {
+         return last_tick;
+     }
+ 
+@@ -169,22 +144,21 @@ private:
+     /// Advances offset past the mapped region and records the current tick for it.
+     void AdvanceAndWatch();
+ 
+     /// Increases the amount of watches available.
+     void ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size);
+ 
+     /// Waits pending watches until requested upper bound.
+     bool WaitPendingOperations(u64 requested_upper_bound, bool allow_wait);
+ 
+ private:
+-    Vulkan::Scheduler& scheduler;
+-    vk::DeviceSize non_coherent_atom_size{};
++    Metal::Timeline& timeline;
+     u64 offset{};
+     u64 mapped_size{};
+     u64 last_tick{};
+     std::vector<Watch> current_watches;
+     std::size_t current_watch_cursor{};
+     std::optional<size_t> invalidation_mark;
+     std::vector<Watch> previous_watches;
+     std::size_t wait_cursor{};
+     u64 wait_bound{};
+ };
+diff --git a/gpu/shadps4/video_core/renderer_metal/mtl_buffer.h b/gpu/shadps4/video_core/renderer_metal/mtl_buffer.h
+new file mode 100644
+index 0000000..32472fd
+--- /dev/null
++++ b/gpu/shadps4/video_core/renderer_metal/mtl_buffer.h
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport: MTLBuffer creation for the buffer cache (Metal-native renderer).
++
++#pragma once
++
++#include <string_view>
++#include "common/types.h"
++#include "video_core/buffer_cache/buffer.h"
++#include "video_core/renderer_metal/mtl_object.h"
++
++namespace Metal {
++
++class Device;
++
++/// Creates an MTLBuffer of `size` bytes: DeviceLocal is private storage, HostUncached is shared
++/// and write-combined, HostCached and Stream are shared. Returns an empty Object on failure.
++/// `gpu_address` receives the buffer's GPU address, `contents` the CPU pointer (null for
++/// DeviceLocal).
++Object CreateBuffer(Device& device, u64 size, VideoCore::MemoryType type, std::string_view label,
++                    u64* gpu_address, u8** contents);
++
++} // namespace Metal
+diff --git a/gpu/shadps4/video_core/renderer_metal/mtl_buffer.mm b/gpu/shadps4/video_core/renderer_metal/mtl_buffer.mm
+new file mode 100644
+index 0000000..8d613bc
+--- /dev/null
++++ b/gpu/shadps4/video_core/renderer_metal/mtl_buffer.mm
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport: MTLBuffer creation for the buffer cache (Metal-native renderer).
++
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++
++#include "video_core/renderer_metal/mtl_buffer.h"
++#include "video_core/renderer_metal/mtl_device.h"
++
++namespace Metal {
++
++namespace {
++
++MTLResourceOptions OptionsFor(VideoCore::MemoryType type) {
++    switch (type) {
++    case VideoCore::MemoryType::DeviceLocal:
++        return MTLResourceStorageModePrivate;
++    case VideoCore::MemoryType::HostUncached:
++        return MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined;
++    case VideoCore::MemoryType::HostCached:
++    case VideoCore::MemoryType::Stream:
++    default:
++        return MTLResourceStorageModeShared;
++    }
++}
++
++} // namespace
++
++Object CreateBuffer(Device& device, u64 size, VideoCore::MemoryType type, std::string_view label,
++                    u64* gpu_address, u8** contents) {
++    *gpu_address = 0;
++    *contents = nullptr;
++    id<MTLDevice> mtl_device = (__bridge id<MTLDevice>)device.NativeDevice();
++    id<MTLBuffer> buffer = [mtl_device newBufferWithLength:size options:OptionsFor(type)];
++    if (buffer == nil) {
++        return {};
++    }
++    if (!label.empty()) {
++        buffer.label = [[NSString alloc] initWithBytes:label.data()
++                                                length:label.size()
++                                              encoding:NSUTF8StringEncoding];
++    }
++    *gpu_address = buffer.gpuAddress;
++    if (type != VideoCore::MemoryType::DeviceLocal) {
++        *contents = static_cast<u8*>(buffer.contents);
++    }
++    return Object::Adopt((__bridge_retained void*)buffer);
++}
++
++} // namespace Metal
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_constant_ring.h b/gpu/shadps4/video_core/renderer_vulkan/vk_constant_ring.h
+index ae3348d..a81699a 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_constant_ring.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_constant_ring.h
+@@ -6,36 +6,38 @@
+ // the submission tick (Stamp), stage A retires stamps whose tick the GPU has passed.
+ 
+ #pragma once
+ 
+ #include <array>
+ #include <atomic>
+ 
+ #include "common/assert.h"
+ #include "common/types.h"
+ #include "video_core/buffer_cache/buffer.h"
+-#include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/renderer_metal/mtl_device.h"
++#include "video_core/renderer_metal/mtl_timeline.h"
+ 
+ namespace Vulkan {
+ 
+ class ConstantRing {
+ public:
+     static constexpr u64 Capacity = 32ull << 20;
+ 
+-    ConstantRing(const Instance& instance, Scheduler& scheduler_)
+-        : scheduler{scheduler_},
+-          buffer{instance, 0, Capacity, VideoCore::MemoryType::Stream, "bbport constant ring"} {
++    /// `timeline`: the ticks of the scheduler that records the draws reading the ring.
++    ConstantRing(Metal::Device& device, Metal::Timeline& timeline_)
++        : timeline{timeline_},
++          buffer{device, VideoCore::MemoryType::Stream, 0, Capacity, "bbport constant ring"} {
+         ASSERT(!buffer.mapped_data.empty());
+     }
+ 
+-    [[nodiscard]] vk::Buffer Handle() const noexcept {
+-        return buffer.Handle();
++    [[nodiscard]] Metal::BufferRef Handle() const noexcept {
++        return buffer.Ref();
+     }
+ 
+     /// Stage A: `size` bytes at `alignment`; returns the ring offset, or nullopt when the ring is
+     /// still in use by the GPU (the caller leaves the binding to stage B).
+     std::optional<u64> Allocate(u64 size, u64 alignment) {
+         u64 at = (position + alignment - 1) & ~(alignment - 1);
+         if (at % Capacity + size > Capacity) {
+             at += Capacity - at % Capacity; // wrap to the ring start
+         }
+         const auto in_use = [&] { return at + size > Capacity && at + size - Capacity > retired; };
+@@ -46,72 +48,65 @@ public:
+             }
+         }
+         position = at + size;
+         return at % Capacity;
+     }
+ 
+     [[nodiscard]] u8* Data(u64 offset) noexcept {
+         return buffer.mapped_data.data() + offset;
+     }
+ 
+-    /// Stage A, after writing: makes the bytes visible to the GPU.
+-    void Flush(u64 offset, u64 size) {
+-        buffer.Flush(offset, size);
+-    }
+-
+     /// Stage A: the position the next packet's allocations end at.
+     [[nodiscard]] u64 Position() const noexcept {
+         return position;
+     }
+ 
+     /// Stage B, after recording a packet whose allocations end at `end`. Stamps of one
+     /// submission tick are merged: only the last end per tick is published.
+     void Stamp(u64 end) {
+         if (end == pending_end) {
+             return;
+         }
+-        const u64 tick = scheduler.CurrentTick();
++        const u64 tick = timeline.CurrentTick();
+         if (tick != pending_tick && pending_end != last_published) {
+             Publish(pending_end, pending_tick);
+         }
+         pending_end = end;
+         pending_tick = tick;
+     }
+ 
+ private:
+     void Publish(u64 end, u64 tick) {
+         const u64 at = stamps_head.load(std::memory_order_relaxed);
+         if (at - stamps_tail.load(std::memory_order_acquire) >= stamps.size()) {
+             return; // full: this region retires with a later stamp
+         }
+         stamps[at % stamps.size()] = {end, tick};
+         stamps_head.store(at + 1, std::memory_order_release);
+         last_published = end;
+     }
+ 
+     void Retire() {
+-        auto* semaphore = scheduler.GetWorkSemaphore();
+-        semaphore->Refresh();
+         u64 at = stamps_tail.load(std::memory_order_relaxed);
+         const u64 head = stamps_head.load(std::memory_order_acquire);
+-        while (at < head && semaphore->IsFree(stamps[at % stamps.size()].tick)) {
++        while (at < head && timeline.IsFree(stamps[at % stamps.size()].tick)) {
+             retired = stamps[at % stamps.size()].end;
+             ++at;
+         }
+         stamps_tail.store(at, std::memory_order_release);
+     }
+ 
+     struct StampEntry {
+         u64 end;
+         u64 tick;
+     };
+-    Scheduler& scheduler;
++    Metal::Timeline& timeline;
+     VideoCore::Buffer buffer;
+     u64 position = 0;     ///< stage A
+     u64 retired = 0;      ///< stage A: the GPU is done with everything before this
+     u64 pending_end = 0, pending_tick = 0, last_published = 0; ///< stage B
+     std::array<StampEntry, 1024> stamps{};
+     alignas(64) std::atomic<u64> stamps_head{0}; ///< stage B writes
+     alignas(64) std::atomic<u64> stamps_tail{0}; ///< stage A reads
+ };
+ 
+ } // namespace Vulkan
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 089c503..5e5b2af 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -4,22 +4,21 @@
+ #include "bbport_toggles.h"
+ #include <algorithm>
+ #include <bit>
+ #include <cstdlib>
+ #include <cstring>
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
+ #include "common/types.h"
+ #include "core/devtools/widget/gpu_memory.h"
+-#include "video_core/renderer_vulkan/vk_instance.h"
+-#include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/renderer_metal/mtl_device.h"
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ 
+ namespace Vulkan {
+ 
+ using VideoCore::MemoryType;
+ 
+ namespace {
+ 
+ // bbport: staging memory is populated (allocated and cleared) by the kernel on first CPU access,
+ // ~2 ms per 16 MiB block. Streaming bursts a few seconds apart re-created the blocks trimmed
+@@ -31,29 +30,29 @@ constexpr u64 PREWARM_BLOCKS = 8;
+ constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
+ constexpr u64 BLOCK_SIZE = 16_MB;
+ 
+ u64 RoundAllocationSize(u64 size) {
+     const u64 step = std::max(std::bit_floor(size) / 4, LARGE_MIN_GRANULARITY);
+     return Common::AlignUp(size, step);
+ }
+ 
+ } // Anonymous namespace
+ 
+-StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
+-    : instance{instance_}, scheduler{scheduler_} {
++StagingBufferPool::StagingBufferPool(Metal::Device& device_, Metal::Timeline& timeline_)
++    : device{device_}, timeline{timeline_} {
+     const char* env = std::getenv("BB_STAGING_KEEP_MB");
+     keep_blocks = (env ? std::strtoull(env, nullptr, 10) : 512) * 1_MB / BLOCK_SIZE;
+     Ring& ring = rings[u32(MemoryType::HostUncached)];
+     for (u64 i = 0; i < PREWARM_BLOCKS; ++i) {
+         auto& block = ring.blocks.emplace_back(Block{
+             .buffer = std::make_unique<VideoCore::StreamBuffer>(
+-                instance, scheduler, MemoryType::HostUncached, BLOCK_SIZE),
++                device, timeline, MemoryType::HostUncached, BLOCK_SIZE),
+             .last_used_frame = frame,
+         });
+         if (!block.buffer->mapped_data.empty()) {
+             std::memset(block.buffer->mapped_data.data(), 0, block.buffer->mapped_data.size());
+         }
+     }
+ }
+ 
+ StagingBufferPool::~StagingBufferPool() = default;
+ 
+@@ -77,21 +76,21 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
+             ring.current = index;
+             best = block;
+             best_offset = *offset;
+             break;
+         }
+     }
+ 
+     if (!best) {
+         best = &ring.blocks.emplace_back(Block{
+             .buffer =
+-                std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type, BLOCK_SIZE),
++                std::make_unique<VideoCore::StreamBuffer>(device, timeline, type, BLOCK_SIZE),
+             .last_used_frame = frame,
+         });
+         ring.current = ring.blocks.size() - 1;
+         best_offset = *best->buffer->Reserve(size, alignment, false);
+     }
+ 
+     auto& buffer = *best->buffer;
+     best->last_used_frame = frame;
+ 
+     StagingBufferRef ref{
+@@ -107,39 +106,39 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
+ }
+ 
+ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool deferred) {
+     auto& cache = large_caches[u32(type)];
+     const u64 max_size = std::max(size + size / 4, RoundAllocationSize(size));
+ 
+     LargeBuffer* best{};
+     for (LargeBuffer& entry : cache) {
+         const u64 entry_size = entry.buffer->SizeBytes();
+         if (entry.held || entry_size < size || entry_size > max_size ||
+-            !scheduler.IsFree(entry.tick)) {
++            !timeline.IsFree(entry.tick)) {
+             continue;
+         }
+         if (!best || entry_size < best->buffer->SizeBytes()) {
+             best = &entry;
+         }
+     }
+ 
+     if (!best) {
+         best = &cache.emplace_back(LargeBuffer{
+-            .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
+-                                                          type, "StagingBufferPool:Dedicated"),
++            .buffer = std::make_unique<VideoCore::Buffer>(device, type, 0, RoundAllocationSize(size),
++                                                          "StagingBufferPool:Dedicated"),
+             .tick = 0,
+             .last_used_frame = frame,
+             .held = false,
+         });
+     }
+ 
+-    best->tick = scheduler.CurrentTick();
++    best->tick = timeline.CurrentTick();
+     best->last_used_frame = frame;
+     best->held = deferred;
+ 
+     VideoCore::Buffer& buffer = *best->buffer;
+     StagingBufferRef ref{
+         .buffer = &buffer,
+         .offset = 0,
+         .size = size,
+         .type = type,
+     };
+@@ -148,59 +147,59 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
+     }
+     return ref;
+ }
+ 
+ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
+     auto& cache = large_caches[u32(ref.type)];
+     const auto it = std::ranges::find_if(
+         cache, [&](const LargeBuffer& entry) { return entry.buffer.get() == ref.buffer; });
+     ASSERT_MSG(it != cache.end() && it->held, "FreeDeferred on an allocation that is not held");
+     it->held = false;
+-    it->tick = scheduler.CurrentTick();
++    it->tick = timeline.CurrentTick();
+     it->last_used_frame = frame;
+ }
+ 
+ void StagingBufferPool::TickFrame() {
+     ++frame;
+     for (Ring& ring : rings) {
+         TrimRing(ring);
+     }
+     for (auto& cache : large_caches) {
+         TrimLarge(cache);
+     }
+     PublishStats();
+ }
+ 
+ void StagingBufferPool::TrimRing(Ring& ring) {
+     auto& blocks = ring.blocks;
+     for (size_t i = blocks.size(); i-- > 0;) {
+         const Block& block = blocks[i];
+         if (blocks.size() <= keep_blocks || frame - block.last_used_frame < RING_IDLE_FRAMES ||
+-            !scheduler.IsFree(block.buffer->LastTick())) {
++            !timeline.IsFree(block.buffer->LastTick())) {
+             continue;
+         }
+         blocks.erase(blocks.begin() + i);
+         if (i < ring.current) {
+             --ring.current;
+         } else if (i == ring.current) {
+             ring.current = 0;
+         }
+     }
+     if (ring.current >= blocks.size()) {
+         ring.current = 0;
+     }
+ }
+ 
+ void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
+     std::erase_if(cache, [this](const LargeBuffer& entry) {
+         return !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
+-               scheduler.IsFree(entry.tick);
++               timeline.IsFree(entry.tick);
+     });
+ }
+ 
+ void StagingBufferPool::PublishStats() const {
+     using namespace Core::Devtools::Widget;
+     if (!GpuMemoryViewer::IsEnabled()) {
+         return;
+     }
+     static constexpr std::array<const char*, NUM_TYPES> names = {"DeviceLocal", "HostUncached",
+                                                                  "HostCached"};
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 1ca0873..561ce4c 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -2,45 +2,36 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #pragma once
+ 
+ #include <array>
+ #include <memory>
+ #include <vector>
+ 
+ #include "common/types.h"
+ #include "video_core/buffer_cache/buffer.h"
++#include "video_core/renderer_metal/mtl_timeline.h"
+ 
+ namespace Vulkan {
+ 
+-class Instance;
+-class Scheduler;
+-
+ struct StagingBufferRef {
+     VideoCore::Buffer* buffer{};
+     u64 offset{};
+     u64 size{};
+     u8* mapped{};
+     VideoCore::MemoryType type{};
+-
+-    void Flush() const noexcept {
+-        buffer->Flush(offset, size);
+-    }
+-
+-    void Invalidate() const noexcept {
+-        buffer->Invalidate(offset, size);
+-    }
+ };
+ 
+ class StagingBufferPool {
+ public:
+-    explicit StagingBufferPool(const Instance& instance, Scheduler& scheduler);
++    /// `timeline`: the ticks of the scheduler whose commands read the staged data.
++    explicit StagingBufferPool(Metal::Device& device, Metal::Timeline& timeline);
+     ~StagingBufferPool();
+ 
+     StagingBufferPool(const StagingBufferPool&) = delete;
+     StagingBufferPool& operator=(const StagingBufferPool&) = delete;
+ 
+     /// Requests size bytes of memory of the given type.
+     [[nodiscard]] StagingBufferRef Request(u64 size, VideoCore::MemoryType type, u64 alignment = 0,
+                                            bool deferred = false);
+ 
+     /// Releases a deferred allocation. It becomes reusable once the current tick completes.
+@@ -71,20 +62,20 @@ private:
+ 
+     StagingBufferRef RequestFromRing(Ring& ring, u64 size, u64 alignment,
+                                      VideoCore::MemoryType type);
+     StagingBufferRef RequestLarge(u64 size, VideoCore::MemoryType type, bool deferred);
+ 
+     void TrimRing(Ring& ring);
+     void TrimLarge(std::vector<LargeBuffer>& cache);
+ 
+     void PublishStats() const;
+ 
+-    const Instance& instance;
+-    Scheduler& scheduler;
++    Metal::Device& device;
++    Metal::Timeline& timeline;
+ 
+     std::array<Ring, NUM_TYPES> rings;
+     u64 keep_blocks = 0; ///< bbport: ring blocks never trimmed
+     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
+     u64 frame = 0;
+ };
+ 
+ } // namespace Vulkan
+diff --git a/tests/test_mtl_encoder.mm b/tests/test_mtl_encoder.mm
+index 77bea30..354005c 100644
+--- a/tests/test_mtl_encoder.mm
++++ b/tests/test_mtl_encoder.mm
+@@ -7,20 +7,21 @@
+ 
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdlib>
+ #include <cstdio>
+ #include <cstring>
+ #include <map>
+ #include <thread>
+ #include <vector>
++#include "video_core/renderer_metal/mtl_buffer.h"
+ #include "video_core/renderer_metal/mtl_object.h"
+ #include "video_core/renderer_metal/mtl_device.h"
+ #include "video_core/renderer_metal/mtl_encoder.h"
+ #include "video_core/renderer_metal/mtl_depth_stencil.h"
+ #include "video_core/renderer_metal/mtl_specialize.h"
+ #include "video_core/renderer_metal/mtl_timeline.h"
+ 
+ namespace {
+ 
+ int failures = 0;
+@@ -799,20 +800,34 @@ void TestTimelines() {
+     for (u64 t = 0; t <= 302; ++t) {
+         all_free = all_free && a.IsFree(t);
+     }
+     Expect(all_free && a.KnownGpuTick() == 302, "every committed tick is free after the last");
+     Expect(!a.IsFree(303), "the next tick is still not free");
+     Expect(a.PendingCount() == 0, "completed mappings are dropped");
+     device.Finish();
+     Expect(b.KnownGpuTick() == 102 && b.PendingCount() == 0, "B's mappings pruned too");
+ }
+ 
++void TestBufferCreation() {
++    Metal::Device device;
++    u64 stream_address = 0, private_address = 0;
++    u8 *stream_contents = nullptr, *private_contents = nullptr;
++    Metal::Object stream = Metal::CreateBuffer(device, 64, VideoCore::MemoryType::Stream, "test",
++                                               &stream_address, &stream_contents);
++    Metal::Object priv = Metal::CreateBuffer(device, 64, VideoCore::MemoryType::DeviceLocal, "",
++                                             &private_address, &private_contents);
++    Expect(stream && priv, "buffers created");
++    Expect(stream_contents != nullptr, "Stream buffer has CPU contents");
++    Expect(private_contents == nullptr, "DeviceLocal buffer has no CPU contents");
++    Expect(stream_address != 0 && private_address != 0, "both buffers have a GPU address");
++}
++
+ int main() {
+     @autoreleasepool {
+         TestObject();
+         TestTicks();
+         TestDeviceLifetime();
+         TestBlits();
+         TestKeepAlive();
+         TestWaitMeansCompleted();
+         TestCompute();
+         TestLargeBytes();
+@@ -825,18 +840,19 @@ int main() {
+         TestCopyInPassSeesClear();
+         TestScissorClampedToTarget();
+         TestFillPattern();
+         TestSubmitResetsBindings();
+         TestUntrackedRunsFirst();
+         TestIndirectResidency();
+         TestDepthAspectCopy();
+         TestSpecialize();
+         TestDepthStencilCache();
+         TestTimelines();
++        TestBufferCreation();
+     }
+     if (failures) {
+         std::printf("FAILED: %d check(s)\n", failures);
+         return 1;
+     }
+     std::printf("PASS: Metal-native foundation (object, device ticks, encoder)\n");
+     return 0;
+ }

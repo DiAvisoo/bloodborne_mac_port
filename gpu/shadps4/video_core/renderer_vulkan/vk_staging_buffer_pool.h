@@ -9,9 +9,14 @@
 
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
-#include "video_core/renderer_metal/mtl_timeline.h"
+
+namespace Metal {
+class Device;
+}
 
 namespace Vulkan {
+
+class Scheduler;
 
 struct StagingBufferRef {
     VideoCore::Buffer* buffer{};
@@ -23,8 +28,7 @@ struct StagingBufferRef {
 
 class StagingBufferPool {
 public:
-    /// `timeline`: the ticks of the scheduler whose commands read the staged data.
-    explicit StagingBufferPool(Metal::Device& device, Metal::Timeline& timeline);
+    explicit StagingBufferPool(Metal::Device& device, Scheduler& scheduler);
     ~StagingBufferPool();
 
     StagingBufferPool(const StagingBufferPool&) = delete;
@@ -70,7 +74,7 @@ private:
     void PublishStats() const;
 
     Metal::Device& device;
-    Metal::Timeline& timeline;
+    Scheduler& scheduler;
 
     std::array<Ring, NUM_TYPES> rings;
     u64 keep_blocks = 0; ///< bbport: ring blocks never trimmed

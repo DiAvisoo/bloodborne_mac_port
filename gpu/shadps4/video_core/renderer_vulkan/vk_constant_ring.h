@@ -14,7 +14,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_metal/mtl_device.h"
-#include "video_core/renderer_metal/mtl_timeline.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
 
@@ -22,9 +22,8 @@ class ConstantRing {
 public:
     static constexpr u64 Capacity = 32ull << 20;
 
-    /// `timeline`: the ticks of the scheduler that records the draws reading the ring.
-    ConstantRing(Metal::Device& device, Metal::Timeline& timeline_)
-        : timeline{timeline_},
+    ConstantRing(Metal::Device& device, Scheduler& scheduler_)
+        : scheduler{scheduler_},
           buffer{device, VideoCore::MemoryType::Stream, 0, Capacity, "bbport constant ring"} {
         ASSERT(!buffer.mapped_data.empty());
     }
@@ -66,7 +65,7 @@ public:
         if (end == pending_end) {
             return;
         }
-        const u64 tick = timeline.CurrentTick();
+        const u64 tick = scheduler.CurrentTick();
         if (tick != pending_tick && pending_end != last_published) {
             Publish(pending_end, pending_tick);
         }
@@ -88,7 +87,7 @@ private:
     void Retire() {
         u64 at = stamps_tail.load(std::memory_order_relaxed);
         const u64 head = stamps_head.load(std::memory_order_acquire);
-        while (at < head && timeline.IsFree(stamps[at % stamps.size()].tick)) {
+        while (at < head && scheduler.IsFree(stamps[at % stamps.size()].tick)) {
             retired = stamps[at % stamps.size()].end;
             ++at;
         }
@@ -99,7 +98,7 @@ private:
         u64 end;
         u64 tick;
     };
-    Metal::Timeline& timeline;
+    Scheduler& scheduler;
     VideoCore::Buffer buffer;
     u64 position = 0;     ///< stage A
     u64 retired = 0;      ///< stage A: the GPU is done with everything before this

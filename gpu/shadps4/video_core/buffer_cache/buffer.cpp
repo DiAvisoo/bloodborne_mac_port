@@ -10,7 +10,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_metal/mtl_buffer.h"
 #include "video_core/renderer_metal/mtl_device.h"
-#include "video_core/renderer_metal/mtl_timeline.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace VideoCore {
 
@@ -59,11 +59,11 @@ Buffer::Buffer(Metal::Device& device, MemoryType mem_type_, VAddr cpu_addr_, u64
 constexpr u64 WATCHES_INITIAL_RESERVE = 0x100;
 constexpr u64 WATCHES_RESERVE_CHUNK = 0x100;
 
-StreamBuffer::StreamBuffer(Metal::Device& device, Metal::Timeline& timeline_,
+StreamBuffer::StreamBuffer(Metal::Device& device, Vulkan::Scheduler& scheduler_,
                            MemoryType mem_type, u64 size_bytes)
     : Buffer{device, mem_type, 0, size_bytes,
              fmt::format("StreamBuffer({}):{:#x}", BufferTypeName(mem_type), size_bytes)},
-      timeline{timeline_} {
+      scheduler{scheduler_} {
     ReserveWatches(current_watches, WATCHES_INITIAL_RESERVE);
     ReserveWatches(previous_watches, WATCHES_INITIAL_RESERVE);
 }
@@ -120,7 +120,7 @@ std::optional<u64> StreamBuffer::Reserve(u64 size, u64 alignment, bool allow_wai
 
 void StreamBuffer::AdvanceAndWatch() {
     offset += mapped_size;
-    const u64 tick = timeline.CurrentTick();
+    const u64 tick = scheduler.CurrentTick();
     last_tick = tick;
 
     // Extend the last watch if it belongs to the same tick.
@@ -149,10 +149,10 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
     }
     while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
         auto& watch = previous_watches[wait_cursor];
-        if (!timeline.IsFree(watch.tick) && !allow_wait) {
+        if (!scheduler.IsFree(watch.tick) && !allow_wait) {
             return false;
         }
-        timeline.Wait(watch.tick);
+        scheduler.Wait(watch.tick);
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

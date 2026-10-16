@@ -1,0 +1,608 @@
+# Review package: 8eec341..HEAD
+
+## Commits
+9de9df8 Metal-native M2: per-scheduler tick timelines over the shared device (deferred ops and waits see only their own scheduler's work)
+
+## Files changed
+ gpu/CMakeLists.txt                                 |  3 +-
+ .../video_core/renderer_metal/mtl_timeline.cpp     | 71 +++++++++++++++++++
+ .../video_core/renderer_metal/mtl_timeline.h       | 57 +++++++++++++++
+ .../video_core/renderer_vulkan/vk_scheduler.cpp    | 34 ++++-----
+ .../video_core/renderer_vulkan/vk_scheduler.h      | 24 +++++--
+ tests/test_mtl_encoder.mm                          | 82 ++++++++++++++++++++++
+ 6 files changed, 248 insertions(+), 23 deletions(-)
+
+## Diff
+diff --git a/gpu/CMakeLists.txt b/gpu/CMakeLists.txt
+index 4bbd33d..a1834f1 100644
+--- a/gpu/CMakeLists.txt
++++ b/gpu/CMakeLists.txt
+@@ -189,35 +189,36 @@ if (APPLE)
+         find_package(spirv_cross_glsl CONFIG REQUIRED)
+         find_package(spirv_cross_msl CONFIG REQUIRED)
+         # Metal-native core (docs/superpowers/plans/2026-10-16-metal-native-m2-scheduler-caches.md):
+         # device, encoder and helpers with no renderer dependencies; unit tests link it alone.
+         set(METAL_CORE_SOURCES
+             shadps4/video_core/renderer_metal/mtl_object.cpp
+             shadps4/video_core/renderer_metal/mtl_device.mm
+             shadps4/video_core/renderer_metal/mtl_encoder.mm
+             shadps4/video_core/renderer_metal/mtl_depth_stencil.mm
+             shadps4/video_core/renderer_metal/mtl_specialize.cpp
++            shadps4/video_core/renderer_metal/mtl_timeline.cpp
+             shadps4/video_core/renderer_metal/vk_to_mtl.mm)
+         add_library(bbmetal_core STATIC ${METAL_CORE_SOURCES})
+         target_include_directories(bbmetal_core PRIVATE shim shadps4 ${SHADER_INCLUDE})
+         target_compile_features(bbmetal_core PRIVATE cxx_std_20)
+         target_link_libraries(bbmetal_core PRIVATE fmt::fmt)
+         set_target_properties(bbmetal_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+         foreach(source IN LISTS METAL_CORE_SOURCES)
+             if (source MATCHES "\\.mm$")
+                 set_source_files_properties(${source} TARGET_DIRECTORY bbmetal_core PROPERTIES
+                     COMPILE_OPTIONS "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
+             endif()
+         endforeach()
+         file(GLOB METAL_SOURCES CONFIGURE_DEPENDS shadps4/video_core/renderer_metal/*.cpp
+              shadps4/video_core/renderer_metal/*.mm)
+-        list(REMOVE_ITEM METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_object.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_device.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_encoder.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_depth_stencil.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_specialize.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/vk_to_mtl.mm)
++        list(REMOVE_ITEM METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_object.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_device.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_encoder.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_depth_stencil.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_specialize.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_timeline.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/vk_to_mtl.mm)
+         target_sources(bbgpu PRIVATE ${METAL_SOURCES})
+         target_link_libraries(bbgpu PRIVATE bbmetal_core "-framework Metal" "-framework Foundation")
+         foreach(source IN LISTS METAL_SOURCES)
+             if (source MATCHES "\\.mm$")
+                 # No Vulkan Metal-surface types here: under ARC their CAMetalLayer pointer breaks
+                 # vulkan.hpp's constexpr templates.
+                 set_source_files_properties(${source} PROPERTIES COMPILE_OPTIONS
+                     "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
+             endif()
+         endforeach()
+diff --git a/gpu/shadps4/video_core/renderer_metal/mtl_timeline.cpp b/gpu/shadps4/video_core/renderer_metal/mtl_timeline.cpp
+new file mode 100644
+index 0000000..739b3f2
+--- /dev/null
++++ b/gpu/shadps4/video_core/renderer_metal/mtl_timeline.cpp
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport: per-scheduler logical ticks over the shared Metal::Device (Metal-native renderer).
++
++#include "video_core/renderer_metal/mtl_timeline.h"
++
++#include "common/assert.h"
++#include "video_core/renderer_metal/mtl_device.h"
++
++namespace Metal {
++
++Timeline::Timeline(Device& device_) : device{device_} {}
++
++void Timeline::Refresh() const {
++    while (!pending.empty() && device.IsFree(pending.front().device)) {
++        known.store(pending.front().logical, std::memory_order_release);
++        pending.pop_front();
++    }
++}
++
++u64 Timeline::KnownGpuTick() const {
++    std::scoped_lock lock{mutex};
++    Refresh();
++    return known.load(std::memory_order_acquire);
++}
++
++bool Timeline::IsFree(u64 tick) const {
++    if (tick <= known.load(std::memory_order_acquire)) {
++        return true;
++    }
++    if (tick >= CurrentTick()) {
++        return false;
++    }
++    std::scoped_lock lock{mutex};
++    Refresh();
++    return tick <= known.load(std::memory_order_acquire);
++}
++
++void Timeline::Wait(u64 tick) {
++    ASSERT_MSG(tick < CurrentTick(), "Waiting for logical tick {} that was never committed", tick);
++    u64 device_tick;
++    {
++        std::scoped_lock lock{mutex};
++        Refresh();
++        if (tick <= known.load(std::memory_order_acquire)) {
++            return;
++        }
++        // Logical ticks are consecutive: the front mapping is known + 1.
++        device_tick = pending[tick - pending.front().logical].device;
++    }
++    device.Wait(device_tick);
++}
++
++u64 Timeline::Committed(u64 device_tick) {
++    std::scoped_lock lock{mutex};
++    ASSERT_MSG(device_tick != 0, "Timeline: an untracked commit has no device tick");
++    ASSERT_MSG(pending.empty() || device_tick > pending.back().device,
++               "Timeline: device tick {} is not after this timeline's last one", device_tick);
++    const u64 logical = current.load(std::memory_order_relaxed);
++    pending.push_back({logical, device_tick});
++    current.store(logical + 1, std::memory_order_release);
++    Refresh();
++    return logical;
++}
++
++size_t Timeline::PendingCount() const {
++    std::scoped_lock lock{mutex};
++    Refresh();
++    return pending.size();
++}
++
++} // namespace Metal
+diff --git a/gpu/shadps4/video_core/renderer_metal/mtl_timeline.h b/gpu/shadps4/video_core/renderer_metal/mtl_timeline.h
+new file mode 100644
+index 0000000..ffc00a2
+--- /dev/null
++++ b/gpu/shadps4/video_core/renderer_metal/mtl_timeline.h
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport: per-scheduler logical ticks over the shared Metal::Device (Metal-native renderer).
++
++#pragma once
++
++#include <atomic>
++#include <deque>
++#include <mutex>
++#include "common/types.h"
++
++namespace Metal {
++
++class Device;
++
++/// The ticks of one submitter (a Scheduler) on a Device that several submitters share. Each
++/// commit gets the next logical tick (1, 2, ...) mapped to the device tick it signalled, so a
++/// tick of this timeline only ever means this timeline's own command buffer. Thread-safe.
++class Timeline {
++public:
++    explicit Timeline(Device& device);
++
++    Timeline(const Timeline&) = delete;
++    Timeline& operator=(const Timeline&) = delete;
++
++    /// The logical tick the next commit gets (starts at 1).
++    [[nodiscard]] u64 CurrentTick() const noexcept {
++        return current.load(std::memory_order_acquire);
++    }
++    /// The highest logical tick whose command buffer completed.
++    [[nodiscard]] u64 KnownGpuTick() const;
++    /// True when `tick` (and every tick before it) completed. Tick 0 always is; an uncommitted
++    /// tick never is.
++    [[nodiscard]] bool IsFree(u64 tick) const;
++    /// Blocks until `tick` completed. `tick` must have been committed (asserted).
++    void Wait(u64 tick);
++    /// Records that this timeline's next commit signalled `device_tick` (a tracked
++    /// Device::Commit, later than this timeline's previous one) and returns its logical tick.
++    u64 Committed(u64 device_tick);
++    /// Committed ticks not yet known complete (their mappings), for tests.
++    [[nodiscard]] size_t PendingCount() const;
++
++private:
++    struct Mapping {
++        u64 logical;
++        u64 device;
++    };
++    /// Drops the mappings whose device tick completed (they complete in order on one queue).
++    void Refresh() const;
++
++    Device& device;
++    std::atomic<u64> current{1};
++    mutable std::atomic<u64> known{0};
++    mutable std::mutex mutex;
++    mutable std::deque<Mapping> pending; ///< logical ticks known+1 .. current-1, in order
++};
++
++} // namespace Metal
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.cpp b/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.cpp
+index 5c062dc..ccadcf5 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -435,61 +435,60 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
+     }
+ }
+ 
+ void Scheduler::Flush() {
+     // When flushing, we only send data to the driver; no waiting is necessary.
+     SubmitExecution();
+ }
+ 
+ void Scheduler::Finish() {
+     // When finishing, we need to wait for the submission to have executed on the device.
+-    const u64 presubmit_tick = CurrentTick();
+-    Flush();
++    const u64 tick = SubmitExecution();
+     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
+-    device.Wait(presubmit_tick);
++    timeline.Wait(tick);
+ }
+ 
+ void Scheduler::Wait(u64 tick) {
+     if (tick >= CurrentTick()) {
+         // Make sure we are not waiting for the current tick without signalling
+         Flush();
+     }
+     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
+-    device.Wait(tick);
++    timeline.Wait(tick);
+ }
+ 
+ void Scheduler::PopPendingOperations() {
+     if (num_pending_ops.load(std::memory_order_acquire) == 0) {
+         return; // every draw comes here
+     }
+-    // Reading the known GPU tick is an atomic load (Metal completion handlers raise it), so
+-    // there is no polling limit.
++    // Checking a tick reads atomics that Metal completion handlers raise (no ioctl), so there is
++    // no polling limit.
+     std::unique_lock lk(pending_ops_mutex);
+-    while (!pending_ops.empty() && device.IsFree(pending_ops.front().gpu_tick)) {
++    while (!pending_ops.empty() && timeline.IsFree(pending_ops.front().gpu_tick)) {
+         pending_ops.front().callback();
+         pending_ops.pop();
+         num_pending_ops.fetch_sub(1, std::memory_order_release);
+     }
+ }
+ 
+ void Scheduler::RecordHoistedCopy(Metal::BufferRef src, Metal::BufferRef dst,
+                                   std::span<const VideoCore::BufferCopy> copies,
+                                   [[maybe_unused]] bool ordered) {
+     std::scoped_lock lk{upload_mutex};
+     upload_open = true;
+     for (const VideoCore::BufferCopy& c : copies) {
+         upload_encoder.CopyBuffer({src.buffer, src.offset + c.src_offset},
+                                   {dst.buffer, dst.offset + c.dst_offset}, c.size);
+     }
+ }
+ 
+-void Scheduler::SubmitExecution() {
++u64 Scheduler::SubmitExecution() {
+     std::scoped_lock lk{submit_mutex};
+     const u64 signal_value = CurrentTick();
+ 
+     if (on_submit) {
+         on_submit();
+     }
+ 
+     EndRendering();
+     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
+         // Until the next submission's first timestamp: mostly the GPU waiting for it.
+@@ -503,70 +502,71 @@ void Scheduler::SubmitExecution() {
+     // submission, whose tick covers them); held until the main commit so no copy recorded
+     // meanwhile lands in a later upload command buffer than the commands that need it.
+     std::unique_lock upload_lock{upload_mutex};
+     if (upload_open) {
+         upload_encoder.SubmitUntracked();
+         upload_open = false;
+     }
+ 
+     ImGui::Core::TextureManager::Submit(); // ImGui textures: M5
+     const u64 submit_start = bbport::CpuCycles();
+-    const u64 tick = encoder.Submit();
++    const u64 tick = timeline.Committed(encoder.Submit());
+     BbStats::queue_submit_ns.fetch_add(bbport::CyclesToNs(bbport::CpuCycles() - submit_start),
+                                        std::memory_order_relaxed);
+     BbStats::queue_submits.fetch_add(1, std::memory_order_relaxed);
+     ASSERT_MSG(tick == signal_value, "Submission signalled tick {}, expected {}", tick,
+                signal_value);
+     upload_lock.unlock();
+ 
+     // A new command buffer starts without state (Encoder::Submit clears it): apply it again.
+     dynamic_state.Invalidate();
+ 
+-    // The priority-ops thread waits for ticks to be committed before waiting on the GPU; taking
+-    // its mutex first means it is either before its check or already waiting (no lost wakeup).
++    // The priority-ops thread waits for its tick to be committed before waiting on the GPU;
++    // taking its mutex first means it is either before its check or already waiting (no lost
++    // wakeup).
+     {
+         std::scoped_lock ops_lock{priority_pending_ops_mutex};
+     }
+     priority_pending_ops_cv.notify_all();
+ 
+     // Apply pending operations
+     PopPendingOperations();
++    return tick;
+ }
+ 
+ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
+     Common::SetCurrentThreadName("shadPS4:GpuSchedPriorityPendingOpsRunner");
+ 
+     while (!stoken.stop_requested()) {
+         PendingOp op;
+         {
+             std::unique_lock lk(priority_pending_ops_mutex);
+             priority_pending_ops_cv.wait(lk, stoken,
+                                          [this] { return !priority_pending_ops.empty(); });
+             if (stoken.stop_requested()) {
+                 break;
+             }
+ 
+             op = std::move(priority_pending_ops.front());
+             priority_pending_ops.pop();
+         }
+ 
+-        // Ticks are deferred before they are committed (Device::Wait needs a committed one);
+-        // any scheduler's commit on the device may cover it, hence the timed re-check.
++        // Ticks are deferred before they are committed (Timeline::Wait needs a committed one);
++        // only this scheduler's own submission commits it, and it notifies.
+         {
+             std::unique_lock lk(priority_pending_ops_mutex);
+-            while (op.gpu_tick >= device.CurrentTick() && !stoken.stop_requested()) {
+-                priority_pending_ops_cv.wait_for(lk, std::chrono::milliseconds(1));
+-            }
++            priority_pending_ops_cv.wait(lk, stoken,
++                                         [&] { return op.gpu_tick < timeline.CurrentTick(); });
+         }
+         if (stoken.stop_requested()) {
+             break;
+         }
+-        device.Wait(op.gpu_tick);
++        timeline.Wait(op.gpu_tick);
+         if (stoken.stop_requested()) {
+             break;
+         }
+ 
+         op.callback();
+     }
+ }
+ 
+ } // namespace Vulkan
+diff --git a/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.h b/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.h
+index e03a8ab..45656b5 100644
+--- a/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.h
++++ b/gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.h
+@@ -27,20 +27,21 @@
+ #include "common/interval_set.h"
+ #include "common/logging/log.h"
+ #include "common/unique_function.h"
+ #include "video_core/amdgpu/regs_color.h"
+ #include "video_core/amdgpu/regs_primitive.h"
+ #include "video_core/buffer_cache/buffer_copy.h"
+ #include "video_core/renderer_metal/mtl_depth_stencil.h"
+ #include "video_core/renderer_metal/mtl_device.h"
+ #include "video_core/renderer_metal/mtl_encoder.h"
+ #include "video_core/renderer_metal/mtl_raster_util.h"
++#include "video_core/renderer_metal/mtl_timeline.h"
+ #include "video_core/renderer_vulkan/vk_common.h"
+ 
+ namespace Vulkan {
+ 
+ /// bbport: BB_PASS_LOG=<file>: the render passes recorded into each submission, by the tick it
+ /// signals (vk_scheduler.cpp).
+ namespace BbPassLog {
+ bool Enabled();
+ void Pass(u64 tick, const std::string& label);
+ } // namespace BbPassLog
+@@ -805,28 +806,39 @@ public:
+     }
+ 
+     /// Whether BeginRendering(state) would start a new render pass.
+     [[nodiscard]] bool WillBeginRendering(const RenderState& state) const {
+         return !(is_rendering && render_state == state);
+     }
+ 
+     /// DirectEncoder() calls that waited for a recording thread (BB_FRAME_STATS).
+     static inline std::atomic<u64> direct_recordings{0};
+ 
+-    /// The tick the next submission signals.
++    /// The tick this scheduler's next submission gets (its own timeline: other schedulers on
++    /// the device do not advance it).
+     [[nodiscard]] u64 CurrentTick() const noexcept {
+-        return device.CurrentTick();
++        return timeline.CurrentTick();
+     }
+ 
+-    /// Returns true when the GPU completed the command buffers up to `tick`.
++    /// Returns true when the GPU completed this scheduler's submissions up to `tick`.
+     [[nodiscard]] bool IsFree(u64 tick) const {
+-        return device.IsFree(tick);
++        return timeline.IsFree(tick);
++    }
++
++    /// The highest of this scheduler's ticks known complete.
++    [[nodiscard]] u64 KnownGpuTick() const {
++        return timeline.KnownGpuTick();
++    }
++
++    /// This scheduler's ticks, for tick users that are not the scheduler (staging, rings).
++    [[nodiscard]] Metal::Timeline& GetTimeline() noexcept {
++        return timeline;
+     }
+ 
+     [[nodiscard]] Metal::Device& GetDevice() noexcept {
+         return device;
+     }
+ 
+     /// MTLDepthStencilStates by key (DynamicState::CommitWith).
+     [[nodiscard]] Metal::DepthStencilCache& GetDepthStencilCache() noexcept {
+         return depth_stencil;
+     }
+@@ -850,26 +862,28 @@ public:
+     }
+ 
+     /// One committer at a time across schedulers (Device::Commit hands out ticks in commit order).
+     static std::mutex submit_mutex;
+ 
+ private:
+     std::unique_ptr<RecordChunk> AcquireChunk();
+ 
+     void RecorderThread(std::stop_token stoken);
+ 
+-    void SubmitExecution();
++    /// Returns the tick (of this scheduler's timeline) the submission got.
++    u64 SubmitExecution();
+ 
+     void PriorityPendingOpsThread(std::stop_token stoken);
+ 
+ private:
+     Metal::Device& device;
++    Metal::Timeline timeline{device};
+     Metal::Encoder encoder{device};
+     /// bbport: this submission's hoisted copies, recorded on the calling thread while the
+     /// recorder thread encodes into `encoder`.
+     Metal::Encoder upload_encoder{device};
+     std::mutex upload_mutex; ///< upload_encoder and upload_open
+     bool upload_open{};
+     Metal::DepthStencilCache depth_stencil{device};
+     DynamicState dynamic_state;
+     std::function<void()> on_submit{};
+     struct PendingOp {
+diff --git a/tests/test_mtl_encoder.mm b/tests/test_mtl_encoder.mm
+index ee3860e..77bea30 100644
+--- a/tests/test_mtl_encoder.mm
++++ b/tests/test_mtl_encoder.mm
+@@ -1,30 +1,32 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ // bbport: unit test for the Metal-native foundation (docs/superpowers/plans/
+ // 2026-10-16-metal-native-m1-device-encoder.md): Metal::Object, Metal::Device ticks and limits,
+ // Metal::Encoder blits, dispatches, render passes and draws, on the system's GPU. No window.
+ #import <Foundation/Foundation.h>
+ #import <Metal/Metal.h>
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cstdlib>
+ #include <cstdio>
+ #include <cstring>
+ #include <map>
+ #include <thread>
+ #include <vector>
+ #include "video_core/renderer_metal/mtl_object.h"
+ #include "video_core/renderer_metal/mtl_device.h"
+ #include "video_core/renderer_metal/mtl_encoder.h"
+ #include "video_core/renderer_metal/mtl_depth_stencil.h"
+ #include "video_core/renderer_metal/mtl_specialize.h"
++#include "video_core/renderer_metal/mtl_timeline.h"
+ 
+ namespace {
+ 
+ int failures = 0;
+ 
+ void Expect(bool ok, const char* what) {
+     if (!ok) {
+         std::printf("FAIL: %s\n", what);
+         ++failures;
+     }
+@@ -718,20 +720,99 @@ void TestDepthAspectCopy() {
+                                 Metal::BlitAspect::Depth);
+     encoder.CopyTextureToBuffer((__bridge void*)ds, 0, 0, {}, {4, 4, 1}, Ref(stencil), 4, 16,
+                                 Metal::BlitAspect::Stencil);
+     device.Wait(encoder.Submit());
+     Expect(static_cast<const float*>(depth.contents)[5] == 0.5f, "depth aspect copied");
+     Expect(static_cast<const u8*>(stencil.contents)[5] == 7, "stencil aspect copied");
+ }
+ 
+ } // namespace
+ 
++/// Two schedulers' timelines on one device: each counts its own commits 1, 2, ... and a tick of
++/// one timeline means that timeline's command buffer, whatever the other committed in between.
++void TestTimelines() {
++    Metal::Device device;
++    Metal::Encoder enc_a{device}, enc_b{device};
++    Metal::Timeline a{device}, b{device};
++    Expect(a.CurrentTick() == 1 && b.CurrentTick() == 1 && a.KnownGpuTick() == 0,
++           "timelines start at 1");
++    Expect(a.IsFree(0), "tick 0 is always free");
++    Expect(!a.IsFree(1), "an uncommitted logical tick is not free");
++
++    id<MTLBuffer> buffer = SharedBuffer(device, 4096);
++    enc_a.FillBuffer(Ref(buffer), 4096, 0x01010101u);
++    const u64 a1 = a.Committed(enc_a.Submit());
++    enc_b.FillBuffer(Ref(buffer), 4096, 0x02020202u);
++    const u64 b1 = b.Committed(enc_b.Submit());
++    enc_b.FillBuffer(Ref(buffer), 4096, 0x03030303u);
++    const u64 b2 = b.Committed(enc_b.Submit());
++
++    // A's second command buffer waits for an event the CPU signals later.
++    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
++    id<MTLSharedEvent> gate = [dev newSharedEvent];
++    id<MTLCommandBuffer> gated = (__bridge id<MTLCommandBuffer>)enc_a.CommandBuffer();
++    [gated encodeWaitForEvent:gate value:1];
++    enc_a.FillBuffer(Ref(buffer), 4096, 0x04040404u);
++    const u64 a2 = a.Committed(enc_a.Submit());
++    Expect(a1 == 1 && a2 == 2 && b1 == 1 && b2 == 2, "each timeline numbers its own commits");
++    Expect(a.CurrentTick() == 3 && b.CurrentTick() == 3, "each timeline advances on its own");
++
++    b.Wait(b2);
++    Expect(b.IsFree(2) && b.KnownGpuTick() == 2, "B's tick 2 is its own second command buffer");
++    a.Wait(a1);
++    Expect(a.IsFree(1), "A's tick 1 done");
++    Expect(!a.IsFree(2), "A's tick 2 is A's gated command buffer, not B's completed one");
++    Expect(a.KnownGpuTick() == 1, "A knows only its own completed ticks");
++    Expect(!a.IsFree(3), "A's uncommitted tick is not free");
++
++    std::atomic<bool> waited{false};
++    std::thread waiter([&] {
++        a.Wait(a2);
++        waited.store(true);
++    });
++    std::this_thread::sleep_for(std::chrono::milliseconds(50));
++    Expect(!waited.load(), "Wait on A's tick 2 blocks while A's command buffer is gated");
++    gate.signaledValue = 1;
++    waiter.join();
++    Expect(gated.status == MTLCommandBufferStatusCompleted, "Wait returned after A's own buffer");
++    Expect(a.IsFree(2) && a.KnownGpuTick() == 2, "A's tick 2 done after the gate opened");
++
++    // Many commits, waited on out of order: pruning keeps every answer right and the map small.
++    u64 last_known = a.KnownGpuTick();
++    bool monotonic = true;
++    for (int i = 0; i < 300; ++i) {
++        enc_a.FillBuffer(Ref(buffer), 4096, u32(i & 0xff) * 0x01010101u);
++        a.Committed(enc_a.Submit());
++        if (i % 3 == 0) {
++            enc_b.FillBuffer(Ref(buffer), 4096, 0);
++            b.Committed(enc_b.Submit());
++        }
++        const u64 known = a.KnownGpuTick();
++        monotonic = monotonic && known >= last_known;
++        last_known = known;
++    }
++    Expect(monotonic, "KnownGpuTick never goes back");
++    Expect(a.CurrentTick() == 303 && b.CurrentTick() == 103, "ticks after many commits");
++    a.Wait(150);
++    Expect(a.IsFree(150), "a tick in the middle waited for");
++    a.Wait(302);
++    bool all_free = true;
++    for (u64 t = 0; t <= 302; ++t) {
++        all_free = all_free && a.IsFree(t);
++    }
++    Expect(all_free && a.KnownGpuTick() == 302, "every committed tick is free after the last");
++    Expect(!a.IsFree(303), "the next tick is still not free");
++    Expect(a.PendingCount() == 0, "completed mappings are dropped");
++    device.Finish();
++    Expect(b.KnownGpuTick() == 102 && b.PendingCount() == 0, "B's mappings pruned too");
++}
++
+ int main() {
+     @autoreleasepool {
+         TestObject();
+         TestTicks();
+         TestDeviceLifetime();
+         TestBlits();
+         TestKeepAlive();
+         TestWaitMeansCompleted();
+         TestCompute();
+         TestLargeBytes();
+@@ -743,18 +824,19 @@ int main() {
+         TestNoLeakOnPoollessThread();
+         TestCopyInPassSeesClear();
+         TestScissorClampedToTarget();
+         TestFillPattern();
+         TestSubmitResetsBindings();
+         TestUntrackedRunsFirst();
+         TestIndirectResidency();
+         TestDepthAspectCopy();
+         TestSpecialize();
+         TestDepthStencilCache();
++        TestTimelines();
+     }
+     if (failures) {
+         std::printf("FAILED: %d check(s)\n", failures);
+         return 1;
+     }
+     std::printf("PASS: Metal-native foundation (object, device ticks, encoder)\n");
+     return 0;
+ }

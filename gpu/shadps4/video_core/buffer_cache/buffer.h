@@ -13,22 +13,18 @@
 
 #include "common/assert.h"
 #include "common/types.h"
+#include "video_core/renderer_metal/mtl_memory_type.h"
 #include "video_core/renderer_metal/mtl_object.h"
 
 namespace Metal {
 class Device;
-class Timeline;
 } // namespace Metal
 
-namespace VideoCore {
+namespace Vulkan {
+class Scheduler;
+} // namespace Vulkan
 
-/// Hints and requirements for the backing memory type of a commit
-enum class MemoryType : u8 {
-    DeviceLocal,  ///< Private storage (GPU only; no CPU mapping).
-    HostUncached, ///< Shared, write-combined: optimized for CPU to GPU uploads.
-    HostCached,   ///< Shared, cached: optimized for GPU to CPU readbacks.
-    Stream,       ///< Shared, host-written every frame.
-};
+namespace VideoCore {
 
 /// One MTLBuffer. Metal tracks hazards and shared storage is coherent, so there is nothing to
 /// flush or invalidate.
@@ -104,8 +100,7 @@ struct Buffer {
 };
 
 struct StreamBuffer : public Buffer {
-    /// `timeline`: the ticks of the scheduler whose commands use this buffer.
-    explicit StreamBuffer(Metal::Device& device, Metal::Timeline& timeline, MemoryType mem_type,
+    explicit StreamBuffer(Metal::Device& device, Vulkan::Scheduler& scheduler, MemoryType mem_type,
                           u64 size_bytes);
 
     /// Reserves a region of memory from the stream buffer. Must be followed by Commit().
@@ -151,7 +146,7 @@ private:
     bool WaitPendingOperations(u64 requested_upper_bound, bool allow_wait);
 
 private:
-    Metal::Timeline& timeline;
+    Vulkan::Scheduler& scheduler;
     u64 offset{};
     u64 mapped_size{};
     u64 last_tick{};
