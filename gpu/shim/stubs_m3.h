@@ -4,8 +4,8 @@
 // files named in BB_M5_PENDING out of the build; their headers include this one instead and get
 // classes with the same public API that do nothing (each guarded by BB_M5_PENDING_<FILE NAME>,
 // which CMake defines while the file is pending):
-//   - M5: the temporal upscaler, camera motion and the GPU profiler
-//     (vk_temporal_upscaler.h, vk_camera_motion.h, vk_gpu_profiler.h): all off.
+//   - M5: the temporal upscaler and the GPU profiler (vk_temporal_upscaler.h,
+//     vk_gpu_profiler.h): all off.
 //     The settings overlay keeps its header; stubs_m3.cpp defines what the shim calls.
 // Converting a file removes its name from BB_M5_PENDING and its stand-in from here; the last
 // conversion deletes this file.
@@ -36,7 +36,6 @@ namespace Vulkan {
 class Scheduler;
 class Runtime;
 class SceneTargets;
-class ObjectMotion;
 struct RenderState;
 
 // --- M5: temporal upscaling (vk_temporal_upscaler.h) -----------------------------------------
@@ -102,43 +101,6 @@ public:
     }
 };
 #endif // BB_M5_PENDING_VK_TEMPORAL_UPSCALER
-
-// --- M5: camera motion vectors (vk_camera_motion.h) ------------------------------------------
-
-#ifdef BB_M5_PENDING_VK_CAMERA_MOTION
-class CameraMotion {
-public:
-    CameraMotion(Metal::Device&, Scheduler&, VideoCore::TextureCache&, Runtime&) {}
-
-    void InvalidateHistory() {}
-    void SetObjectMotion(ObjectMotion*) noexcept {}
-    void SetJitter(std::array<float, 2>) noexcept {}
-    [[nodiscard]] bool Enabled() const noexcept {
-        return false;
-    }
-    [[nodiscard]] bool Ready() const noexcept {
-        return false;
-    }
-    [[nodiscard]] VideoCore::ImageId Depth() const noexcept {
-        return {};
-    }
-    [[nodiscard]] std::array<u32, 2> RenderSize() const noexcept {
-        return {};
-    }
-    [[nodiscard]] float VerticalFov() const noexcept {
-        return 0.0f;
-    }
-    [[nodiscard]] float Near() const noexcept {
-        return 0.0f;
-    }
-    [[nodiscard]] std::array<std::array<float, 4>, 3> TaaDepthParameters() const noexcept {
-        return {};
-    }
-    void OnConstants(const float*) {}
-    void OnGBufferPass(VideoCore::ImageId) {}
-    void OnDisplayPass(VideoCore::ImageId) {}
-};
-#endif // BB_M5_PENDING_VK_CAMERA_MOTION
 
 // --- M5: GPU time per pass (vk_gpu_profiler.h): never on -------------------------------------
 

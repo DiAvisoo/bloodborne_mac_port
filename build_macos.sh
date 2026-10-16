@@ -175,8 +175,13 @@ if [[ ${1:-} == --test ]]; then
         # Metal-native M5: the motion shader variants compile to MSL; object motion on Metal
         # (history buffers by GPU address, the motion attachment), plain and under validation.
         ninja -C out/gpu-arm64 motion-shader-test >/dev/null
-        out/gpu-arm64/motion-shader-test 2>&1 | grep -E '^(FAIL|motion-shader-test)'
-        MTL_DEBUG_LAYER=1 out/gpu-arm64/motion-shader-test 2>&1 | grep -E '^(FAIL|motion-shader-test)'
+        out/gpu-arm64/motion-shader-test 2>&1 | grep -E '^(FAIL|motion-shader-test)' || { echo 'FAIL: motion-shader-test'; exit 1; }
+        MTL_DEBUG_LAYER=1 out/gpu-arm64/motion-shader-test 2>&1 | grep -E '^(FAIL|motion-shader-test)' || { echo 'FAIL: motion-shader-test (validation)'; exit 1; }
+        # Metal-native M5: the camera motion kernel (production SPIR-V through BuildHostKernel and
+        # CameraMotion::Record), plain and under validation.
+        ninja -C out/gpu-arm64 camera-motion-test >/dev/null
+        out/gpu-arm64/camera-motion-test 2>&1 | grep -E 'PASS|FAIL|Assertion' || { echo 'FAIL: camera-motion-test'; exit 1; }
+        MTL_DEBUG_LAYER=1 out/gpu-arm64/camera-motion-test 2>&1 | grep -E 'PASS|FAIL|Assertion' || { echo 'FAIL: camera-motion-test (validation)'; exit 1; }
         # Metal-native M5: the pipeline key's depth/stencil formats follow the pass's attachment.
         ninja -C out/gpu-arm64 depth-attachment-test >/dev/null
         out/gpu-arm64/depth-attachment-test || { echo 'FAIL: depth-attachment-test'; exit 1; }

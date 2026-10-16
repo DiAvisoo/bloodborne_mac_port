@@ -5,47 +5,61 @@
 
 #pragma once
 
-#ifndef BB_METAL_NATIVE_STAGE
-#error "BB_METAL_NATIVE_STAGE must be defined (gpu/CMakeLists.txt: target_compile_definitions)"
-#endif
-
-#ifdef BB_M5_PENDING_VK_CAMERA_MOTION
-// Not converted to Metal yet (M5, BB_M5_PENDING in gpu/CMakeLists.txt): the source is left out
-// of the build and this stand-in takes its place.
-#include "stubs_m3.h"
-#else
-
 #include <array>
-#include <vector>
+#include <memory>
 
 #include "common/types.h"
-#include "video_core/renderer_vulkan/vk_common.h"
-#include "video_core/buffer_cache/buffer.h"
-#include "video_core/texture_cache/image.h"
+#include "video_core/renderer_metal/mtl_host_kernel.h"
+#include "video_core/texture_cache/types.h"
+
+namespace Metal {
+class Device;
+class Encoder;
+} // namespace Metal
 
 namespace VideoCore {
 class TextureCache;
-}
+struct Buffer;
+} // namespace VideoCore
 
 namespace Vulkan {
 
-class Instance;
 class Scheduler;
 class Runtime;
 class ObjectMotion;
 
 class CameraMotion {
 public:
-    CameraMotion(const Instance& instance, Scheduler& scheduler,
+    /// camera_motion.comp's push constants (std430; padded to the MSL struct's 16-byte size).
+    struct alignas(16) Params {
+        std::array<float, 12> reproject; ///< previous view * inverse current view, 3x4 rows
+        std::array<float, 4> proj;
+        std::array<float, 4> prev_proj;
+        std::array<float, 2> size;
+        std::array<float, 2> jitter;
+        std::array<float, 2> previous_jitter;
+        u32 mode;
+    };
+
+    /// Encodes camera_motion.comp (`kernel`, BuildHostKernel of CAMERA_MOTION_COMP) over
+    /// `params.size`: `depth` (id<MTLTexture>, depth in red: D32/D32S8 or a float colour format)
+    /// into `motion` (RG16Float, ShaderWrite), pixels, previous minus current. `object` is the
+    /// object motion texture (read with mode 1; any readable 2D texture otherwise).
+    static void Record(Metal::Encoder& encoder, const Metal::HostKernel& kernel, void* depth,
+                       void* motion, void* object, const Params& params);
+
+    CameraMotion(Metal::Device& device, Scheduler& scheduler,
                  VideoCore::TextureCache& texture_cache, Runtime& runtime);
     ~CameraMotion();
     void InvalidateHistory() { current.valid = previous.valid = false; }
     void SetObjectMotion(ObjectMotion* motion) noexcept {
         object_motion = motion;
     }
-    /// This frame's object motion image (after RecordMotion), for the debug view; or null.
-    vk::ImageView ObjectMotionView() const noexcept;
-    vk::Image ObjectMotionImage(u32 width, u32 height) const noexcept;
+    /// The object motion texture (id<MTLTexture>, after RecordMotion), for the debug view; or
+    /// null.
+    void* ObjectMotionView() const noexcept;
+    /// The object motion texture if it holds this frame's vectors at `width` x `height`, or null.
+    void* ObjectMotionImage(u32 width, u32 height) const noexcept;
 
     void SetJitter(std::array<float, 2> value) noexcept {
         previous_jitter = jitter;
@@ -74,10 +88,9 @@ public:
     // Current projection, previous projection, and row Z of previous-view * inverse-view.
     [[nodiscard]] std::array<std::array<float, 4>, 3> TaaDepthParameters() const noexcept;
 
-    /// Records the motion vector pass: `depth_view` (depth aspect, General layout) into
-    /// `motion_view` (RG16F storage, General), pixels, previous minus current.
-    void RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_view, vk::ImageView motion_view,
-                      u32 width, u32 height);
+    /// Records the motion vector pass (Record) in order on the scheduler: `depth_texture` into
+    /// `motion_texture` (id<MTLTexture>, RG16Float, ShaderWrite), pixels, previous minus current.
+    void RecordMotion(void* depth_texture, void* motion_texture, u32 width, u32 height);
 
     /// A bound constant buffer of 864 bytes: checks the scene constant signature.
     void OnConstants(const float* data);
@@ -98,16 +111,15 @@ private:
     };
 
     void Overlay(VideoCore::ImageId frame);
+    [[nodiscard]] Params MakeParams(u32 width, u32 height, u32 mode) const noexcept;
 
-    const Instance& instance;
+    Metal::Device& device;
     Scheduler& scheduler;
     VideoCore::TextureCache& texture_cache;
     Runtime& runtime;
     bool debug_overlay = false;
     bool for_upscaler = false;
-    vk::UniqueDescriptorSetLayout motion_desc_layout;
-    vk::UniquePipelineLayout motion_pipeline_layout;
-    vk::UniquePipeline motion_pipeline;
+    Metal::HostKernel motion_kernel; ///< built at construction when for_upscaler
 
     ObjectMotion* object_motion = nullptr;
     Camera current, previous;
@@ -116,14 +128,10 @@ private:
     std::array<u32, 2> render_size{};
     VideoCore::ImageId depth_id{};
 
-    vk::UniqueDescriptorSetLayout desc_layout;
-    vk::UniquePipelineLayout pipeline_layout;
-    vk::UniquePipeline overlay_pipeline;
+    Metal::HostKernel overlay_kernel; ///< built at construction when debug_overlay
     /// Debug: the last two finished frames (RGBA8 packed), for the reprojection check.
     std::unique_ptr<VideoCore::Buffer> frames[2];
     u32 frame_index = 0;
 };
 
 } // namespace Vulkan
-
-#endif // BB_METAL_NATIVE_STAGE < 5

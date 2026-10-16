@@ -1002,7 +1002,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const auto& regs = Regs();
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's
     // target is that frame.
-    if (camera_motion->Enabled() && regs.color_buffers[0] &&
+    // Object motion needs the frame boundary too (its history halves alternate per frame).
+    if ((camera_motion->Enabled() || object_motion->Enabled()) && regs.color_buffers[0] &&
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
         scene_started = false;
         camera_motion->OnDisplayPass(cb_descs[0].first);

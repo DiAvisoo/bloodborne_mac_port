@@ -1,120 +1,91 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Execute production camera motion SPIR-V: distant geometry, sky and stale object vectors.
+// Metal-native (M5): the kernel is built by Metal::BuildHostKernel and recorded by
+// CameraMotion::Record, as in the renderer. argv[1] (optional): a SPIR-V file to run instead.
 #include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
-#include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/texture_cache/image.h"
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <unistd.h>
+#include <vector>
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/host_shaders/camera_motion_comp.h"
-#include <vk_mem_alloc.h>
+#include "video_core/host_shaders/camera_motion_debug_comp.h"
+#include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_encoder.h"
+#include "video_core/renderer_metal/mtl_host_kernel.h"
+#include "video_core/renderer_metal/mtl_texture.h"
+#include "video_core/renderer_metal/vk_to_mtl.h"
+#include "video_core/renderer_vulkan/vk_camera_motion.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
-int main() {
-    Vulkan::Instance instance(0, false);
-    static vk::detail::DynamicLoader loader;
-    vk::detail::DispatchLoaderDynamic d;
-    d.init(loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
-    d.init(instance.GetInstance()); d.init(instance.GetDevice());
-    const auto device = instance.GetDevice();
-    Vulkan::Scheduler scheduler(instance);
+int main(int argc, char** argv) {
+    // No game: the host kernel's MSL disk cache goes to a temporary directory.
+    std::string dir_template =
+        (std::filesystem::temp_directory_path() / "bb-camera-motion-test.XXXXXX").string();
+    const char* cache_dir = mkdtemp(dir_template.data());
+    assert(cache_dir);
+    Metal::SetHostKernelCacheDir(cache_dir);
+    std::vector<u32> spirv(std::begin(CAMERA_MOTION_COMP), std::end(CAMERA_MOTION_COMP));
+    if (argc > 1) {
+        std::ifstream file(argv[1], std::ios::binary | std::ios::ate);
+        assert(file && file.tellg() % 4 == 0);
+        spirv.resize(size_t(file.tellg()) / 4);
+        file.seekg(0);
+        file.read(reinterpret_cast<char*>(spirv.data()), std::streamsize(spirv.size() * 4));
+    }
+    Metal::Device device;
+    Vulkan::Scheduler scheduler(device, false);
+    const Metal::HostKernel kernel = Metal::BuildHostKernel(device, spirv, {}, "camera_motion");
     constexpr u32 W=9,H=7,N=W*H;
-    std::array<VideoCore::UniqueImage,3> images;
-    std::array<vk::UniqueImageView,3> views;
-    std::array<vk::DescriptorSetLayoutBinding,3> bindings{};
+    std::array<Metal::Object,3> images;
     for (u32 i=0;i<3;++i) {
         const auto format=i==1 ? vk::Format::eR16G16Sfloat : vk::Format::eR32G32B32A32Sfloat;
-        images[i]=VideoCore::UniqueImage(device,instance.GetAllocator());
-        images[i].Create({.imageType=vk::ImageType::e2D,.format=format,.extent={W,H,1},
-            .mipLevels=1,.arrayLayers=1,.samples=vk::SampleCountFlagBits::e1,
-            .tiling=vk::ImageTiling::eOptimal,.usage=vk::ImageUsageFlagBits::eSampled |
-            vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc |
-            vk::ImageUsageFlagBits::eTransferDst});
-        views[i]=device.createImageViewUnique({.image=vk::Image(images[i]),
-            .viewType=vk::ImageViewType::e2D,.format=format,
-            .subresourceRange={vk::ImageAspectFlagBits::eColor,0,1,0,1}},nullptr,d).value;
-        bindings[i]={.binding=i,.descriptorType=i==1 ? vk::DescriptorType::eStorageImage :
-            vk::DescriptorType::eSampledImage,.descriptorCount=1,
-            .stageFlags=vk::ShaderStageFlagBits::eCompute};
+        images[i]=Metal::CreateTexture(device,{.pixel_format=Metal::VkToMtl::PixelFormat(format),
+            .width=W,.height=H,.shader_write=i==1},"camera-motion-test",nullptr);
+        assert(images[i]);
     }
-    auto descriptors=device.createDescriptorSetLayoutUnique({
-        .flags=vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
-        .bindingCount=3,.pBindings=bindings.data()},nullptr,d).value;
-    struct Params {
-        std::array<float,12> reproject;
-        std::array<float,4> proj,prev_proj;
-        std::array<float,2> size,jitter,previous_jitter;
-        u32 mode;
-    };
-    const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute,0,sizeof(Params)};
-    auto layout=device.createPipelineLayoutUnique({.setLayoutCount=1,.pSetLayouts=&*descriptors,
-        .pushConstantRangeCount=1,.pPushConstantRanges=&push},nullptr,d).value;
-    auto module=device.createShaderModuleUnique({.codeSize=sizeof(CAMERA_MOTION_COMP),
-        .pCode=CAMERA_MOTION_COMP},nullptr,d).value;
-    auto pipeline=device.createComputePipelineUnique({}, {
-        .stage={.stage=vk::ShaderStageFlagBits::eCompute,.module=*module,.pName="main"},
-        .layout=*layout},nullptr,d).value;
-    VkBuffer staging{}; VmaAllocation allocation{}; VmaAllocationInfo ai{};
-    const VkBufferCreateInfo bi{.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size=N*16*2,.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    const VmaAllocationCreateInfo ac{.flags=VMA_ALLOCATION_CREATE_MAPPED_BIT |
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,.usage=VMA_MEMORY_USAGE_AUTO,
-        .requiredFlags=VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-    assert(vmaCreateBuffer(instance.GetAllocator(),&bi,&ac,&staging,&allocation,&ai)==VK_SUCCESS);
-    const auto barrier=[&](vk::CommandBuffer cmd,vk::PipelineStageFlags2 src,
-                          vk::AccessFlags2 src_access,vk::PipelineStageFlags2 dst,
-                          vk::AccessFlags2 dst_access) {
-        const vk::MemoryBarrier2 b{.srcStageMask=src,.srcAccessMask=src_access,
-                                  .dstStageMask=dst,.dstAccessMask=dst_access};
-        cmd.pipelineBarrier2({.memoryBarrierCount=1,.pMemoryBarriers=&b},d);
-    };
+    // The renderer's scene depth is D32S8, bound where the kernel declares a texture2D.
+    const Metal::Object scene_depth=Metal::CreateTexture(device,{.pixel_format=
+        Metal::VkToMtl::PixelFormat(vk::Format::eD32SfloatS8Uint),.width=W,.height=H},
+        "camera-motion-test depth",nullptr);
+    assert(scene_depth);
+    // Depth (RGBA32F), object vectors (RGBA32F), and D32 depth values for scene_depth.
+    VideoCore::Buffer staging(device,VideoCore::MemoryType::HostCached,0,N*16*2+N*4,"staging");
+    assert(!staging.mapped_data.empty());
     const auto run=[&](const char* label,float depth,float translation,float rotation,
-                       float object_depth,u32 mode,float expected,bool jitter=false) {
-        auto* pixels=static_cast<float*>(ai.pMappedData);
+                       float object_depth,u32 mode,float expected,bool jitter=false,
+                       bool d32s8=false) {
+        auto* pixels=reinterpret_cast<float*>(staging.mapped_data.data());
         for (u32 p=0;p<N;++p) {
             pixels[p*4]=depth;
             pixels[N*4+p*4]=2.f; pixels[N*4+p*4+1]=0.f;
             pixels[N*4+p*4+2]=1.f; pixels[N*4+p*4+3]=object_depth;
+            pixels[N*8+p]=depth;
         }
-        const auto cmd=scheduler.CommandBuffer();
-        std::array<vk::ImageMemoryBarrier2,3> transitions{};
-        for (u32 i=0;i<3;++i) transitions[i]={
-            .srcStageMask=vk::PipelineStageFlagBits2::eAllCommands,
-            .dstStageMask=vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask=vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite,
-            .oldLayout=vk::ImageLayout::eUndefined,.newLayout=vk::ImageLayout::eGeneral,
-            .image=vk::Image(images[i]),.subresourceRange={vk::ImageAspectFlagBits::eColor,0,1,0,1}};
-        cmd.pipelineBarrier2({.imageMemoryBarrierCount=3,.pImageMemoryBarriers=transitions.data()},d);
-        for (u32 i : {0u,2u}) {
-            const vk::BufferImageCopy region{.bufferOffset=i/2*N*16,
-                .imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},.imageExtent={W,H,1}};
-            cmd.copyBufferToImage(staging,vk::Image(images[i]),vk::ImageLayout::eGeneral,region,d);
-        }
-        barrier(cmd,vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite,
-            vk::PipelineStageFlagBits2::eComputeShader,vk::AccessFlagBits2::eShaderRead);
-        std::array<vk::DescriptorImageInfo,3> infos{};
-        std::array<vk::WriteDescriptorSet,3> writes{};
-        for (u32 i=0;i<3;++i) {
-            infos[i]={.imageView=*views[i],.imageLayout=vk::ImageLayout::eGeneral};
-            writes[i]={.dstBinding=i,.descriptorCount=1,.descriptorType=bindings[i].descriptorType,
-                .pImageInfo=&infos[i]};
-        }
-        Params params{{1,0,rotation,translation,0,1,0,0,0,0,1,0},
+        const Vulkan::CameraMotion::Params params{{1,0,rotation,translation,0,1,0,0,0,0,1,0},
             {1,1,1,-0.05f},{1,1,1,-0.05f},{W,H},
             {jitter ? 0.37f : 0.f,jitter ? -0.29f : 0.f},{0,0},mode};
-        cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline,d);
-        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,*layout,0,writes,d);
-        cmd.pushConstants(*layout,vk::ShaderStageFlagBits::eCompute,0,sizeof(params),&params,d);
-        cmd.dispatch((W+7)/8,(H+7)/8,1,d);
-        barrier(cmd,vk::PipelineStageFlagBits2::eComputeShader,vk::AccessFlagBits2::eShaderWrite,
-            vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferRead);
-        const vk::BufferImageCopy region{.imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
-            .imageOffset={4,3,0},.imageExtent={1,1,1}};
-        cmd.copyImageToBuffer(vk::Image(images[1]),vk::ImageLayout::eGeneral,staging,region,d);
-        barrier(cmd,vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite,
-            vk::PipelineStageFlagBits2::eHost,vk::AccessFlagBits2::eHostRead);
+        void* const depth_texture=d32s8 ? scene_depth.Get() : images[0].Get();
+        scheduler.Record([&,buffer=staging.Handle(),depth_texture](Metal::Encoder& e) {
+            for (u32 i : {0u,2u}) {
+                e.CopyBufferToTexture({buffer,i/2*N*16},W*16,N*16,images[i].Get(),0,0,{},
+                    {W,H,1});
+            }
+            if (d32s8) {
+                e.CopyBufferToTexture({buffer,N*16*2},W*4,N*4,depth_texture,0,0,{},{W,H,1},
+                    Metal::BlitAspect::Depth);
+            }
+            Vulkan::CameraMotion::Record(e,kernel,depth_texture,images[1].Get(),images[2].Get(),
+                params);
+            e.CopyTextureToBuffer(images[1].Get(),0,0,{4,3,0},{1,1,1},{buffer,0},4,4);
+        });
         scheduler.Finish();
-        const auto* result=static_cast<u16*>(ai.pMappedData);
+        const auto* result=reinterpret_cast<const u16*>(staging.mapped_data.data());
         const auto half=[](u16 v) {
             const int e=(v>>10)&31;
             return (v&0x8000 ? -1.f : 1.f)*(e==0 ? std::ldexp(float(v&1023),-24) :
@@ -131,5 +102,15 @@ int main() {
     run("static camera cancels jitter",distant,0,0,0,0,0,true);
     run("matching object vector",distant,0,0,distant,1,2);
     run("stale distant object vector",distant,0,0,0.9999f,1,0);
-    vmaDestroyBuffer(instance.GetAllocator(),staging,allocation);
+    // Metal-native addition: the first case again with the renderer's D32S8 scene depth.
+    run("distant geometry moves, D32S8 depth",distant,1000,0,0,0,4.5f*1000*(1-distant)/0.05f,
+        false,true);
+    // The debug overlay kernel (BB_DEBUG_MOTION=1) builds, with its four bindings.
+    const Metal::HostKernel overlay=Metal::BuildHostKernel(device,CAMERA_MOTION_DEBUG_COMP,{},
+        "camera_motion_debug");
+    assert(overlay.pipeline && overlay.texture_slot[0]!=~0u && overlay.texture_slot[1]!=~0u &&
+        overlay.buffer_slot[2]!=~0u && overlay.buffer_slot[3]!=~0u);
+    std::printf("Camera motion: debug overlay kernel PASS\n");
+    assert(device.ErrorCount()==0);
+    std::filesystem::remove_all(cache_dir);
 }
