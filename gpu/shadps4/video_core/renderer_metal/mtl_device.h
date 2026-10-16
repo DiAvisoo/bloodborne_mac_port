@@ -1,21 +1,36 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: the Metal device and queue our own encoders use (docs/DESIGN_METAL_BACKEND.md). The
-// interface follows Huax-1839/bloodborne-macos's Metal::Device (GPL-2.0-or-later); here the
-// device and queue are normally MoltenVK's (VK_EXT_metal_objects), so our command buffers and
-// MoltenVK's are ordered on one queue.
+// bbport: the Metal device, queue and submission ticks (Metal-native renderer, spec component 1).
+// The interface began as Huax-1839/bloodborne-macos's Metal::Device (GPL-2.0-or-later). On the
+// metal-backend path the device and queue are MoltenVK's (VK_EXT_metal_objects).
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include "common/types.h"
 
 namespace Metal {
+
+/// Limits the caches use. MoltenVK's values, so the caches behave as with MoltenVK.
+struct Limits {
+    u64 max_buffer_length{};       ///< MTLDevice.maxBufferLength
+    u64 recommended_working_set{}; ///< MTLDevice.recommendedMaxWorkingSetSize
+    u32 uniform_alignment{16};
+    u32 storage_alignment{16};
+    u32 texel_buffer_alignment{16};
+    u32 non_coherent_atom{16};
+    float max_anisotropy{16.0f};
+    float max_lod_bias{16.0f};
+    u32 max_samplers{500000};
+};
 
 class Device {
 public:
     /// `mtl_device`/`mtl_queue`: id<MTLDevice>/id<MTLCommandQueue> to use (MoltenVK's); null: the
-    /// system default device and a queue of our own (tools and tests).
+    /// system default device and a queue of our own.
     explicit Device(void* mtl_device = nullptr, void* mtl_queue = nullptr);
+    /// Waits for every committed command buffer.
     ~Device();
 
     Device(const Device&) = delete;
@@ -29,10 +44,46 @@ public:
     const std::string& Name() const {
         return name;
     }
+    const Limits& GetLimits() const noexcept {
+        return limits;
+    }
+    /// id<MTLDevice> and id<MTLCommandQueue>, unretained.
+    void* NativeDevice() const noexcept;
+    void* NativeQueue() const noexcept;
+
+    /// The tick the next Commit() signals. Ticks start at 1 and grow by one per commit.
+    [[nodiscard]] u64 CurrentTick() const noexcept {
+        return current_tick.load(std::memory_order_acquire);
+    }
+    /// The highest tick the GPU is known to have finished.
+    [[nodiscard]] u64 KnownGpuTick() const noexcept {
+        return gpu_tick.load(std::memory_order_acquire);
+    }
+    /// True once the GPU finished every command buffer up to `tick`.
+    [[nodiscard]] bool IsFree(u64 tick) const;
+    /// Blocks until `tick` is done; also returns for command buffers that failed. `tick` must have
+    /// been committed (asserted).
+    void Wait(u64 tick);
+    /// Waits for every command buffer committed so far.
+    void Finish();
+    /// Commits `command_buffer` (id<MTLCommandBuffer>) so that it signals CurrentTick() when done,
+    /// and returns that tick. One thread commits at a time, so ticks follow commit order.
+    u64 Commit(void* command_buffer);
+    /// Command buffers that completed with an error (each one is logged).
+    [[nodiscard]] u64 ErrorCount() const noexcept {
+        return errors.load(std::memory_order_relaxed);
+    }
 
 private:
+    /// Raises the known GPU tick to the shared event's value.
+    void Refresh() const;
+
     std::unique_ptr<Impl> impl;
     std::string name;
+    Limits limits;
+    std::atomic<u64> current_tick{1};
+    mutable std::atomic<u64> gpu_tick{0};
+    std::atomic<u64> errors{0};
 };
 
 } // namespace Metal

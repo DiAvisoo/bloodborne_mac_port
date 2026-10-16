@@ -10,6 +10,7 @@
 #include <cstring>
 #include <vector>
 #include "video_core/renderer_metal/mtl_object.h"
+#include "video_core/renderer_metal/mtl_device.h"
 
 #include <csetjmp>
 
@@ -67,11 +68,37 @@ void TestObject() {
     }
 }
 
+void TestTicks() {
+    Metal::Device device;
+    const Metal::Limits& limits = device.GetLimits();
+    Expect(limits.max_buffer_length >= (u64(1) << 30), "max buffer length read from the device");
+    Expect(limits.uniform_alignment == 16 && limits.storage_alignment == 16 &&
+               limits.max_samplers == 500000,
+           "limits keep MoltenVK's values");
+    Expect(device.CurrentTick() == 1 && device.KnownGpuTick() == 0, "ticks start at 1");
+
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)device.NativeQueue();
+    id<MTLCommandBuffer> empty = [queue commandBuffer];
+    const u64 first = device.Commit((__bridge void*)empty);
+    Expect(first == 1 && device.CurrentTick() == 2, "Commit signals the current tick and advances");
+    device.Wait(first);
+    Expect(device.IsFree(first), "an empty command buffer completes");
+    Expect(!device.IsFree(2), "an uncommitted tick is not free");
+
+    for (int i = 0; i < 3; ++i) {
+        device.Commit((__bridge void*)[queue commandBuffer]);
+    }
+    device.Finish();
+    Expect(device.IsFree(4) && device.KnownGpuTick() >= 4, "Finish waits for every commit");
+    Expect(device.ErrorCount() == 0, "no command buffer failed");
+}
+
 } // namespace
 
 int main() {
     @autoreleasepool {
         TestObject();
+        TestTicks();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

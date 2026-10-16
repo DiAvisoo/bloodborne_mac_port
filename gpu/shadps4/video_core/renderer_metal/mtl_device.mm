@@ -1,10 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: Metal::Device (Metal-native renderer, spec component 1).
 
-#include <cstdio>
+#include <atomic>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "video_core/renderer_metal/mtl_device_impl.h"
 
 namespace Metal {
+
+namespace {
+
+void RaiseTo(std::atomic<u64>& value, u64 tick) {
+    u64 known = value.load(std::memory_order_acquire);
+    while (known < tick &&
+           !value.compare_exchange_weak(known, tick, std::memory_order_acq_rel)) {
+    }
+}
+
+} // namespace
 
 Device::Device(void* mtl_device, void* mtl_queue) : impl{std::make_unique<Impl>()} {
     @autoreleasepool {
@@ -12,10 +25,70 @@ Device::Device(void* mtl_device, void* mtl_queue) : impl{std::make_unique<Impl>(
         ASSERT_MSG(impl->device, "No Metal device");
         impl->queue = mtl_queue ? (__bridge id<MTLCommandQueue>)mtl_queue : [impl->device newCommandQueue];
         ASSERT_MSG(impl->queue, "No Metal command queue");
+        impl->event = [impl->device newSharedEvent];
+        ASSERT_MSG(impl->event, "No Metal shared event");
         name = impl->device.name.UTF8String;
+        limits.max_buffer_length = impl->device.maxBufferLength;
+        limits.recommended_working_set = impl->device.recommendedMaxWorkingSetSize;
     }
 }
 
-Device::~Device() = default;
+Device::~Device() {
+    Finish();
+}
+
+void* Device::NativeDevice() const noexcept {
+    return (__bridge void*)impl->device;
+}
+
+void* Device::NativeQueue() const noexcept {
+    return (__bridge void*)impl->queue;
+}
+
+void Device::Refresh() const {
+    RaiseTo(gpu_tick, impl->event.signaledValue);
+}
+
+bool Device::IsFree(u64 tick) const {
+    if (KnownGpuTick() >= tick) {
+        return true;
+    }
+    Refresh();
+    return KnownGpuTick() >= tick;
+}
+
+void Device::Wait(u64 tick) {
+    ASSERT_MSG(tick < CurrentTick(), "Waiting for tick {} that was never committed", tick);
+    while (!IsFree(tick)) {
+        // A failed command buffer may never signal the event; its completion handler raises the
+        // known tick instead, so wait in slices and look again.
+        [impl->event waitUntilSignaledValue:tick timeoutMS:100];
+    }
+}
+
+void Device::Finish() {
+    const u64 last = CurrentTick() - 1;
+    if (last != 0) {
+        Wait(last);
+    }
+}
+
+u64 Device::Commit(void* command_buffer) {
+    id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)command_buffer;
+    const u64 tick = current_tick.fetch_add(1, std::memory_order_acq_rel);
+    [cmd encodeSignalEvent:impl->event value:tick];
+    std::atomic<u64>* known = &gpu_tick;
+    std::atomic<u64>* failed = &errors;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.status == MTLCommandBufferStatusError) {
+            failed->fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR(Render, "Metal command buffer of tick {} failed: {}", tick,
+                      done.error ? done.error.localizedDescription.UTF8String : "unknown error");
+        }
+        RaiseTo(*known, tick);
+    }];
+    [cmd commit];
+    return tick;
+}
 
 } // namespace Metal
