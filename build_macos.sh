@@ -125,10 +125,10 @@ if [[ ${1:-} == --test ]]; then
     fi
     # Metal-native M1: Metal::Object, Device ticks and limits, Metal::Encoder (arm64, no window);
     # again under Metal's validation layer.
-    if [[ -f out/gpu-arm64/libbbgpu.dylib ]]; then
+    if [[ -f out/gpu-arm64/libbbmetal_core.a ]]; then
         /usr/bin/clang++ -arch arm64 -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -std=c++20 -fobjc-arc -O2 -g \
-            -Wall -Wextra -Werror -Igpu/shadps4 tests/test_mtl_encoder.mm -Lout/gpu-arm64 -lbbgpu \
-            -Wl,-rpath,"$ROOT/out/gpu-arm64" -framework Metal -framework Foundation -o out/mtl-encoder-test
+            -Wall -Wextra -Werror -Igpu/shim -Igpu/shadps4 -I"$ARM64_PREFIX/include" tests/test_mtl_encoder.mm gpu/shim/common/logging/log.cpp gpu/shim/common/assert.cpp out/gpu-arm64/libbbmetal_core.a -L"$ARM64_PREFIX/lib" -lfmt \
+            -framework Metal -framework Foundation -o out/mtl-encoder-test
         out/mtl-encoder-test
         MTL_DEBUG_LAYER=1 out/mtl-encoder-test
     fi

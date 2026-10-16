@@ -188,9 +188,28 @@ if (APPLE)
         find_package(spirv_cross_core CONFIG REQUIRED)
         find_package(spirv_cross_glsl CONFIG REQUIRED)
         find_package(spirv_cross_msl CONFIG REQUIRED)
+        # Metal-native core (docs/superpowers/plans/2026-10-16-metal-native-m2-scheduler-caches.md):
+        # device, encoder and helpers with no renderer dependencies; unit tests link it alone.
+        set(METAL_CORE_SOURCES
+            shadps4/video_core/renderer_metal/mtl_object.cpp
+            shadps4/video_core/renderer_metal/mtl_device.mm
+            shadps4/video_core/renderer_metal/mtl_encoder.mm)
+        add_library(bbmetal_core STATIC ${METAL_CORE_SOURCES})
+        target_include_directories(bbmetal_core PRIVATE shim shadps4 ${SHADER_INCLUDE})
+        target_compile_features(bbmetal_core PRIVATE cxx_std_20)
+        target_link_libraries(bbmetal_core PRIVATE fmt::fmt)
+        set_target_properties(bbmetal_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        foreach(source IN LISTS METAL_CORE_SOURCES)
+            if (source MATCHES "\\.mm$")
+                set_source_files_properties(${source} TARGET_DIRECTORY bbmetal_core PROPERTIES
+                    COMPILE_OPTIONS "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
+            endif()
+        endforeach()
         file(GLOB METAL_SOURCES CONFIGURE_DEPENDS shadps4/video_core/renderer_metal/*.cpp
              shadps4/video_core/renderer_metal/*.mm)
+        list(REMOVE_ITEM METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_object.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_device.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_encoder.mm)
         target_sources(bbgpu PRIVATE ${METAL_SOURCES})
+        target_link_libraries(bbgpu PRIVATE bbmetal_core "-framework Metal" "-framework Foundation")
         foreach(source IN LISTS METAL_SOURCES)
             if (source MATCHES "\\.mm$")
                 # No Vulkan Metal-surface types here: under ARC their CAMetalLayer pointer breaks

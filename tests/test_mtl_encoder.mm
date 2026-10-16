@@ -16,15 +16,6 @@
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
 
-#include <csetjmp>
-
-// The library binds these host-runtime data symbols at load (host/host_runtime.c defines them in
-// bbgpu-host); a test executable has to provide them, as tests/test_srt_walker.cpp does.
-extern "C" __thread sigjmp_buf* runtime_fault_recover;
-__thread sigjmp_buf* runtime_fault_recover;
-extern "C" uint64_t runtime_disabled_optimizations;
-uint64_t runtime_disabled_optimizations;
-
 namespace {
 
 int failures = 0;
