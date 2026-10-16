@@ -1483,6 +1483,10 @@ void RunCountClamp(bool indexed) {
         reinterpret_cast<u32*>(indices.contents)[i] = i;
     }
     id<MTLBuffer> counter = SharedBuffer(device, 16 * 4);
+    id<MTLBuffer> count_all = SharedBuffer(device, 64);
+    *reinterpret_cast<u32*>(static_cast<u8*>(count_all.contents) + 20) = 4;
+    const std::vector<u8> args_before(static_cast<u8*>(args.contents),
+                                      static_cast<u8*>(args.contents) + args.length);
 
     // The caller's compute state must survive: set it, run a dispatch, clamp-draw, dispatch again.
     encoder.SetComputePipeline((__bridge void*)add_one);
@@ -1500,10 +1504,33 @@ void RunCountClamp(bool indexed) {
         encoder.DrawIndirectCount(Metal::Primitive::Triangle, Ref(args, 8), stride, Ref(count, 20), 4,
                                   false);
     }
+    // Same argument table again with a bigger count (green): a clamp that had modified the
+    // records would leave quads 2 and 3 empty.
+    id<MTLTexture> target2 = Texture(device, kSize, kSize);
+    encoder.EndRenderPass();
+    id<MTLBuffer> out = Readback(device, encoder, target);
+    encoder.BeginRenderPass(ColorPass(target2, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)pipeline);
+    FullViewport(encoder);
+    SetColor(encoder, kGreen);
+    if (indexed) {
+        encoder.DrawIndirectCount(Metal::Primitive::Triangle, Ref(args, 8), stride, Ref(count_all, 20),
+                                  4, true, Metal::IndexType::U32, Ref(indices));
+    } else {
+        encoder.DrawIndirectCount(Metal::Primitive::Triangle, Ref(args, 8), stride,
+                                  Ref(count_all, 20), 4, false);
+    }
     encoder.EndRenderPass();
     encoder.Dispatch({1, 1, 1}, {16, 1, 1});
-    id<MTLBuffer> out = Readback(device, encoder, target);
+    id<MTLBuffer> out2 = Readback(device, encoder, target2);
     device.Wait(encoder.Submit());
+    Expect(std::memcmp(args_before.data(), args.contents, args.length) == 0,
+           "DrawIndirectCount leaves the argument records untouched");
+    bool all_green = true;
+    for (u32 q = 0; q < 4; ++q) {
+        all_green &= Pixel(out2, kSize, (q & 1) * 32 + 16, (q >> 1) == 0 ? 48 : 16) == kGreen;
+    }
+    Expect(all_green, "the same records drawn later with a bigger count all draw");
 
     // Quad q covers x in [(q&1)*32, +32), and rows: NDC y -1..0 is the bottom half (rows 32..63).
     const auto quarter = [&](u32 q) {

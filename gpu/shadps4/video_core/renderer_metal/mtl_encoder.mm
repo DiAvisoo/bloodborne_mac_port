@@ -109,16 +109,20 @@ MTLCullMode ToMtl(CullMode mode) {
     UNREACHABLE();
 }
 
-/// Zeroes the draw/dispatch-count word (the first) of the argument records whose index is at or
-/// above the GPU-side count: indirect draws with a count.
+/// Copies the argument records to a scratch buffer, zeroing the draw-count word (the first) of
+/// the records whose index is at or above the GPU-side count: indirect draws with a count. The
+/// source records (guest data) are never written.
 constexpr const char* kClampCountSource = R"(
 #include <metal_stdlib>
 using namespace metal;
-kernel void clamp_indirect_count(device uint* records [[buffer(0)]],
+kernel void clamp_indirect_count(device const uint* records [[buffer(0)]],
                                  device const uint* count [[buffer(1)]],
                                  constant uint2& params [[buffer(2)]], // stride in words, max count
+                                 device uint* scratch [[buffer(3)]],
                                  uint i [[thread_position_in_grid]]) {
-    if (i < params.y && i >= *count) records[i * params.x] = 0;
+    if (i >= params.y) return;
+    for (uint w = 0; w < params.x; ++w) scratch[i * params.x + w] = records[i * params.x + w];
+    if (i >= *count) scratch[i * params.x] = 0;
 }
 )";
 
@@ -1039,7 +1043,8 @@ void Encoder::DrawIndirectCount(Primitive primitive, BufferRef args, u32 stride,
     if (max_count == 0) {
         return;
     }
-    // The clamp runs on its own compute encoder, so the caller's compute state is untouched. The
+    // The clamp copies the records to a scratch buffer (the source is guest data and stays
+    // untouched) on its own compute encoder, so the caller's compute state is untouched. The
     // render encoder ends here; the pass reopens (Load) at the draws below, after the clamp.
     impl->FlushPendingClear();
     impl->EndRender();
@@ -1047,17 +1052,22 @@ void Encoder::DrawIndirectCount(Primitive primitive, BufferRef args, u32 stride,
     impl->EndBlit();
     id<MTLComputePipelineState> pipeline = impl->ClampCountPipeline();
     const u32 params[2] = {stride / 4, max_count};
+    id<MTLBuffer> scratch;
     @autoreleasepool {
+        scratch = [impl->dev newBufferWithLength:u64(max_count) * stride
+                                         options:MTLResourceStorageModePrivate];
         id<MTLComputeCommandEncoder> e = [impl->Cmd() computeCommandEncoder];
         [e setComputePipelineState:pipeline];
         [e setBuffer:(__bridge id<MTLBuffer>)args.buffer offset:args.offset atIndex:0];
         [e setBuffer:(__bridge id<MTLBuffer>)count.buffer offset:count.offset atIndex:1];
         [e setBytes:params length:sizeof(params) atIndex:2];
+        [e setBuffer:scratch offset:0 atIndex:3];
         [e dispatchThreads:MTLSizeMake(max_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         [e endEncoding];
     }
+    KeepAlive(Object::Retain((__bridge void*)scratch));
     for (u32 i = 0; i < max_count; ++i) {
-        const BufferRef record{args.buffer, args.offset + u64(i) * stride};
+        const BufferRef record{(__bridge void*)scratch, u64(i) * stride};
         if (indexed) {
             DrawIndexedIndirect(primitive, type, indices, record);
         } else {

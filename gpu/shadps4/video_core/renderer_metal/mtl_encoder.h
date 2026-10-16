@@ -120,10 +120,11 @@ public:
     void DrawIndirect(Primitive primitive, BufferRef args);
     /// MTLDrawIndexedPrimitivesIndirectArguments at `args`.
     void DrawIndexedIndirect(Primitive primitive, IndexType type, BufferRef indices, BufferRef args);
-    /// Multi-draw indirect with a GPU count: clamps the `max_count` argument records at `args`
+    /// Multi-draw indirect with a GPU count: clamps a copy of the `max_count` argument records at `args`
     /// (stride `stride` bytes) so records at index >= *count draw nothing (vertex/index count 0),
     /// with a compute pass before the render pass reopens, then issues max_count indirect draws.
-    /// The records are modified in place; the caller's compute state is untouched.
+    /// The clamp works on a scratch copy of the records (`args` is only read); the caller's
+    /// compute state is untouched.
     void DrawIndirectCount(Primitive primitive, BufferRef args, u32 stride, BufferRef count,
                            u32 max_count, bool indexed, IndexType type = IndexType::U16,
                            BufferRef indices = {});
