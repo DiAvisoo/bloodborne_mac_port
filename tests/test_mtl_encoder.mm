@@ -1274,6 +1274,461 @@ void TestCrossEncoderWait() {
     Expect(device.ErrorCount() == 0, "cross-encoder wait ran without errors");
 }
 
+
+// ---- Task M3.1: encoder capabilities for the rasterizer ----
+
+constexpr const char* kRasterShaders = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VOut { float4 pos [[position]]; };
+struct VColorOut { float4 pos [[position]]; float4 color; };
+struct StrideIn { float2 pos [[attribute(0)]]; float4 color [[attribute(1)]]; };
+
+vertex VColorOut strided(StrideIn in [[stage_in]]) {
+    VColorOut o;
+    o.pos = float4(in.pos, 0.0, 1.0);
+    o.color = in.color;
+    return o;
+}
+fragment float4 vcolor(VColorOut in [[stage_in]]) { return in.color; }
+
+// 6 vertices per quad, quad q covers quadrant (q & 1, q >> 1) of clip space.
+vertex VOut quarters(uint vid [[vertex_id]], constant uint* indices [[buffer(1)]]) {
+    const uint v = vid;
+    const uint q = v / 6, c = v % 6;
+    const float2 corner[6] = {float2(0, 0), float2(1, 0), float2(0, 1),
+                              float2(0, 1), float2(1, 0), float2(1, 1)};
+    const float2 base = float2(float(q & 1), float(q >> 1)) - 1.0;
+    VOut o;
+    o.pos = float4(base + corner[c], 0.0, 1.0);
+    return o;
+}
+
+// A triangle in the middle of the target at depth z (buffer 1).
+vertex VOut small_triangle(uint vid [[vertex_id]], constant float& z [[buffer(1)]]) {
+    const float2 p[3] = {float2(-0.8, -0.8), float2(0.8, -0.8), float2(0.0, 0.8)};
+    VOut o;
+    o.pos = float4(p[vid], z, 1.0);
+    return o;
+}
+
+fragment float4 solid(constant float4& color [[buffer(0)]]) { return color; }
+
+fragment float4 tex100(VOut in [[stage_in]], texture2d<float> t [[texture(100)]]) {
+    constexpr sampler s(filter::nearest, coord::pixel);
+    return t.sample(s, in.pos.xy);
+}
+
+// The left half of clip space as one tessellated patch.
+[[patch(quad, 4)]] vertex VOut post_tess_quad(float2 uv [[position_in_patch]]) {
+    VOut o;
+    o.pos = float4(uv.x - 1.0, uv.y * 2.0 - 1.0, 0.0, 1.0);
+    return o;
+}
+
+kernel void doubles(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    out[i] = i * 2u;
+}
+kernel void add_one(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    out[i] += 1u;
+}
+)";
+
+id<MTLLibrary> RasterLibrary(Metal::Device& device) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    NSError* error = nil;
+    id<MTLLibrary> library = [dev newLibraryWithSource:@(kRasterShaders) options:nil error:&error];
+    if (!library) {
+        std::printf("FAIL: raster shaders: %s\n", error.localizedDescription.UTF8String);
+        std::exit(1);
+    }
+    return library;
+}
+
+id<MTLRenderPipelineState> RasterPipeline(Metal::Device& device, id<MTLLibrary> library,
+                                          NSString* vertex, NSString* fragment,
+                                          MTLRenderPipelineDescriptor* desc = nil) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    if (!desc) {
+        desc = [MTLRenderPipelineDescriptor new];
+    }
+    desc.vertexFunction = [library newFunctionWithName:vertex];
+    desc.fragmentFunction = [library newFunctionWithName:fragment];
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    NSError* error = nil;
+    id<MTLRenderPipelineState> pipeline = [dev newRenderPipelineStateWithDescriptor:desc
+                                                                              error:&error];
+    if (!pipeline) {
+        std::printf("FAIL: raster pipeline %s: %s\n", vertex.UTF8String,
+                    error.localizedDescription.UTF8String);
+        std::exit(1);
+    }
+    return pipeline;
+}
+
+void FullViewport(Metal::Encoder& encoder) {
+    encoder.SetViewport({0, 0, float(kSize), float(kSize), 0, 1});
+    encoder.SetScissor({0, 0, kSize, kSize});
+}
+
+void TestVertexBufferStride() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = RasterLibrary(device);
+    MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+    MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
+    vd.attributes[0].format = MTLVertexFormatFloat2;
+    vd.attributes[0].offset = 0;
+    vd.attributes[0].bufferIndex = 3;
+    vd.attributes[1].format = MTLVertexFormatFloat4;
+    vd.attributes[1].offset = 16;
+    vd.attributes[1].bufferIndex = 3;
+    vd.layouts[3].stride = MTLBufferLayoutStrideDynamic;
+    desc.vertexDescriptor = vd;
+    id<MTLRenderPipelineState> pipeline = RasterPipeline(device, library, @"strided", @"vcolor", desc);
+    // Three vertices, 32 bytes apart: position at +0, red at +16 (the rest is padding).
+    const float pos[3][2] = {{-1, -1}, {3, -1}, {-1, 3}};
+    id<MTLBuffer> vertices = SharedBuffer(device, 3 * 32);
+    for (u32 i = 0; i < 3; ++i) {
+        float* v = reinterpret_cast<float*>(static_cast<u8*>(vertices.contents) + i * 32);
+        v[0] = pos[i][0];
+        v[1] = pos[i][1];
+        v[4] = 1; v[5] = 0; v[6] = 0; v[7] = 1;
+        v[2] = v[3] = 9; // padding that a 16-byte stride would read as vertex data
+    }
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    encoder.BeginRenderPass(ColorPass(target, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)pipeline);
+    FullViewport(encoder);
+    encoder.SetVertexBuffer(3, Ref(vertices), 32);
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.EndRenderPass();
+    id<MTLBuffer> out = Readback(device, encoder, target);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize, 5, 5) == kRed && Pixel(out, kSize, 60, 60) == kRed,
+           "SetVertexBuffer: attributes are read with the given stride");
+    Expect(device.ErrorCount() == 0, "strided vertex buffer ran without errors");
+}
+
+void TestIndirectDraw() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = TestLibrary(device);
+    id<MTLRenderPipelineState> solid = SolidPipeline(device, library, @"fullscreen");
+    id<MTLRenderPipelineState> quad = SolidPipeline(device, library, @"indexed_quad");
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    // MTLDrawPrimitivesIndirectArguments at offset 16 of a shared buffer.
+    id<MTLBuffer> args = SharedBuffer(device, 64);
+    const u32 record[4] = {3, 1, 0, 0};
+    std::memcpy(static_cast<u8*>(args.contents) + 16, record, sizeof(record));
+    // MTLDrawIndexedPrimitivesIndirectArguments: six indices of the left-half quad.
+    id<MTLBuffer> indexed_args = SharedBuffer(device, 32);
+    const u32 indexed_record[5] = {6, 1, 0, 0, 0};
+    std::memcpy(indexed_args.contents, indexed_record, sizeof(indexed_record));
+    const float corners[8] = {-1, -1, 0, -1, -1, 1, 0, 1};
+    id<MTLBuffer> indices = SharedBuffer(device, 12);
+    const u16 index_data[6] = {0, 1, 2, 2, 1, 3};
+    std::memcpy(indices.contents, index_data, sizeof(index_data));
+    id<MTLTexture> target2 = Texture(device, kSize, kSize);
+
+    encoder.BeginRenderPass(ColorPass(target, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)solid);
+    FullViewport(encoder);
+    SetColor(encoder, kGreen);
+    encoder.DrawIndirect(Metal::Primitive::Triangle, Ref(args, 16));
+    encoder.EndRenderPass();
+    encoder.BeginRenderPass(ColorPass(target2, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)quad);
+    FullViewport(encoder);
+    encoder.SetBytes(Metal::Stage::Vertex, 0, corners, sizeof(corners));
+    SetColor(encoder, kBlue);
+    encoder.DrawIndexedIndirect(Metal::Primitive::Triangle, Metal::IndexType::U16, Ref(indices),
+                                Ref(indexed_args));
+    encoder.EndRenderPass();
+    id<MTLBuffer> out = Readback(device, encoder, target);
+    id<MTLBuffer> out2 = Readback(device, encoder, target2);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize, 10, 10) == kGreen && Pixel(out, kSize, 50, 50) == kGreen,
+           "DrawIndirect draws the triangle the GPU-side arguments describe");
+    Expect(Pixel(out2, kSize, 2, kSize / 2) == kBlue && Pixel(out2, kSize, kSize - 2, 2) == kBlack,
+           "DrawIndexedIndirect draws the left half");
+    Expect(device.ErrorCount() == 0, "indirect draws ran without errors");
+}
+
+/// Four records at `stride` bytes, record i drawing quad i; count 2 draws quads 0 and 1 only.
+void RunCountClamp(bool indexed) {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = RasterLibrary(device);
+    id<MTLRenderPipelineState> pipeline = RasterPipeline(device, library, @"quarters", @"solid");
+    id<MTLComputePipelineState> add_one = Kernel(device, library, @"add_one");
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    constexpr u32 stride = 32;
+    id<MTLBuffer> args = SharedBuffer(device, 8 + 4 * stride);
+    for (u32 i = 0; i < 4; ++i) {
+        u32* r = reinterpret_cast<u32*>(static_cast<u8*>(args.contents) + 8 + i * stride);
+        if (indexed) {
+            const u32 rec[5] = {6, 1, 6 * i, 0, 0};
+            std::memcpy(r, rec, sizeof(rec));
+        } else {
+            const u32 rec[4] = {6, 1, 6 * i, 0};
+            std::memcpy(r, rec, sizeof(rec));
+        }
+    }
+    id<MTLBuffer> count = SharedBuffer(device, 64);
+    *reinterpret_cast<u32*>(static_cast<u8*>(count.contents) + 20) = 2;
+    id<MTLBuffer> indices = SharedBuffer(device, 24 * 4);
+    for (u32 i = 0; i < 24; ++i) {
+        reinterpret_cast<u32*>(indices.contents)[i] = i;
+    }
+    id<MTLBuffer> counter = SharedBuffer(device, 16 * 4);
+
+    // The caller's compute state must survive: set it, run a dispatch, clamp-draw, dispatch again.
+    encoder.SetComputePipeline((__bridge void*)add_one);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(counter));
+    encoder.Dispatch({1, 1, 1}, {16, 1, 1});
+    encoder.BeginRenderPass(ColorPass(target, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)pipeline);
+    FullViewport(encoder);
+    SetColor(encoder, kRed);
+    if (indexed) {
+        encoder.SetBuffer(Metal::Stage::Vertex, 1, Ref(indices)); // unused by the shader
+        encoder.DrawIndirectCount(Metal::Primitive::Triangle, Ref(args, 8), stride, Ref(count, 20), 4,
+                                  true, Metal::IndexType::U32, Ref(indices));
+    } else {
+        encoder.DrawIndirectCount(Metal::Primitive::Triangle, Ref(args, 8), stride, Ref(count, 20), 4,
+                                  false);
+    }
+    encoder.EndRenderPass();
+    encoder.Dispatch({1, 1, 1}, {16, 1, 1});
+    id<MTLBuffer> out = Readback(device, encoder, target);
+    device.Wait(encoder.Submit());
+
+    // Quad q covers x in [(q&1)*32, +32), and rows: NDC y -1..0 is the bottom half (rows 32..63).
+    const auto quarter = [&](u32 q) {
+        return Pixel(out, kSize, (q & 1) * 32 + 16, (q >> 1) == 0 ? 48 : 16);
+    };
+    const char* what = indexed ? "indexed: records below the count draw"
+                               : "records below the count draw";
+    Expect(quarter(0) == kRed && quarter(1) == kRed, what);
+    Expect(quarter(2) == kBlack && quarter(3) == kBlack,
+           indexed ? "indexed: records at or above the count draw nothing"
+                   : "records at or above the count draw nothing");
+    Expect(static_cast<const u32*>(counter.contents)[0] == 2 &&
+               static_cast<const u32*>(counter.contents)[15] == 2,
+           "the caller's compute state survives DrawIndirectCount");
+    Expect(device.ErrorCount() == 0, "count-clamped draws ran without errors");
+}
+
+void TestIndirectCountClamp() {
+    RunCountClamp(false);
+    RunCountClamp(true);
+}
+
+void TestDispatchIndirect() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = RasterLibrary(device);
+    id<MTLComputePipelineState> doubles = Kernel(device, library, @"doubles");
+    id<MTLBuffer> out = SharedBuffer(device, 128 * 4);
+    id<MTLBuffer> args = SharedBuffer(device, 32);
+    const u32 groups[3] = {4, 1, 1};
+    std::memcpy(static_cast<u8*>(args.contents) + 12, groups, sizeof(groups));
+    encoder.SetComputePipeline((__bridge void*)doubles);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(out));
+    encoder.DispatchIndirect(Ref(args, 12), {16, 1, 1});
+    device.Wait(encoder.Submit());
+    bool ok = true;
+    for (u32 i = 0; i < 64; ++i) {
+        ok &= static_cast<const u32*>(out.contents)[i] == i * 2;
+    }
+    Expect(ok, "DispatchIndirect runs the GPU-side group count");
+    Expect(static_cast<const u32*>(out.contents)[64] == 0, "and no more groups than that");
+    Expect(device.ErrorCount() == 0, "indirect dispatch ran without errors");
+}
+
+void TestFillModeAndDepthClip() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = RasterLibrary(device);
+    id<MTLRenderPipelineState> triangle = RasterPipeline(device, library, @"small_triangle", @"solid");
+    id<MTLBuffer> scratch = SharedBuffer(device, 16);
+    id<MTLTexture> lines = Texture(device, kSize, kSize);
+    id<MTLTexture> filled = Texture(device, kSize, kSize);
+    id<MTLTexture> clipped = Texture(device, kSize, kSize);
+    id<MTLTexture> clamped = Texture(device, kSize, kSize);
+    const auto draw = [&](id<MTLTexture> t, Metal::FillMode fill, Metal::DepthClip clip, float z,
+                          bool interrupt) {
+        encoder.BeginRenderPass(ColorPass(t, true, kBlack));
+        encoder.SetRenderPipeline((__bridge void*)triangle);
+        FullViewport(encoder);
+        encoder.SetBytes(Metal::Stage::Vertex, 1, &z, sizeof(z));
+        SetColor(encoder, kGreen);
+        encoder.SetFillMode(fill);
+        encoder.SetDepthClip(clip);
+        encoder.Draw(Metal::Primitive::Triangle, 3);
+        if (interrupt) {
+            encoder.FillBuffer(Ref(scratch), 16, 0); // the reopened encoder must get the modes again
+            encoder.Draw(Metal::Primitive::Triangle, 3);
+        }
+        encoder.EndRenderPass();
+    };
+    draw(lines, Metal::FillMode::Lines, Metal::DepthClip::Clip, 0.5f, true);
+    draw(filled, Metal::FillMode::Fill, Metal::DepthClip::Clip, 0.5f, false);
+    draw(clipped, Metal::FillMode::Fill, Metal::DepthClip::Clip, 1.5f, false);
+    draw(clamped, Metal::FillMode::Fill, Metal::DepthClip::Clamp, 1.5f, false);
+    id<MTLBuffer> a = Readback(device, encoder, lines);
+    id<MTLBuffer> b = Readback(device, encoder, filled);
+    id<MTLBuffer> c = Readback(device, encoder, clipped);
+    id<MTLBuffer> d = Readback(device, encoder, clamped);
+    device.Wait(encoder.Submit());
+    bool edge = false;
+    for (u32 y = 54; y < 62; ++y) {
+        edge |= Pixel(a, kSize, kSize / 2, y) == kGreen; // the bottom edge, y = -0.8 in clip space
+    }
+    Expect(edge, "FillMode::Lines draws the edges");
+    Expect(Pixel(a, kSize, kSize / 2, 40) == kBlack, "FillMode::Lines leaves the interior unfilled");
+    Expect(Pixel(b, kSize, kSize / 2, 40) == kGreen, "FillMode::Fill fills the interior");
+    Expect(Pixel(c, kSize, kSize / 2, 40) == kBlack, "DepthClip::Clip drops a triangle beyond the far plane");
+    Expect(Pixel(d, kSize, kSize / 2, 40) == kGreen, "DepthClip::Clamp keeps it");
+    Expect(device.ErrorCount() == 0, "fill and depth-clip modes ran without errors");
+}
+
+void TestDrawPatches() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = RasterLibrary(device);
+    MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+    desc.maxTessellationFactor = 1;
+    desc.tessellationPartitionMode = MTLTessellationPartitionModeInteger;
+    desc.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionConstant;
+    desc.tessellationOutputWindingOrder = MTLWindingCounterClockwise;
+    desc.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+    id<MTLRenderPipelineState> pipeline = RasterPipeline(device, library, @"post_tess_quad", @"solid", desc);
+    // Factors for one quad patch: four edges and two inside factors, all 1.0 (half).
+    id<MTLBuffer> factors = SharedBuffer(device, 64);
+    u16* f = reinterpret_cast<u16*>(static_cast<u8*>(factors.contents) + 16);
+    for (u32 i = 0; i < 6; ++i) {
+        f[i] = 0x3c00;
+    }
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    encoder.BeginRenderPass(ColorPass(target, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)pipeline);
+    FullViewport(encoder);
+    SetColor(encoder, kBlue);
+    encoder.SetTessellationFactorBuffer(Ref(factors, 16), 0);
+    encoder.DrawPatches(4, 0, 1, {}, 1, 0);
+    encoder.EndRenderPass();
+    id<MTLBuffer> out = Readback(device, encoder, target);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize, 3, 3) == kBlue && Pixel(out, kSize, 28, 60) == kBlue &&
+               Pixel(out, kSize, 16, 32) == kBlue,
+           "DrawPatches fills the tessellated quad");
+    Expect(Pixel(out, kSize, kSize - 3, kSize / 2) == kBlack, "and nothing outside it");
+    Expect(device.ErrorCount() == 0, "patch draw ran without errors");
+}
+
+void TestTextureSlot100() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = RasterLibrary(device);
+    id<MTLLibrary> basic = TestLibrary(device);
+    // Vertex "fullscreen" lives in the basic library; build the pipeline by hand.
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+    desc.vertexFunction = [basic newFunctionWithName:@"fullscreen"];
+    desc.fragmentFunction = [library newFunctionWithName:@"tex100"];
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    NSError* error = nil;
+    id<MTLRenderPipelineState> pipeline = [dev newRenderPipelineStateWithDescriptor:desc error:&error];
+    if (!pipeline) {
+        std::printf("FAIL: tex100 pipeline: %s\n", error.localizedDescription.UTF8String);
+        std::exit(1);
+    }
+    id<MTLTexture> source = Texture(device, kSize, kSize);
+    FillTexture(device, encoder, source, kGreen);
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    encoder.BeginRenderPass(ColorPass(target, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)pipeline);
+    FullViewport(encoder);
+    encoder.SetTexture(Metal::Stage::Fragment, 100, (__bridge void*)source);
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.FillBuffer(Ref(SharedBuffer(device, 16)), 16, 0); // forces the slot onto a new encoder
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.EndRenderPass();
+    id<MTLBuffer> out = Readback(device, encoder, target);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize, 10, 10) == kGreen, "a texture bound at slot 100 is sampled");
+    Expect(device.ErrorCount() == 0, "texture slot 100 ran without errors");
+}
+
+void TestDebugGroups() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = TestLibrary(device);
+    id<MTLRenderPipelineState> solid = SolidPipeline(device, library, @"fullscreen");
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    id<MTLBuffer> scratch = SharedBuffer(device, 16);
+    encoder.PushDebugGroup("frame");       // no encoder open: on the command buffer
+    encoder.BeginRenderPass(ColorPass(target, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)solid);
+    FullViewport(encoder);
+    SetColor(encoder, kRed);
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.PushDebugGroup("draw");        // on the open render encoder
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.PushDebugGroup("interrupted"); // the encoder ends before this group is popped
+    encoder.FillBuffer(Ref(scratch), 16, 0);
+    encoder.PopDebugGroup();
+    encoder.PopDebugGroup();
+    encoder.Draw(Metal::Primitive::Triangle, 3); // reopened encoder
+    encoder.EndRenderPass();
+    encoder.PushDebugGroup("compute");
+    encoder.FillBuffer(Ref(scratch), 16, 0x01020304u);
+    encoder.PopDebugGroup();
+    encoder.PopDebugGroup();
+    id<MTLBuffer> out = Readback(device, encoder, target);
+    device.Wait(encoder.Submit());
+    // A command-buffer group popped while an encoder is open, and an encoder group left open.
+    encoder.PushDebugGroup("outer");
+    encoder.BeginRenderPass(ColorPass(target, false, 0));
+    encoder.SetRenderPipeline((__bridge void*)solid); // bindings ended with the Submit
+    FullViewport(encoder);
+    SetColor(encoder, kRed);
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.PopDebugGroup();
+    encoder.PushDebugGroup("left open");
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.EndRenderPass();
+    encoder.PopDebugGroup(); // its encoder is gone; nothing to pop
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize, 5, 5) == kRed, "drawing inside debug groups works");
+    Expect(device.ErrorCount() == 0, "balanced debug groups ran without errors");
+}
+
+void TestComputeEncoderAccess() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = RasterLibrary(device);
+    id<MTLComputePipelineState> add_one = Kernel(device, library, @"add_one");
+    id<MTLComputePipelineState> doubles = Kernel(device, library, @"doubles");
+    id<MTLBuffer> counter = SharedBuffer(device, 16 * 4);
+    id<MTLBuffer> other = SharedBuffer(device, 16 * 4);
+    encoder.SetComputePipeline((__bridge void*)add_one);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(counter));
+    encoder.Dispatch({1, 1, 1}, {16, 1, 1});
+    id<MTLComputeCommandEncoder> raw = (__bridge id<MTLComputeCommandEncoder>)encoder.ComputeEncoder();
+    [raw setComputePipelineState:doubles];
+    [raw setBuffer:other offset:0 atIndex:0];
+    [raw dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(16, 1, 1)];
+    encoder.Dispatch({1, 1, 1}, {16, 1, 1}); // the caller's pipeline and buffer come back
+    device.Wait(encoder.Submit());
+    Expect(static_cast<const u32*>(counter.contents)[3] == 2, "the caller's compute state is re-applied");
+    Expect(static_cast<const u32*>(other.contents)[3] == 6, "the raw compute encoder ran its kernel");
+    Expect(device.ErrorCount() == 0, "compute encoder access ran without errors");
+}
+
 int main() {
     @autoreleasepool {
         TestObject();
@@ -1310,6 +1765,15 @@ int main() {
         TestZeroSizeBlits();
         TestUnalignedPatternFill();
         TestCrossEncoderWait();
+        TestVertexBufferStride();
+        TestIndirectDraw();
+        TestIndirectCountClamp();
+        TestDispatchIndirect();
+        TestFillModeAndDepthClip();
+        TestDrawPatches();
+        TestTextureSlot100();
+        TestDebugGroups();
+        TestComputeEncoderAccess();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

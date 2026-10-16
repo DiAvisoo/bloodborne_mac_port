@@ -18,8 +18,35 @@ namespace Metal {
 
 namespace {
 
-constexpr u32 MaxBuffers = 31, MaxTextures = 32, MaxSamplers = 16;
+constexpr u32 MaxBuffers = 31, MaxTextures = 128, MaxSamplers = 16;
 constexpr u32 MaxInlineBytes = 4096;
+
+/// A bit per texture slot.
+struct TextureMask {
+    std::array<u32, MaxTextures / 32> words{};
+
+    void Set(u32 slot) { words[slot / 32] |= 1u << (slot % 32); }
+    void Clear() { words = {}; }
+    [[nodiscard]] bool Any() const {
+        for (u32 w : words) {
+            if (w) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /// Calls `f(slot)` for every set slot.
+    template <typename F>
+    void ForEach(F&& f) const {
+        for (u32 i = 0; i < words.size(); ++i) {
+            u32 mask = words[i];
+            while (mask) {
+                f(i * 32 + u32(std::countr_zero(mask)));
+                mask &= mask - 1;
+            }
+        }
+    }
+};
 
 /// One stage's resources: what the caller set, and which slots changed since the Metal encoder
 /// last saw them (bit per slot). A new Metal encoder starts empty, so it gets every used slot.
@@ -27,13 +54,14 @@ struct StageState {
     struct Slot {
         void* buffer{};
         u64 offset{};
+        u32 stride{}; ///< non-zero: bound with an attribute stride (vertex buffers)
         std::vector<u8> bytes; ///< non-empty: inline bytes instead of the buffer
     };
     std::array<Slot, MaxBuffers> buffers{};
     std::array<void*, MaxTextures> textures{};
     std::array<void*, MaxSamplers> samplers{};
     u32 buffers_dirty{}, buffers_used{};
-    u32 textures_dirty{}, textures_used{};
+    TextureMask textures_dirty, textures_used;
     u32 samplers_dirty{}, samplers_used{};
 
     void Reapply() {
@@ -81,6 +109,19 @@ MTLCullMode ToMtl(CullMode mode) {
     UNREACHABLE();
 }
 
+/// Zeroes the draw/dispatch-count word (the first) of the argument records whose index is at or
+/// above the GPU-side count: indirect draws with a count.
+constexpr const char* kClampCountSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void clamp_indirect_count(device uint* records [[buffer(0)]],
+                                 device const uint* count [[buffer(1)]],
+                                 constant uint2& params [[buffer(2)]], // stride in words, max count
+                                 uint i [[thread_position_in_grid]]) {
+    if (i < params.y && i >= *count) records[i * params.x] = 0;
+}
+)";
+
 MTLBlitOption BlitOptions(BlitAspect aspect) {
     switch (aspect) {
     case BlitAspect::All:
@@ -127,6 +168,9 @@ struct Encoder::Impl {
         BitBias = 1u << 6,
         BitStencilRef = 1u << 7,
         BitBlend = 1u << 8,
+        BitFill = 1u << 9,
+        BitDepthClip = 1u << 10,
+        BitTessFactors = 1u << 11,
     };
     u32 render_dirty{}, render_used{};
     void* render_pipeline{};
@@ -138,6 +182,11 @@ struct Encoder::Impl {
     float bias[3]{}; ///< constant, slope, clamp
     u32 stencil_front{}, stencil_back{};
     float blend[4]{};
+    FillMode fill{FillMode::Fill};
+    DepthClip depth_clip{DepthClip::Clip};
+    void* tess_factors{};
+    u64 tess_offset{};
+    u32 tess_stride{};
     StageState vertex, fragment;
 
     // Compute state (Task 4).
@@ -147,6 +196,25 @@ struct Encoder::Impl {
 
     std::vector<void*> indirect; ///< declared on every encoder opened (survives Submit)
     id<MTLComputePipelineState> fill_u32;
+    id<MTLComputePipelineState> clamp_count;
+
+    /// Debug groups still open: on the command buffer (`encoder` null) or on the Metal encoder
+    /// that was open when pushed (cleared when that encoder ends and closes the group).
+    struct DebugGroup {
+        bool on_cmd;
+        void* encoder;
+    };
+    std::vector<DebugGroup> groups;
+
+    /// An encoder is about to end: close the groups pushed on it.
+    void CloseGroups(id encoder) {
+        for (size_t i = groups.size(); i-- > 0;) {
+            if (!groups[i].on_cmd && groups[i].encoder == (__bridge void*)encoder) {
+                [(id<MTLCommandEncoder>)encoder popDebugGroup];
+                groups[i].encoder = nullptr;
+            }
+        }
+    }
 
     void DeclareOn(id<MTLRenderCommandEncoder> e) {
         for (void* b : indirect) {
@@ -177,6 +245,30 @@ struct Encoder::Impl {
         bias[0] = bias[1] = bias[2] = 0;
         stencil_front = stencil_back = 0;
         blend[0] = blend[1] = blend[2] = blend[3] = 0;
+        fill = FillMode::Fill;
+        depth_clip = DepthClip::Clip;
+        tess_factors = nullptr;
+        tess_offset = 0;
+        tess_stride = 0;
+    }
+
+    id<MTLComputePipelineState> ClampCountPipeline() {
+        if (!clamp_count) {
+            @autoreleasepool {
+                NSError* error = nil;
+                id<MTLLibrary> lib = [dev newLibraryWithSource:@(kClampCountSource)
+                                                       options:nil
+                                                         error:&error];
+                ASSERT_MSG(lib, "clamp_indirect_count kernel: {}",
+                           error ? error.localizedDescription.UTF8String : "unknown");
+                clamp_count = [dev newComputePipelineStateWithFunction:
+                                       [lib newFunctionWithName:@"clamp_indirect_count"]
+                                                                 error:&error];
+                ASSERT_MSG(clamp_count, "clamp_indirect_count pipeline: {}",
+                           error ? error.localizedDescription.UTF8String : "unknown");
+            }
+        }
+        return clamp_count;
     }
 
     id<MTLComputePipelineState> FillPipeline() {
@@ -209,6 +301,12 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
         EndCompute();
         EndBlit();
         id<MTLCommandBuffer> c = Cmd();
+        for (size_t i = groups.size(); i-- > 0;) {
+            if (groups[i].on_cmd) {
+                [c popDebugGroup]; // unbalanced pushes must not leave the command buffer open
+            }
+        }
+        groups.clear();
         auto* held = new std::vector<Object>(std::move(keep));
         keep.clear();
         [c addCompletedHandler:^(id<MTLCommandBuffer>) {
@@ -236,18 +334,21 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
 
     void EndRender() {
         if (render) {
+            CloseGroups(render);
             [render endEncoding];
             render = nil;
         }
     }
     void EndCompute() {
         if (compute) {
+            CloseGroups(compute);
             [compute endEncoding];
             compute = nil;
         }
     }
     void EndBlit() {
         if (blit) {
+            CloseGroups(blit);
             [blit endEncoding];
             blit = nil;
         }
@@ -302,13 +403,14 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
                 [e setBuffer:(__bridge id<MTLBuffer>)b.buffer offset:b.offset atIndex:slot];
             }
         });
-        ForEachBit(s.textures_dirty, [&](u32 slot) {
+        s.textures_dirty.ForEach([&](u32 slot) {
             [e setTexture:(__bridge id<MTLTexture>)s.textures[slot] atIndex:slot];
         });
         ForEachBit(s.samplers_dirty, [&](u32 slot) {
             [e setSamplerState:(__bridge id<MTLSamplerState>)s.samplers[slot] atIndex:slot];
         });
-        s.buffers_dirty = s.textures_dirty = s.samplers_dirty = 0;
+        s.buffers_dirty = s.samplers_dirty = 0;
+        s.textures_dirty.Clear();
     }
 
     id<MTLRenderCommandEncoder> Render() {
@@ -338,13 +440,18 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
                 } else {
                     [e setFragmentBytes:b.bytes.data() length:b.bytes.size() atIndex:slot];
                 }
+            } else if (is_vertex && b.stride) {
+                [e setVertexBuffer:(__bridge id<MTLBuffer>)b.buffer
+                            offset:b.offset
+                    attributeStride:b.stride
+                           atIndex:slot];
             } else if (is_vertex) {
                 [e setVertexBuffer:(__bridge id<MTLBuffer>)b.buffer offset:b.offset atIndex:slot];
             } else {
                 [e setFragmentBuffer:(__bridge id<MTLBuffer>)b.buffer offset:b.offset atIndex:slot];
             }
         });
-        ForEachBit(s.textures_dirty, [&](u32 slot) {
+        s.textures_dirty.ForEach([&](u32 slot) {
             id<MTLTexture> t = (__bridge id<MTLTexture>)s.textures[slot];
             if (is_vertex) {
                 [e setVertexTexture:t atIndex:slot];
@@ -360,7 +467,8 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
                 [e setFragmentSamplerState:st atIndex:slot];
             }
         });
-        s.buffers_dirty = s.textures_dirty = s.samplers_dirty = 0;
+        s.buffers_dirty = s.samplers_dirty = 0;
+        s.textures_dirty.Clear();
     }
 
     void ApplyRender() {
@@ -399,6 +507,19 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
         }
         if (d & BitBlend) {
             [e setBlendColorRed:blend[0] green:blend[1] blue:blend[2] alpha:blend[3]];
+        }
+        if (d & BitFill) {
+            [e setTriangleFillMode:fill == FillMode::Lines ? MTLTriangleFillModeLines
+                                                           : MTLTriangleFillModeFill];
+        }
+        if (d & BitDepthClip) {
+            [e setDepthClipMode:depth_clip == DepthClip::Clamp ? MTLDepthClipModeClamp
+                                                               : MTLDepthClipModeClip];
+        }
+        if ((d & BitTessFactors) && tess_factors) {
+            [e setTessellationFactorBuffer:(__bridge id<MTLBuffer>)tess_factors
+                                    offset:tess_offset
+                            instanceStride:tess_stride];
         }
         render_dirty = 0;
         ApplyStage(e, vertex, true);
@@ -591,7 +712,7 @@ void Encoder::DeclareIndirect(void* buffer) {
 
 bool Encoder::HasBindings() const noexcept {
     const auto used = [](const StageState& s) {
-        return s.buffers_used | s.textures_used | s.samplers_used;
+        return s.buffers_used | s.textures_used.Any() | s.samplers_used;
     };
     return impl->render_used || impl->compute_pipeline || used(impl->vertex) ||
            used(impl->fragment) || used(impl->compute_stage);
@@ -605,9 +726,15 @@ void Encoder::SetBuffer(Stage stage, u32 slot, BufferRef buffer) {
     StageState::Slot& b = s.buffers[slot];
     b.buffer = buffer.buffer;
     b.offset = buffer.offset;
+    b.stride = 0;
     b.bytes.clear();
     s.buffers_dirty |= 1u << slot;
     s.buffers_used |= 1u << slot;
+}
+
+void Encoder::SetVertexBuffer(u32 slot, BufferRef buffer, u32 stride) {
+    SetBuffer(Stage::Vertex, slot, buffer);
+    impl->vertex.buffers[slot].stride = stride;
 }
 
 void Encoder::SetBytes(Stage stage, u32 slot, const void* data, u32 size) {
@@ -627,6 +754,7 @@ void Encoder::SetBytes(Stage stage, u32 slot, const void* data, u32 size) {
     StageState::Slot& b = s.buffers[slot];
     b.buffer = nullptr;
     b.offset = 0;
+    b.stride = 0;
     b.bytes.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + size);
     s.buffers_dirty |= 1u << slot;
     s.buffers_used |= 1u << slot;
@@ -636,8 +764,8 @@ void Encoder::SetTexture(Stage stage, u32 slot, void* texture) {
     ASSERT(slot < MaxTextures);
     StageState& s = impl->StateOf(stage);
     s.textures[slot] = texture;
-    s.textures_dirty |= 1u << slot;
-    s.textures_used |= 1u << slot;
+    s.textures_dirty.Set(slot);
+    s.textures_used.Set(slot);
 }
 
 void Encoder::SetSampler(Stage stage, u32 slot, void* sampler) {
@@ -662,6 +790,24 @@ void Encoder::Dispatch(Size3 groups, Size3 threads_per_group) {
                   threadsPerThreadgroup:MTLSizeMake(threads_per_group.width,
                                                     threads_per_group.height,
                                                     threads_per_group.depth)];
+}
+
+void Encoder::DispatchIndirect(BufferRef args, Size3 threads_per_group) {
+    ASSERT_MSG(impl->compute_pipeline, "Dispatch without a compute pipeline");
+    impl->ApplyCompute();
+    [impl->compute dispatchThreadgroupsWithIndirectBuffer:(__bridge id<MTLBuffer>)args.buffer
+                                     indirectBufferOffset:args.offset
+                                    threadsPerThreadgroup:MTLSizeMake(threads_per_group.width,
+                                                                      threads_per_group.height,
+                                                                      threads_per_group.depth)];
+}
+
+void* Encoder::ComputeEncoder() {
+    id<MTLComputeCommandEncoder> e = impl->Compute();
+    // The caller's kernels change the pipeline and slots: its next Dispatch applies them again.
+    impl->compute_stage.Reapply();
+    impl->compute_pipeline_dirty = impl->compute_pipeline != nullptr;
+    return (__bridge void*)e;
 }
 
 // ---- Render passes and draws (Task 5) ----
@@ -821,6 +967,23 @@ void Encoder::SetBlendColor(float r, float g, float b, float a) {
     impl->MarkRender(Impl::BitBlend);
 }
 
+void Encoder::SetFillMode(FillMode mode) {
+    impl->fill = mode;
+    impl->MarkRender(Impl::BitFill);
+}
+
+void Encoder::SetDepthClip(DepthClip mode) {
+    impl->depth_clip = mode;
+    impl->MarkRender(Impl::BitDepthClip);
+}
+
+void Encoder::SetTessellationFactorBuffer(BufferRef factors, u32 instance_stride) {
+    impl->tess_factors = factors.buffer;
+    impl->tess_offset = factors.offset;
+    impl->tess_stride = instance_stride;
+    impl->MarkRender(Impl::BitTessFactors);
+}
+
 void Encoder::Draw(Primitive primitive, u32 vertex_count, u32 instance_count, u32 first_vertex,
                    u32 first_instance) {
     ASSERT_MSG(impl->render_pipeline, "Draw without a render pipeline");
@@ -845,6 +1008,104 @@ void Encoder::DrawIndexed(Primitive primitive, u32 index_count, IndexType type, 
                           instanceCount:instance_count
                              baseVertex:base_vertex
                            baseInstance:first_instance];
+}
+
+void Encoder::DrawIndirect(Primitive primitive, BufferRef args) {
+    ASSERT_MSG(impl->render_pipeline, "Draw without a render pipeline");
+    impl->ApplyRender();
+    [impl->render drawPrimitives:ToMtl(primitive)
+                  indirectBuffer:(__bridge id<MTLBuffer>)args.buffer
+            indirectBufferOffset:args.offset];
+}
+
+void Encoder::DrawIndexedIndirect(Primitive primitive, IndexType type, BufferRef indices,
+                                  BufferRef args) {
+    ASSERT_MSG(impl->render_pipeline, "Draw without a render pipeline");
+    impl->ApplyRender();
+    [impl->render drawIndexedPrimitives:ToMtl(primitive)
+                              indexType:type == IndexType::U32 ? MTLIndexTypeUInt32
+                                                               : MTLIndexTypeUInt16
+                            indexBuffer:(__bridge id<MTLBuffer>)indices.buffer
+                      indexBufferOffset:indices.offset
+                         indirectBuffer:(__bridge id<MTLBuffer>)args.buffer
+                   indirectBufferOffset:args.offset];
+}
+
+void Encoder::DrawIndirectCount(Primitive primitive, BufferRef args, u32 stride, BufferRef count,
+                                u32 max_count, bool indexed, IndexType type, BufferRef indices) {
+    ASSERT_MSG(impl->render_pipeline, "Draw without a render pipeline");
+    ASSERT_MSG(stride % 4 == 0 && stride >= (indexed ? 20u : 16u),
+               "indirect argument stride {} cannot hold the records", stride);
+    if (max_count == 0) {
+        return;
+    }
+    // The clamp runs on its own compute encoder, so the caller's compute state is untouched. The
+    // render encoder ends here; the pass reopens (Load) at the draws below, after the clamp.
+    impl->FlushPendingClear();
+    impl->EndRender();
+    impl->EndCompute();
+    impl->EndBlit();
+    id<MTLComputePipelineState> pipeline = impl->ClampCountPipeline();
+    const u32 params[2] = {stride / 4, max_count};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = [impl->Cmd() computeCommandEncoder];
+        [e setComputePipelineState:pipeline];
+        [e setBuffer:(__bridge id<MTLBuffer>)args.buffer offset:args.offset atIndex:0];
+        [e setBuffer:(__bridge id<MTLBuffer>)count.buffer offset:count.offset atIndex:1];
+        [e setBytes:params length:sizeof(params) atIndex:2];
+        [e dispatchThreads:MTLSizeMake(max_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [e endEncoding];
+    }
+    for (u32 i = 0; i < max_count; ++i) {
+        const BufferRef record{args.buffer, args.offset + u64(i) * stride};
+        if (indexed) {
+            DrawIndexedIndirect(primitive, type, indices, record);
+        } else {
+            DrawIndirect(primitive, record);
+        }
+    }
+}
+
+void Encoder::DrawPatches(u32 control_points, u32 patch_start, u32 patch_count,
+                          BufferRef patch_index_buffer, u32 instance_count, u32 base_instance) {
+    ASSERT_MSG(impl->render_pipeline, "Draw without a render pipeline");
+    impl->ApplyRender();
+    [impl->render drawPatches:control_points
+                   patchStart:patch_start
+                   patchCount:patch_count
+             patchIndexBuffer:(__bridge id<MTLBuffer>)patch_index_buffer.buffer
+       patchIndexBufferOffset:patch_index_buffer.offset
+                instanceCount:instance_count
+                 baseInstance:base_instance];
+}
+
+void Encoder::PushDebugGroup(std::string_view label) {
+    @autoreleasepool {
+        NSString* name = [[NSString alloc] initWithBytes:label.data()
+                                                  length:label.size()
+                                                encoding:NSUTF8StringEncoding];
+        id<MTLCommandEncoder> open = impl->render ? (id<MTLCommandEncoder>)impl->render
+                                     : impl->compute ? (id<MTLCommandEncoder>)impl->compute
+                                                     : (id<MTLCommandEncoder>)impl->blit;
+        if (open) {
+            [open pushDebugGroup:name];
+            impl->groups.push_back({false, (__bridge void*)open});
+        } else {
+            [impl->Cmd() pushDebugGroup:name];
+            impl->groups.push_back({true, nullptr});
+        }
+    }
+}
+
+void Encoder::PopDebugGroup() {
+    ASSERT_MSG(!impl->groups.empty(), "PopDebugGroup without a PushDebugGroup");
+    const Impl::DebugGroup group = impl->groups.back();
+    impl->groups.pop_back();
+    if (group.on_cmd) {
+        [impl->Cmd() popDebugGroup];
+    } else if (group.encoder) { // else its encoder ended and closed it
+        [(__bridge id<MTLCommandEncoder>)group.encoder popDebugGroup];
+    }
 }
 
 bool Encoder::InRenderPass() const noexcept {

@@ -10,6 +10,7 @@
 
 #include <array>
 #include <memory>
+#include <string_view>
 #include "common/types.h"
 #include "video_core/renderer_metal/mtl_object.h"
 
@@ -23,6 +24,8 @@ enum class IndexType : u8 { U16, U32 };
 enum class CullMode : u8 { None, Front, Back };
 enum class BlitAspect : u8 { All, Depth, Stencil };
 enum class Winding : u8 { Clockwise, CounterClockwise };
+enum class FillMode : u8 { Fill, Lines };
+enum class DepthClip : u8 { Clip, Clamp };
 
 struct Origin3 {
     u32 x{}, y{}, z{};
@@ -88,9 +91,13 @@ public:
     void SetDepthBias(float constant, float slope, float clamp);
     void SetStencilReference(u32 front, u32 back);
     void SetBlendColor(float r, float g, float b, float a);
+    void SetFillMode(FillMode mode);
+    void SetDepthClip(DepthClip mode);
+    /// Tessellation factors for DrawPatches (setTessellationFactorBuffer:offset:instanceStride:).
+    void SetTessellationFactorBuffer(BufferRef factors, u32 instance_stride);
 
     // Resources by stage and slot: render stages apply at the next draw, compute at the next
-    // dispatch. Slots: buffers 0-30, textures 0-31, samplers 0-15.
+    // dispatch. Slots: buffers 0-30, textures 0-127, samplers 0-15.
     // Bindings are unretained pointers that stay bound until replaced, into new Metal encoders
     // (which get every bound slot again) but not across Submit: a new command buffer starts
     // unbound, as in Vulkan, so objects may be freed once their command buffer was submitted.
@@ -98,6 +105,10 @@ public:
     /// Copies `size` bytes now. Up to 4 KiB they go inline (setBytes); more go through a
     /// temporary shared buffer kept until the command buffer completes.
     void SetBytes(Stage stage, u32 slot, const void* data, u32 size);
+    /// A vertex buffer with an attribute stride (the pipeline's vertex layout uses
+    /// MTLBufferLayoutStrideDynamic): setVertexBuffer:offset:attributeStride:. Occupies the
+    /// vertex-stage buffer `slot`, like SetBuffer(Stage::Vertex, ...), and is replaced by it.
+    void SetVertexBuffer(u32 slot, BufferRef buffer, u32 stride);
     void SetTexture(Stage stage, u32 slot, void* texture); ///< id<MTLTexture>
     void SetSampler(Stage stage, u32 slot, void* sampler); ///< id<MTLSamplerState>
 
@@ -105,10 +116,31 @@ public:
               u32 first_instance = 0);
     void DrawIndexed(Primitive primitive, u32 index_count, IndexType type, BufferRef indices,
                      u32 instance_count = 1, s32 base_vertex = 0, u32 first_instance = 0);
+    /// Draws with GPU-side arguments: MTLDrawPrimitivesIndirectArguments at `args`.
+    void DrawIndirect(Primitive primitive, BufferRef args);
+    /// MTLDrawIndexedPrimitivesIndirectArguments at `args`.
+    void DrawIndexedIndirect(Primitive primitive, IndexType type, BufferRef indices, BufferRef args);
+    /// Multi-draw indirect with a GPU count: clamps the `max_count` argument records at `args`
+    /// (stride `stride` bytes) so records at index >= *count draw nothing (vertex/index count 0),
+    /// with a compute pass before the render pass reopens, then issues max_count indirect draws.
+    /// The records are modified in place; the caller's compute state is untouched.
+    void DrawIndirectCount(Primitive primitive, BufferRef args, u32 stride, BufferRef count,
+                           u32 max_count, bool indexed, IndexType type = IndexType::U16,
+                           BufferRef indices = {});
+    /// Patch draw (drawPatches:...): `patch_index_buffer` may be empty. Needs a tessellation
+    /// render pipeline and SetTessellationFactorBuffer.
+    void DrawPatches(u32 control_points, u32 patch_start, u32 patch_count,
+                     BufferRef patch_index_buffer, u32 instance_count, u32 base_instance);
 
     // Compute.
     void SetComputePipeline(void* pipeline); ///< id<MTLComputePipelineState>
     void Dispatch(Size3 groups, Size3 threads_per_group);
+    /// Threadgroup counts (3 u32) are read from `args` on the GPU.
+    void DispatchIndirect(BufferRef args, Size3 threads_per_group);
+    /// The open compute encoder (id<MTLComputeCommandEncoder>, opened if needed) for kernels
+    /// encoded outside the Encoder (tessellation and geometry emulation). The caller's pipeline
+    /// and slots are re-applied by its next Dispatch.
+    void* ComputeEncoder();
 
     // Blits. Inside a render pass they end the render encoder; the pass continues afterwards.
     void CopyBuffer(BufferRef src, BufferRef dst, u64 size);
@@ -137,6 +169,10 @@ public:
     /// 0: no-op (already complete). `device_tick` must already be committed (asserted): the queue
     /// starts command buffers in commit order, so waiting for a later commit never ends.
     void WaitForDeviceTick(u64 device_tick);
+    /// Debug groups: on the command buffer when no encoder is open, else on the open encoder
+    /// (closed with the encoder if still open then). Pops must match pushes.
+    void PushDebugGroup(std::string_view label);
+    void PopDebugGroup();
     /// Keeps `object` alive until the current command buffer completes.
     void KeepAlive(Object object);
     /// Ends the open render, compute or blit encoder (a pass in progress reopens with Load).
