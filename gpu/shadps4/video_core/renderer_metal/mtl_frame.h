@@ -55,7 +55,10 @@ struct Owned {
     // Render pass (vkCmdBeginRendering .. vkCmdEndRendering). `pass` reopens it (loading, not
     // clearing) after work that had to interrupt it (tessellation kernels).
     bool rendering{};
-    MTLRenderPassDescriptor* pass;
+    MTLRenderPassDescriptor* pass;       ///< the pass with Load actions (reopening)
+    MTLRenderPassDescriptor* pass_first; ///< as begun (its clears); opened at the first draw
+    bool pass_opened{};                  ///< an encoder of this pass was created
+    bool pass_clears{};                  ///< pass_first clears something
     // Scratch memory for tessellation (bump-allocated, kept until the GPU is done).
     id<MTLBuffer> scratch;
     u64 scratch_used{};

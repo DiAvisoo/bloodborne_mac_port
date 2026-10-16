@@ -170,6 +170,29 @@ void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
     }
 }
 
+/// The render encoder of the current pass, opened on first use: a pass without draws costs
+/// nothing unless it clears (EndRendering), and work before its first draw (tessellation
+/// kernels) goes before it instead of splitting it.
+id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
+    if (o.render || !o.pass) {
+        return o.render;
+    }
+    if (o.compute) {
+        [o.compute endEncoding];
+        o.compute = nil;
+    }
+    if (o.blit) {
+        [o.blit endEncoding];
+        o.blit = nil;
+    }
+    o.render = [o.cmd renderCommandEncoderWithDescriptor:o.pass_opened ? o.pass : o.pass_first];
+    o.pass_opened = true;
+    if (o.render) {
+        UseAddressBuffers(o.render, true);
+    }
+    return o.render;
+}
+
 id<MTLComputeCommandEncoder> ComputeEncoder(Owned& o) {
     if (o.compute) {
         return o.compute;
@@ -310,7 +333,7 @@ u32 IndexSize(VkIndexType type) {
 
 /// Draw state from the pipeline and the dynamic state; false: skip the draw.
 bool PrepareDraw(Owned& o) {
-    if (!o.render) {
+    if (!RenderEncoder(o)) {
         Log("a draw outside a render pass (skipped)");
         return false;
     }
@@ -789,8 +812,18 @@ void BeginRendering(Owned& o, const VkRenderingInfo* info) {
     }
     o.target_width = width;
     o.target_height = height;
-    o.render = [o.cmd renderCommandEncoderWithDescriptor:rp];
     o.rendering = true;
+    o.pass_first = rp;
+    o.pass_opened = false;
+    o.pass_clears = false;
+    for (u32 i = 0; i < info->colorAttachmentCount; ++i) {
+        o.pass_clears |= rp.colorAttachments[i].texture &&
+                         rp.colorAttachments[i].loadAction == MTLLoadActionClear;
+    }
+    o.pass_clears |= (rp.depthAttachment.texture &&
+                      rp.depthAttachment.loadAction == MTLLoadActionClear) ||
+                     (rp.stencilAttachment.texture &&
+                      rp.stencilAttachment.loadAction == MTLLoadActionClear);
     // A reopened pass loads what this one cleared and drew.
     MTLRenderPassDescriptor* again = [rp copy];
     for (u32 i = 0; i < info->colorAttachmentCount; ++i) {
@@ -802,20 +835,19 @@ void BeginRendering(Owned& o, const VkRenderingInfo* info) {
     again.stencilAttachment.loadAction = MTLLoadActionLoad;
     again.stencilAttachment.storeAction = MTLStoreActionStore;
     o.pass = again;
-    if (!o.render) {
-        Log("a render pass Metal refused (its draws are skipped)");
-        return;
-    }
-    UseAddressBuffers(o.render, true);
 }
 
 void EndRendering(Owned& o) {
+    if (!o.render && !o.pass_opened && o.pass_clears) {
+        RenderEncoder(o); // a pass without draws still performs its clears
+    }
     if (o.render) {
         [o.render endEncoding];
         o.render = nil;
     }
     o.rendering = false;
     o.pass = nil;
+    o.pass_first = nil;
     // BB_METAL_CHUNK=<draws> (default 0: off): commit partway through the frame. Off because the
     // renderer writes guest data into GPU memory from the CPU while it records (host copies),
     // assuming nothing of the frame runs before the submit: an early chunk read data meant for
@@ -984,9 +1016,7 @@ void TessellatedDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 ver
                        vb.buffer ? vb.offset : 0, slot.constant || !vb.stride ? 16 : vb.stride,
                        slot.slot};
     }
-    // Steps 1 and 2: the kernels interrupt the render pass.
-    [o.render endEncoding];
-    o.render = nil;
+    // Steps 1 and 2: the kernels go before the pass when it has not begun, else interrupt it.
     id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
     const auto plan = Metal::Tessellation::PlanScratch(tess, patches);
     const auto [scratch, scratch_offset] = Scratch(o, plan.total);
@@ -998,9 +1028,7 @@ void TessellatedDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 ver
                                        (__bridge void*)scratch, scratch_offset, plan, bind, bind);
     [o.compute endEncoding];
     o.compute = nil;
-    // Step 3: the render pass again (loading), the patch draw.
-    o.render = [o.cmd renderCommandEncoderWithDescriptor:o.pass];
-    UseAddressBuffers(o.render, true);
+    // Step 3: the render pass (begun, or reopened loading), the patch draw.
     if (!PrepareDraw(o)) {
         return;
     }
@@ -1066,8 +1094,6 @@ void GeometryDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 vertex
                        vb.buffer ? vb.offset : 0, slot.constant || !vb.stride ? 16 : vb.stride,
                        slot.slot};
     }
-    [o.render endEncoding];
-    o.render = nil;
     id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
     const auto bind = [&](const Metal::CompiledShader& shader) {
         BindStage(o, Stage::Compute, &shader, o.graphics_bindings);
@@ -1098,10 +1124,6 @@ void GeometryDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 vertex
                                        bind, bind);
         chunks.push_back(chunk);
     }
-    [o.compute endEncoding];
-    o.compute = nil;
-    o.render = [o.cmd renderCommandEncoderWithDescriptor:o.pass];
-    UseAddressBuffers(o.render, true);
     if (!PrepareDraw(o)) {
         return;
     }
