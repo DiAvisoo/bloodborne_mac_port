@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <pthread.h>
+#include <thread>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -152,16 +155,22 @@ struct PsoCache::Impl {
 
     // The binary archive. Metal cannot serialize an archive again once pipelines that reuse its
     // functions were added after a serialization (tests/test_mtl_archive.mm, cases k and l), so
-    // the archive in use is only looked up, and every Flush writes a fresh archive built from the
-    // descriptors of all pipelines this session created or took from the archive.
+    // the archive in use is only looked up, and every write (writer thread, Flush) is a fresh
+    // archive built from the descriptors of all pipelines this session created or took from it.
     id<MTLBinaryArchive> archive; ///< the archive loaded at startup (or an empty one); nil: none
-    std::mutex archive_mutex;     ///< guards `recorded` and `unwritten`
+    std::mutex archive_mutex;     ///< guards the members up to `stop`
     NSMutableArray* recorded = [NSMutableArray array]; ///< one descriptor per PSO key and stage
     u64 unwritten{};              ///< pipelines compiled since the last successful write
-    std::mutex flush_mutex;       ///< one Flush at a time (it runs on the creation threads)
-    bool archive_error_logged{};  ///< guarded by flush_mutex
-    std::chrono::steady_clock::time_point last_write{}; ///< guarded by flush_mutex
+    /// The last write attempt (or the cache's creation): the writer waits kWriteInterval after it.
+    std::chrono::steady_clock::time_point last_write = std::chrono::steady_clock::now();
+    bool stop{};                  ///< the writer thread ends
+    std::condition_variable writer_cv;
+    std::thread writer;           ///< PsoCache::WriterLoop
+    std::mutex flush_mutex;       ///< one write at a time (writer thread or Flush)
+    std::string last_error;       ///< guarded by flush_mutex: logged once per distinct error
 };
+
+constexpr auto kWriteInterval = std::chrono::seconds{10};
 
 RenderPipeline::~RenderPipeline() {
     // Balance the +1 of __bridge_retained; ARC releases at the end of the scope.
@@ -228,23 +237,52 @@ PsoCache::PsoCache(Device& device_, std::filesystem::path cache_dir)
         }
         impl->archive = archive;
     }
+    if (impl->archive) {
+        impl->writer = std::thread{[this] { WriterLoop(); }};
+    }
 }
 
 PsoCache::~PsoCache() {
+    if (impl->writer.joinable()) {
+        {
+            std::scoped_lock lock{impl->archive_mutex};
+            impl->stop = true;
+        }
+        impl->writer_cv.notify_all();
+        impl->writer.join();
+    }
     Flush();
 }
 
-bool PsoCache::Flush(bool wait) {
-    // A write costs ~2.5 ms per pipeline (all of them, every time): a periodic Flush (`wait`
-    // false) skips while another one runs or when the last write is recent.
-    constexpr auto kMinPeriodicInterval = std::chrono::seconds{10};
-    std::unique_lock flush_lock{impl->flush_mutex, std::defer_lock};
-    if (wait) {
-        flush_lock.lock();
-    } else if (!flush_lock.try_lock() ||
-               std::chrono::steady_clock::now() - impl->last_write < kMinPeriodicInterval) {
-        return true;
+void PsoCache::WriterLoop() {
+    pthread_setname_np("bb:PsoArchive");
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    std::unique_lock lock{impl->archive_mutex};
+    while (true) {
+        impl->writer_cv.wait(lock, [&] { return impl->stop || impl->unwritten > 0; });
+        if (impl->stop) {
+            return;
+        }
+        // Everything compiled until then goes into one write (the destructor writes the rest).
+        const auto due = impl->last_write + kWriteInterval;
+        if (impl->writer_cv.wait_until(lock, due, [&] { return impl->stop; })) {
+            return;
+        }
+        lock.unlock();
+        {
+            std::scoped_lock flush_lock{impl->flush_mutex};
+            WriteArchive();
+        }
+        lock.lock();
     }
+}
+
+bool PsoCache::Flush() {
+    std::scoped_lock flush_lock{impl->flush_mutex}; // waits for the writer's write in flight
+    return WriteArchive();
+}
+
+bool PsoCache::WriteArchive() {
     NSArray* descriptors = nil;
     u64 unwritten = 0;
     {
@@ -255,7 +293,8 @@ bool PsoCache::Flush(bool wait) {
         descriptors = [impl->recorded copy];
         unwritten = impl->unwritten;
     }
-    std::string error;
+    std::string error, first_add_error;
+    u64 add_failures = 0;
     @autoreleasepool {
         NSError* ns_error = nil;
         id<MTLBinaryArchive> fresh =
@@ -273,11 +312,13 @@ bool PsoCache::Flush(bool wait) {
                 [descriptor isKindOfClass:[MTLRenderPipelineDescriptor class]]
                     ? [fresh addRenderPipelineFunctionsWithDescriptor:descriptor error:&ns_error]
                     : [fresh addComputePipelineFunctionsWithDescriptor:descriptor error:&ns_error];
-            if (!added && !impl->archive_error_logged) {
-                impl->archive_error_logged = true;
-                LOG_WARNING(Render, "Metal binary archive: adding pipeline {} failed ({}), "
-                                    "leaving it out",
-                            [[descriptor label] UTF8String] ?: "?", FirstLine(ns_error));
+            if (!added) {
+                ++counters.archive_add_failures;
+                ++add_failures;
+                if (first_add_error.empty()) {
+                    first_add_error = fmt::format("{}: {}", [[descriptor label] UTF8String] ?: "?",
+                                                  FirstLine(ns_error));
+                }
             }
         }
         if (fresh) {
@@ -297,14 +338,23 @@ bool PsoCache::Flush(bool wait) {
             }
         }
     }
+    if (add_failures) {
+        LOG_WARNING(Render, "Metal binary archive: {} pipeline(s) could not be added and are left "
+                            "out (first: {})",
+                    add_failures, first_add_error);
+    }
+    std::scoped_lock lock{impl->archive_mutex};
+    impl->last_write = std::chrono::steady_clock::now(); // failures back off too
     if (!error.empty()) {
         ++counters.archive_write_failures;
-        LOG_WARNING(Render, "Metal binary archive {} could not be written: {}",
-                    archive_path.string(), error);
-        return false; // `unwritten` stays: the next Flush tries again
+        if (error != impl->last_error) {
+            impl->last_error = error;
+            LOG_WARNING(Render, "Metal binary archive {} could not be written: {}",
+                        archive_path.string(), error);
+        }
+        return false; // `unwritten` stays: the next write tries again
     }
-    impl->last_write = std::chrono::steady_clock::now();
-    std::scoped_lock lock{impl->archive_mutex};
+    ++counters.archive_writes;
     impl->unwritten -= unwritten;
     return true;
 }
@@ -348,9 +398,14 @@ void RecordPipeline(PsoCache::Impl& impl, NSArray* descriptors, bool compiled) {
     if (!impl.archive || descriptors.count == 0) {
         return;
     }
-    std::scoped_lock lock{impl.archive_mutex};
-    [impl.recorded addObjectsFromArray:descriptors];
-    impl.unwritten += compiled;
+    {
+        std::scoped_lock lock{impl.archive_mutex};
+        [impl.recorded addObjectsFromArray:descriptors];
+        impl.unwritten += compiled;
+    }
+    if (compiled) {
+        impl.writer_cv.notify_one(); // the writer thread; this thread never writes
+    }
 }
 
 } // namespace

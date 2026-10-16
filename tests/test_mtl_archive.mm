@@ -10,10 +10,10 @@
 // functions it already holds (the same function, or an identical one from another library) fails
 // every later serialization; the renderer wrote its archive every 32 pipelines. An archive
 // serialized once, after all its additions, works: the renderer writes a fresh archive of every
-// pipeline it recorded at each Flush (case m, asserted). Each case below builds a fresh archive, adds
-// pipelines and serializes it to a temporary file. Cases the renderer relies on must PASS; configurations Metal refuses are printed as INFO
-// (the renderer avoids them). Finally a serialized archive is reloaded and the pipelines are
-// created with MTLPipelineOptionFailOnBinaryArchiveMiss to prove that they come from it.
+// pipeline it recorded (cases m and m2, asserted). Each case builds a fresh archive, adds
+// pipelines and serializes it to a temporary file. Cases the renderer relies on must PASS;
+// configurations Metal refuses are printed as INFO (the renderer avoids them). Reloaded archives
+// are checked with MTLPipelineOptionFailOnBinaryArchiveMiss to prove the pipelines come from them.
 //
 // Pure Metal: no renderer library.
 
@@ -263,6 +263,70 @@ std::string SerializeBetween(id<MTLDevice> device, NSArray* first, NSArray* seco
     return error;
 }
 
+/// PsoCache::CreateWithArchive: from `lookup` (FailOnBinaryArchiveMiss) when given and it has the
+/// pipeline (`hit`), else compiled; `binaryArchives` is cleared afterwards. Nil on failure.
+id CreateState(id<MTLDevice> device, id desc, id<MTLBinaryArchive> lookup, bool& hit) {
+    const bool render = [desc isKindOfClass:[MTLRenderPipelineDescriptor class]];
+    auto create = [&](MTLPipelineOption options) -> id {
+        NSError* error = nil;
+        return render ? (id)[device newRenderPipelineStateWithDescriptor:desc
+                                                                 options:options
+                                                              reflection:nil
+                                                                   error:&error]
+                      : (id)[device newComputePipelineStateWithDescriptor:desc
+                                                                  options:options
+                                                               reflection:nil
+                                                                    error:&error];
+    };
+    id state = nil;
+    hit = false;
+    if (lookup) {
+        [desc setBinaryArchives:@[ lookup ]];
+        state = create(MTLPipelineOptionFailOnBinaryArchiveMiss);
+        hit = state != nil;
+    }
+    if (!state) {
+        state = create(MTLPipelineOptionNone);
+    }
+    [desc setBinaryArchives:nil];
+    return state;
+}
+
+/// PsoCache::WriteArchive: a fresh archive of every recorded descriptor, serialized once.
+std::string WriteFresh(id<MTLDevice> device, NSArray* recorded, NSURL* url) {
+    id<MTLBinaryArchive> fresh = NewArchive(device, nil);
+    if (!fresh) {
+        return "no archive";
+    }
+    for (id desc in recorded) {
+        NSError* error = nil;
+        const BOOL added = [desc isKindOfClass:[MTLRenderPipelineDescriptor class]]
+                               ? [fresh addRenderPipelineFunctionsWithDescriptor:desc error:&error]
+                               : [fresh addComputePipelineFunctionsWithDescriptor:desc error:&error];
+        if (!added) {
+            return "add: " + ErrorText(error);
+        }
+    }
+    NSError* error = nil;
+    if (![fresh serializeToURL:url error:&error]) {
+        return "write of " + std::to_string(recorded.count) + ": " + ErrorText(error);
+    }
+    return {};
+}
+
+/// How many of `descriptors` the archive file at `url` has (FailOnBinaryArchiveMiss).
+int CountHits(id<MTLDevice> device, NSArray* descriptors, NSURL* url) {
+    id<MTLBinaryArchive> loaded = NewArchive(device, url);
+    int hits = 0;
+    for (id desc in descriptors) {
+        bool hit = false;
+        if (loaded && CreateState(device, desc, loaded, hit) && hit) {
+            ++hits;
+        }
+    }
+    return hits;
+}
+
 } // namespace
 
 int main() {
@@ -340,8 +404,8 @@ int main() {
         // pipeline that reuses a function the archive already holds can break every later
         // serialization ("expecting 'fragment' stage" / "missing 'vertex' stage in pipeline no.
         // N"). Which reuse breaks depends on the functions (here and in the renderer it was the
-        // vertex function in some runs, the fragment function in others), so l1-l3 are INFO
-        // whatever they print. The game reuses shaders across many pipelines, so the renderer's
+        // vertex function in some runs, the fragment function in others), so l1-l3 are not
+        // asserted (PASS or INFO). The game reuses shaders across many pipelines, so the renderer's
         // archive, written every 32 pipelines, failed. An archive serialized once, after all its
         // additions, works (l4, l5).
         {
@@ -364,52 +428,95 @@ int main() {
             Case(device, true, "l5: vertex function reused, serialized once",
                  @[ ColorPipeline(vs, fs), ColorPipeline(vs, fs2), blended ]);
 
-            // (m) The renderer's configuration (PsoCache::Flush): every write builds a fresh
-            // archive from all descriptors recorded so far and serializes it once. Two writes,
-            // the second batch reusing the first batch's functions (what fails in l1-l3), then
-            // the file is reloaded and every pipeline must be an archive hit.
+            // (m) The renderer's configuration (PsoCache): pipelines are created (looked up in the
+            // loaded archive, or compiled), their descriptors recorded, and every write builds a
+            // fresh archive of all recorded descriptors, serialized once. Two writes, the second
+            // batch reusing the first batch's functions (what fails in l1-l3), with a compute
+            // pipeline; then the file is reloaded and every pipeline must be an archive hit.
+            id<MTLFunction> cs = Function(
+                device,
+                @"#include <metal_stdlib>\nusing namespace metal;\n"
+                 "kernel void compute_m(device float* b [[buffer(0)]], uint i "
+                 "[[thread_position_in_grid]]) { b[i] *= 3.0f; }\n",
+                @"compute_m");
+            MTLComputePipelineDescriptor* compute = [MTLComputePipelineDescriptor new];
+            compute.computeFunction = cs;
             NSMutableArray* recorded = [NSMutableArray array];
-            NSArray* batches[2] = {@[ ColorPipeline(vs, fs) ],
+            NSArray* batches[2] = {@[ ColorPipeline(vs, fs), compute ],
                                    @[ ColorPipeline(vs2, fs), ColorPipeline(vs, fs2), blended ]};
             NSURL* url = TempURL("renderer");
             error.clear();
             for (NSArray* batch : batches) {
-                id<MTLBinaryArchive> unused = NewArchive(device, nil); // lookups only in the renderer
                 for (id desc in batch) {
-                    if (error.empty()) {
-                        error = CreateAndAdd(device, unused, desc, false);
+                    bool hit = false;
+                    if (error.empty() && !CreateState(device, desc, nil, hit)) {
+                        error = "pipeline creation failed";
                     }
                 }
                 [recorded addObjectsFromArray:batch];
-                id<MTLBinaryArchive> fresh = NewArchive(device, nil);
-                for (id desc in recorded) {
-                    if (error.empty()) {
-                        NSError* ns_error = nil;
-                        if (![fresh addRenderPipelineFunctionsWithDescriptor:desc error:&ns_error]) {
-                            error = "add: " + ErrorText(ns_error);
-                        }
-                    }
-                }
-                NSError* ns_error = nil;
-                if (error.empty() && ![fresh serializeToURL:url error:&ns_error]) {
-                    error = "write " + std::to_string(recorded.count) + ": " + ErrorText(ns_error);
+                if (error.empty()) {
+                    error = WriteFresh(device, recorded, url);
                 }
             }
             Report(true, error.empty(), "m: renderer's writes (fresh archive of all recorded pipelines)", error);
             if (error.empty()) {
-                id<MTLBinaryArchive> loaded = NewArchive(device, url);
-                int hits = 0;
-                for (MTLRenderPipelineDescriptor* desc in recorded) {
-                    desc.binaryArchives = @[ loaded ];
-                    NSError* ns_error = nil;
-                    hits += [device newRenderPipelineStateWithDescriptor:desc
-                                                                 options:MTLPipelineOptionFailOnBinaryArchiveMiss
-                                                              reflection:nil
-                                                                   error:&ns_error] != nil;
-                }
+                const int hits = CountHits(device, recorded, url);
                 Report(true, hits == static_cast<int>(recorded.count),
                        "m: reloaded, every pipeline is an archive hit",
                        std::to_string(hits) + " of " + std::to_string(recorded.count));
+            }
+
+            // (m2) The next session: m's file is loaded, its pipelines come from it (hits), a new
+            // pipeline reusing their functions is compiled, and the fresh write of all of them
+            // reloads with every pipeline a hit. Before (INFO): the new pipeline added to the
+            // loaded archive itself and that archive serialized again.
+            if (error.empty()) {
+                id<MTLBinaryArchive> loaded = NewArchive(device, url);
+                NSMutableArray* session = [NSMutableArray array];
+                int hits = 0;
+                for (id desc in recorded) {
+                    bool hit = false;
+                    if (CreateState(device, desc, loaded, hit)) {
+                        hits += hit;
+                        [session addObject:desc];
+                    }
+                }
+                // Functions of the hits, in a state the file has no pipeline for.
+                MTLRenderPipelineDescriptor* added = ColorPipeline(vs2, fs2);
+                added.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+                added.colorAttachments[0].blendingEnabled = YES;
+                bool new_hit = true;
+                if (!CreateState(device, added, loaded, new_hit)) {
+                    error = "pipeline creation failed";
+                }
+                [session addObject:added];
+                Report(true, hits == static_cast<int>(recorded.count) && !new_hit,
+                       "m2: next session, the loaded archive's pipelines are hits, the new one is not",
+                       std::to_string(hits) + " of " + std::to_string(recorded.count) +
+                           (new_hit ? ", the new one too" : ""));
+
+                NSError* ns_error = nil;
+                std::string old_way;
+                if (![loaded addRenderPipelineFunctionsWithDescriptor:added error:&ns_error]) {
+                    old_way = "add: " + ErrorText(ns_error);
+                } else if (![loaded serializeToURL:TempURL("old-way") error:&ns_error]) {
+                    old_way = "write: " + ErrorText(ns_error);
+                }
+                Report(false, old_way.empty(), "m2 before: added to the loaded archive, written again", old_way);
+                [[NSFileManager defaultManager] removeItemAtURL:TempURL("old-way") error:nil];
+
+                NSURL* next = TempURL("renderer-next");
+                if (error.empty()) {
+                    error = WriteFresh(device, session, next);
+                }
+                Report(true, error.empty(), "m2: next session's fresh write", error);
+                if (error.empty()) {
+                    const int next_hits = CountHits(device, session, next);
+                    Report(true, next_hits == static_cast<int>(session.count),
+                           "m2: reloaded, every pipeline is an archive hit (the new one too)",
+                           std::to_string(next_hits) + " of " + std::to_string(session.count));
+                }
+                [[NSFileManager defaultManager] removeItemAtURL:next error:nil];
             }
             [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
         }

@@ -96,7 +96,8 @@ extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir)
     Vulkan::PipelineCache::StoredReport report{};
     unsigned printed = 0;
     bool archive_loaded = false, archive_written = false;
-    u64 archive_hits = 0, archive_adds = 0, archive_write_failures = 0;
+    u64 archive_hits = 0, archive_adds = 0, archive_write_failures = 0, archive_writes = 0,
+        archive_add_failures = 0;
     fs::path archive_path;
     const auto start = std::chrono::steady_clock::now();
     {
@@ -126,6 +127,8 @@ extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir)
         archive_hits = psos.GetCounters().archive_hits;
         archive_adds = psos.GetCounters().archive_adds;
         archive_write_failures = psos.GetCounters().archive_write_failures;
+        archive_writes = psos.GetCounters().archive_writes;
+        archive_add_failures = psos.GetCounters().archive_add_failures;
         archive_path = psos.ArchivePath();
     } // the factory writes its binary archive into the scratch directory
     Storage::DataBase::Instance().Close();
@@ -150,13 +153,18 @@ extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir)
         total_unsupported += unsupported[k];
     }
     const bool archive_exists = fs::exists(archive_path, ec);
-    std::printf("  binary archive %s: %s, %llu pipelines from it, %llu added, %s, %llu failed "
-                "writes\n",
+    // "unchanged": nothing was compiled, so the file was not rewritten.
+    const char* file_state = !archive_written || !archive_exists ? "NOT WRITTEN"
+                             : archive_writes ? "written"
+                                              : "unchanged";
+    std::printf("  binary archive %s: %s, %llu pipelines from it, %llu compiled, %s (%llu "
+                "writes, %llu failed, %llu pipelines not addable)\n",
                 archive_path.string().c_str(), archive_loaded ? "loaded" : "new",
                 static_cast<unsigned long long>(archive_hits),
-                static_cast<unsigned long long>(archive_adds),
-                archive_written && archive_exists ? "written" : "NOT WRITTEN",
-                static_cast<unsigned long long>(archive_write_failures));
+                static_cast<unsigned long long>(archive_adds), file_state,
+                static_cast<unsigned long long>(archive_writes),
+                static_cast<unsigned long long>(archive_write_failures),
+                static_cast<unsigned long long>(archive_add_failures));
     // At least 90% of the stored keys load; permutation conflicts (left to compile at runtime)
     // and duplicates (loaded once, as their twin) are not counted against it.
     const u32 loadable = report.keys - report.conflicts - report.duplicates;
@@ -168,11 +176,13 @@ extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir)
     }
     // The pipelines must reach the binary archive, or every start compiles them again; every
     // write (the factory flushes every few pipelines) must succeed.
-    const bool archive_ok = archive_written && archive_exists && archive_write_failures == 0;
+    const bool archive_ok = archive_written && archive_exists && archive_write_failures == 0 &&
+                            archive_add_failures == 0;
     if (!archive_ok) {
-        std::printf("MSL check: FAILED: the binary archive could not be written (%llu failed "
-                    "writes, see the Flush warning above)\n",
-                    static_cast<unsigned long long>(archive_write_failures));
+        std::printf("MSL check: FAILED: the binary archive could not be written completely (%llu "
+                    "failed writes, %llu pipelines not addable; see the warnings above)\n",
+                    static_cast<unsigned long long>(archive_write_failures),
+                    static_cast<unsigned long long>(archive_add_failures));
     }
     const bool pass = total_failed == 0 && enough_loaded && archive_ok;
     std::printf("%s: MSL check, %u pipelines built, %u failed, %u unsupported in Metal (logged)\n",

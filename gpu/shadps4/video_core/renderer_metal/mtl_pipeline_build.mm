@@ -133,9 +133,6 @@ GraphicsPsos PipelineFactory::BuildGraphics(const Vulkan::GraphicsPipelineKey& k
             }
         }
     }
-    if (result.render) {
-        Built();
-    }
     return result;
 }
 
@@ -287,16 +284,7 @@ const ComputePipeline* PipelineFactory::BuildCompute(const Vulkan::ComputePipeli
             error = "the Metal pipeline state failed";
         }
     }
-    if (pipeline) {
-        Built();
-    }
     return pipeline;
-}
-
-void PipelineFactory::Built() {
-    if ((built.fetch_add(1, std::memory_order_relaxed) + 1) % kFlushInterval == 0) {
-        psos.Flush(false); // skipped while a write runs or right after one
-    }
 }
 
 } // namespace Metal

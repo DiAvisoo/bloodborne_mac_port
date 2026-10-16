@@ -227,14 +227,18 @@ public:
                                                 const GeometryPipelineInput& input,
                                                 const CompiledShader* fs);
 
-    /// Writes the binary archive when pipelines were compiled since the last write: a fresh
-    /// archive of every pipeline this session created or took from the archive (Metal cannot
-    /// serialize one archive again after additions that reuse its functions), atomically (temp
-    /// file + rename). Pipelines of the old file this session never used are left out. Cheap to
-    /// call when nothing changed; call it every few new pipelines, off the recording thread, and
-    /// at shutdown (the destructor does). `wait` false (the periodic writes): skipped (true)
-    /// while another write runs or within 10 s of the last one.
-    bool Flush(bool wait = true);
+    /// The binary archive is written by the cache's own writer thread (never a pipeline build or
+    /// the recording thread): once pipelines were compiled since the last write, it waits until
+    /// 10 s after the last write (or the cache's creation), then writes everything pending. A
+    /// write is a fresh archive of every pipeline this session created or took from the archive
+    /// (Metal cannot serialize one archive again after additions that reuse its functions),
+    /// atomically (temp file + rename); pipelines of the old file this session never used are
+    /// left out. A crash loses at most the last ~10 s of compiled pipelines (plus the write in
+    /// flight).
+    ///
+    /// Flush: waits for a write in flight, then writes now if pipelines are pending (shutdown,
+    /// PipelineCache::Sync; the destructor does). False when the write failed.
+    bool Flush();
 
     struct Counters {
         std::atomic<u64> render_pipelines{};   ///< distinct render pipelines built (incl. failed)
@@ -244,7 +248,9 @@ public:
         std::atomic<u64> failures{};           ///< render + compute builds that failed
         std::atomic<u64> archive_hits{};       ///< pipelines taken from the binary archive
         std::atomic<u64> archive_adds{};       ///< pipelines compiled (not from the archive)
-        std::atomic<u64> archive_write_failures{}; ///< Flush calls that could not write the archive
+        std::atomic<u64> archive_writes{};          ///< archive files written
+        std::atomic<u64> archive_write_failures{};  ///< writes that failed
+        std::atomic<u64> archive_add_failures{};    ///< descriptors a write could not add (left out)
         /// Microseconds spent in the Metal pipeline-state calls.
         std::atomic<u64> render_us{};
         std::atomic<u64> compute_us{};
@@ -267,6 +273,9 @@ private:
     bool archive_loaded{}; ///< an existing archive file was opened
     Counters counters;
     std::unique_ptr<Impl> impl;
+
+    bool WriteArchive(); ///< one write if pipelines are pending; the caller holds the flush lock
+    void WriterLoop();
 };
 
 } // namespace Metal
