@@ -44,6 +44,10 @@ Device::~Device() {
     Finish();
 }
 
+u64 Device::AllocatedSize() const {
+    return impl->device.currentAllocatedSize;
+}
+
 void* Device::NativeDevice() const noexcept {
     return (__bridge void*)impl->device;
 }

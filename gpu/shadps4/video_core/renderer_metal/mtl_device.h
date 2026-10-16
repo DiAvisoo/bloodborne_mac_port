@@ -48,6 +48,8 @@ public:
     const Limits& GetLimits() const noexcept {
         return limits;
     }
+    /// MTLDevice.currentAllocatedSize: bytes the device has allocated for this process.
+    [[nodiscard]] u64 AllocatedSize() const;
     /// id<MTLDevice> and id<MTLCommandQueue>, unretained.
     void* NativeDevice() const noexcept;
     void* NativeQueue() const noexcept;

@@ -127,6 +127,7 @@ void TestTicks() {
     Expect(limits.uniform_alignment == 16 && limits.storage_alignment == 16 &&
                limits.max_samplers == 500000,
            "limits keep MoltenVK's values");
+    Expect(device.AllocatedSize() > 0, "the device reports its allocated size");
     Expect(device.CurrentTick() == 1 && device.KnownGpuTick() == 0, "ticks start at 1");
 
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)device.NativeQueue();

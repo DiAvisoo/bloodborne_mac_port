@@ -13,7 +13,7 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
@@ -25,30 +25,23 @@ namespace VideoCore {
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
-TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
+TextureCache::TextureCache(Metal::Device& device_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                            BufferCache& buffer_cache_, PageManager& tracker_)
-    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
-      buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
-      tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
+    : device{device_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
+      buffer_cache{buffer_cache_}, tracker{tracker_},
+      tile_manager{device, scheduler, runtime},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
 
-    u32 max_samplers = instance.GetMaxSamplerAllocationCount();
+    u32 max_samplers = device.GetLimits().max_samplers;
     trigger_gc_samplers = max_samplers * 3 / 4;
     pressure_gc_samplers = max_samplers * 7 / 8;
     critical_gc_samplers = max_samplers * 15 / 16;
 
     // Set up garbage collection parameters.
-    if (!instance.CanReportMemoryUsage()) {
-        trigger_gc_memory = 0;
-        pressure_gc_memory = DEFAULT_PRESSURE_GC_MEMORY;
-        critical_gc_memory = DEFAULT_CRITICAL_GC_MEMORY;
-        return;
-    }
-
-    u64 budget = instance.GetDeviceMemoryBudgetNow() ? instance.GetDeviceMemoryBudgetNow()
-                                                    : instance.GetTotalMemoryBudget();
-    const u64 local_mem = instance.GetDeviceLocalMemory();
+    // Metal reports the allocated size and a recommended working set (budget and local memory).
+    u64 budget = device.GetLimits().recommended_working_set;
+    const u64 local_mem = device.GetLimits().recommended_working_set;
     const bool is_low_vram = (local_mem > 0 && local_mem <= 4096ULL * 1024 * 1024) ||
                              (budget > 0 && budget <= 4096ULL * 1024 * 1024);
     const u64 base_mem = is_low_vram && local_mem > 0 ? local_mem : budget;
@@ -101,14 +94,12 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
     if (sync) {
         scheduler.Finish();
-        download.Invalidate();
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download.mapped, download_size);
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
-                download.Invalidate();
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                           download.mapped, download_size);
                 runtime.GetStagingPool().FreeDeferred(download);
             });
@@ -232,7 +223,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         auto new_info = requested_info;
         new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
         new_info.UpdateSize();
-        const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, new_info);
+        const auto new_image_id = slot_images.insert(device, runtime, slot_image_views, new_info);
         RegisterImage(new_image_id);
 
         // Inherit image usage
@@ -483,7 +474,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
-    const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+    const auto new_image_id = slot_images.insert(device, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
 
     auto& src_image = slot_images[image_id];
@@ -606,7 +597,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
-        image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+        image_id = slot_images.insert(device, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
 
@@ -754,7 +745,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
             info.guest_address = desc.info.stencil_addr;
             info.guest_size = desc.info.stencil_size;
             info.size = desc.info.size;
-            stencil_id = slot_images.insert(instance, runtime, slot_image_views, info);
+            stencil_id = slot_images.insert(device, runtime, slot_image_views, info);
             RegisterImage(stencil_id);
         }
         Image& stencil_image = slot_images[stencil_id];
@@ -813,7 +804,8 @@ void TextureCache::RefreshImage(Image& image) {
             .bufferRowLength = mip_pitch,
             .bufferImageHeight = mip_height,
             .imageSubresource{
-                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
                 .mipLevel = m,
                 .baseArrayLayer = 0,
                 .layerCount = num_layers,
@@ -840,7 +832,7 @@ void TextureCache::RefreshImage(Image& image) {
     runtime.UploadImage(&image, buffer, image_copies);
 }
 
-vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
+void* TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth, float extra_lod_bias) {
     // Compare and plain uses of one S# need separate samplers; so do extra LOD biases.
@@ -848,7 +840,7 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                  u64(std::bit_cast<u32>(extra_lod_bias)));
 
     std::scoped_lock lock{samplers_mutex};
-    const auto [it, new_sampler] = samplers.try_emplace(hash, instance, sampler, border_color_base,
+    const auto [it, new_sampler] = samplers.try_emplace(hash, device, sampler, border_color_base,
                                                         is_depth, extra_lod_bias);
     if (new_sampler) {
         samplers.at(hash).lru_id = sampler_lru_cache.Insert(hash, gc_tick);
@@ -1006,8 +998,8 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 }
 
 void TextureCache::GarbageCollectImages() {
-    if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
+    { // Metal always reports usage (Device::AllocatedSize)
+        total_used_memory = device.AllocatedSize();
         // bbport: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
         // much more than images (buffers backing guest memory), and the startup budget left
         // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the
@@ -1018,8 +1010,8 @@ void TextureCache::GarbageCollectImages() {
             const char* env = std::getenv("BB_GC_BUDGET_MB");
             return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
         }();
-        u64 budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
-        const u64 local_mem = instance.GetDeviceLocalMemory();
+        u64 budget = forced_budget ? forced_budget : device.GetLimits().recommended_working_set;
+        const u64 local_mem = device.GetLimits().recommended_working_set;
         if (budget != 0 || local_mem != 0) {
             const bool is_low_vram = (local_mem > 0 && local_mem <= 4096ULL * 1024 * 1024) ||
                                      (budget > 0 && budget <= 4096ULL * 1024 * 1024);

@@ -30,7 +30,7 @@ on `master`, 0.4.0, which the user plays). The branch is allowed to be broken fr
 | # | Plan | What | Main files | Gate |
 |---|---|---|---|---|
 | M1 | `…-m1-device-encoder.md` | `Metal::Object`, Device with ticks (`MTLSharedEvent`) and limits, `Metal::Encoder` (native-typed, from `mtl_frame`'s state machine) | `renderer_metal/mtl_object.*`, `mtl_device.*`, `mtl_encoder.*`, `tests/test_mtl_encoder.mm` | Unit test passes; old path still builds and runs — **done** (2026-10-16) |
-| M2 | written after M1 | Scheduler on the Encoder (`Record(lambda(Metal::Encoder&))`, recorder thread, host copies, hoisting); caches on Metal: `Buffer`/`UniqueBuffer`, guest arena (private `MTLBuffer`), staging, `Image`/`ImageView`/`Sampler`, `mtl_runtime` transfers, detile kernels, fault parser, blit helper; layouts/barriers deleted; sparse code deleted | `vk_scheduler.*`→`mtl_scheduler.*`, `buffer_cache/`, `texture_cache/`, `vk_runtime`→`mtl_runtime`, `vk_staging_buffer_pool` | Builds (library may not link the old rasterizer); staging/copy unit test; detile kernels equal the CPU detiler on sample tiles |
+| M2 | `…-m2-scheduler-caches.md` | Scheduler on the Encoder (`Record(lambda(Metal::Encoder&))`, recorder thread, host copies, hoisting); caches on Metal: `Buffer`/`UniqueBuffer`, guest arena (private `MTLBuffer`), staging, `Image`/`ImageView`/`Sampler`, `mtl_runtime` transfers, detile kernels, fault parser, blit helper; layouts/barriers deleted; sparse code deleted | `vk_scheduler.*`→`mtl_scheduler.*`, `buffer_cache/`, `texture_cache/`, `vk_runtime`→`mtl_runtime`, `vk_staging_buffer_pool` | Builds (library may not link the old rasterizer); staging/copy unit test; detile kernels equal the CPU detiler on sample tiles — **done** (2026-10-16; vk_runtime.cpp compiles except the M3 header vk_scene_resolution.h) |
 | M3 | written after M2 | Pipelines (`mtl_pso_cache`, `mtl_shader`, binary archive, background compiles, `shader_compile` modes); rasterizer, draw prep, shader HLE, scene resolution on the Encoder; tessellation runs and geometry emulation moved from `mtl_frame`; `mtl_vk_layer`, `mtl_shadow`, `mtl_frame` deleted | `vk_pipeline_cache`, `vk_graphics_pipeline`, `vk_compute_pipeline`, `vk_pipeline_serialization`, `vk_rasterizer`, `vk_draw_prep`, `vk_shader_hle`, `vk_scene_resolution` | `bbgpu-host --msl-check` builds every cached pipeline through the new cache |
 | M4 | written after M3 | Presenter on `CAMetalLayer` (2 drawables, `displaySyncEnabled`, fps cap, Retina), post-process pass; first light | `vk_presenter`, `vk_swapchain`, `host_passes/pp_pass`, `gpu/shim/bbgpu.cpp` | Title screen correct at 60 FPS; a save loads |
 | M5 | written after M4 | ImGui on Metal, MetalFX direct, TAA, camera/object motion, frame capture, GPU time stats; gameplay parity | `gpu/shim/bbport_overlay.cpp`, `bbport_metalfx.mm`, `vk_temporal_upscaler`, `vk_camera_motion`, `vk_object_motion`, `vk_frame_capture` | Three test scenes match 0.4.0; 15-min walks; `MTL_DEBUG_LAYER=1` clean |
@@ -68,3 +68,32 @@ For the M2 plan:
 - `~Encoder` should end an open clear-only pass before checking for a command buffer; `~Device`
   `Finish` has no timeout; `Wait` must not be called from a completion handler; `IsFree` assumes
   same-queue completion order; logging from handlers may outlive logging at exit.
+
+## Open items carried from M2 (2026-10-16)
+
+For M5 (fidelity/performance):
+- RGB32 formats need an expand step (no Metal RGB32 texture); view min LOD, sampler LOD bias,
+  custom border colours are not carried over; `PixelFormatView` disables lossless compression
+  (bandwidth cost). 8 GB Macs: recommended working set (~5.3 GB) is above the texture cache's
+  4 GB low-VRAM cutoff, so tune `BB_GC_*` there. `Device::AllocatedSize()` counts all of the
+  process's Metal allocations, not only images.
+- `BlitHelper` is owned by `Runtime` only; `TextureCache` no longer has one.
+- `Image` no longer has `aspect_mask`; buffer_cache/texture_cache derive it from `props.is_depth`.
+
+For the M3 plan, external consumers still on the old API:
+- Rasterizer: `Handle()` x13, `image_view` x5 (2483, 2491, 2901, 2964, 3035), `GetSampler` (2582,
+  now returns `void*`), `Transit` x8 -> `AccessImage(image, write)`, `AccessBuffer` x8;
+  `IsBufferAccessed` callers 1249, 1255, 1411, 1844, 1907, 2097, 2192; `backing` (2491).
+- Shader HLE: `IsBufferAccessed` 107-108.
+- `Runtime::CopyBuffer`/`FillBuffer` take `const Buffer&` (callers pass pointers today).
+- Scene resolution: `vk_scene_resolution.h` uses `VideoCore::UniqueImage` (does not exist);
+  `GetImage` 161-162, `Transit` x2, `aspect_mask` x10, `usage_flags`/`supported_samples` x3,
+  `backing` x6. This is the only error left in `vk_runtime.cpp`.
+- Upscaler: `GetImage` x5, `Transit` x9, `usage_flags`/`supported_samples` x7, `backing` x2.
+- Camera motion: `Transit` 290-292, usage/samples, `backing` x2. Object motion `image_view` 204;
+  post-process pass `image_view` 199; presenter `image_view` 416, `Transit` 418.
+- `Runtime` uses `GetImage` x10 and `aspect_mask` x10 internally (done) and buffer_cache 726.
+- `RenderAttachment` gained `clear_stencil` and dropped `num_layers`; viewports go through
+  `RasterUtil::ToMetalViewport`.
+- `GetWorkSemaphore` residue in pipeline_cache, constant_ring, presenter. The presenter's three
+  schedulers share one device with per-scheduler timelines.

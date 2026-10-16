@@ -19,7 +19,6 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/multi_level_page_table.h"
-#include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
@@ -84,7 +83,7 @@ public:
     };
 
 public:
-    TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+    TextureCache(Metal::Device& device, Vulkan::Scheduler& scheduler,
                  Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache,
                  PageManager& tracker);
     ~TextureCache();
@@ -196,7 +195,7 @@ public:
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     /// extra_lod_bias: bbport, added to the S#'s bias (reduced scene rendering).
-    [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
+    [[nodiscard]] void* GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
                                          bool is_depth, float extra_lod_bias = 0.0f);
 
@@ -386,13 +385,12 @@ private:
     void GarbageCollectSamplers();
 
 private:
-    const Vulkan::Instance& instance;
+    Metal::Device& device;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
     PageManager& tracker;
-    BlitHelper blit_helper;
     TileManager tile_manager;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;

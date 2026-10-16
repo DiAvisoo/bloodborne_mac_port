@@ -595,7 +595,8 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             .bufferRowLength = mip_info.pitch,
             .bufferImageHeight = mip_info.height,
             .imageSubresource{
-                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
                 .mipLevel = mip,
                 .baseArrayLayer = 0,
                 .layerCount = image.info.resources.layers,
