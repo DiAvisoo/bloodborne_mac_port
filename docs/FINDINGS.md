@@ -826,3 +826,21 @@ scratch reused across frames (fresh GPU memory stalled the run ~1 ms per frame).
 Did not work: committing the frame in chunks so the GPU starts early (`BB_METAL_CHUNK`): the
 renderer writes guest data into GPU memory from the CPU while recording, and an early chunk read
 data meant for later draws (broken geometry while walking).
+
+### Green flashes indoors (user report, 2026-10-16 morning)
+
+The user saw a bright green, flickering panel (sometimes a burst of green streaks over the whole
+screen) inside a building on the Metal path, never on MoltenVK; worst when entering and moving.
+Reproduced from a copy of the save (window captures: 3 and 1 of 75, 4 of 120 with green; MoltenVK
+0 of 75; `BB_METAL_GEOMETRY=0` 0 of 150). Not stale scratch memory (prefilling the strip indices
+with restarts, or also zeroing the vertex records: still 5 and 3 of 240). Not depth of field.
+`BB_GS_DEBUG=1` (the geometry draw in magenta, blending off) showed the draw covering the whole
+screen or exactly one quadrant in ~40% of captures. Cause: the one geometry-shader pipeline here
+(points expanded to sprites: the dust motes in the air) is drawn with **vkCmdDrawIndirect**, and
+`MetalFrame::DrawIndirect` had no geometry (or tessellation) case: it bound the pass-through
+pipeline, which reads finished vertex records from buffer 0, and drew directly, so the records
+were whatever buffer was bound there. Fix: indirect geometry draws run Huax-1839's indirect
+kernels (prep reads the guest's arguments into a control block, then the export and geometry
+kernels and the strip draw take their sizes from it); indirect tessellated draws are skipped (as
+MoltenVK does) until they are emulated the same way. After the fix: 0 of 240 captures with green,
+and in magenta the draw is small motes spread through the room.

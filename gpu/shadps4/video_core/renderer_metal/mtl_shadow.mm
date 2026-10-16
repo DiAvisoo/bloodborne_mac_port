@@ -216,6 +216,17 @@ void* DepthStencil(const Metal::DepthStencilKey& key) {
     return Get().pso.GetDepthStencilState(key);
 }
 
+const Metal::Geometry::IndirectKernels* GeometryIndirectKernels() {
+    static const auto kernels = [] {
+        auto k = std::make_unique<Metal::Geometry::IndirectKernels>(Get().device);
+        if (!k->Ok()) {
+            std::printf("Metal shadow: indirect geometry kernels: %s\n", k->Error().c_str());
+        }
+        return k;
+    }();
+    return kernels->Ok() ? kernels.get() : nullptr;
+}
+
 void Forget(VkPipeline pipeline) {
     if (!Enabled()) {
         return;

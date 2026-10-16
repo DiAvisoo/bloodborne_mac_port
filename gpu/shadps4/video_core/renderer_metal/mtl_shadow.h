@@ -13,6 +13,9 @@ struct ComputePipeline;
 struct TessellationPipeline;
 struct GeometryPipeline;
 struct DepthStencilKey;
+namespace Geometry {
+class IndirectKernels;
+}
 } // namespace Metal
 
 namespace MetalShadow {
@@ -52,5 +55,8 @@ void ComputeCreated(const VkComputePipelineCreateInfo* info, VkPipeline pipeline
 
 /// id<MTLDepthStencilState> for the key (the pipeline cache's), null on failure.
 void* DepthStencil(const Metal::DepthStencilKey& key);
+/// The prep and index-copy kernels of indirect geometry-shader draws (built on first use; null
+/// when they failed to build).
+const Metal::Geometry::IndirectKernels* GeometryIndirectKernels();
 
 } // namespace MetalShadow

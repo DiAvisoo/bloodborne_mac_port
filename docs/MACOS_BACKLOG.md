@@ -279,6 +279,9 @@ Each item: what was done for now, what the refinement is, and where it lives.
   recording thread's MoltenVK share (~43–47% measured single-process), merged render passes with
   load/store actions we control, tessellation without MoltenVK's emulation stalls. Fragment
   shading cost stays about the same. Gate: the step-1 measurements (FINDINGS).
+  *Metal path gaps (2026-10-16):* indirect tessellated draws are skipped (MoltenVK skips them
+  too; emulate them as the indirect geometry draws are, with a prep kernel sizing the kernels and
+  the patch draw); instanced geometry and tessellated draws draw instance 0 only.
 
 - **Resolution targets (user, 2026-10-13): locked 60 FPS; M4 Max 1440p native and 4K
   upscaled, base M5 1080p native, smaller Macs 1080p upscaled.** M4 Max today: 1080p native

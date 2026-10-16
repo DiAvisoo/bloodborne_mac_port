@@ -706,7 +706,7 @@ void ReturnScratchWhenDone(Owned& o) {
     [o.cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
       std::scoped_lock lock{scratch_pool_mutex};
       for (id<MTLBuffer> b : buffers) {
-          if (b.length == (8ull << 20) && scratch_pool.size() < 16) {
+          if ((b.length == (8ull << 20) || b.length == (16ull << 20)) && scratch_pool.size() < 16) {
               scratch_pool.push_back(b);
           }
       }
@@ -1138,16 +1138,20 @@ std::pair<id<MTLBuffer>, u64> Scratch(Owned& o, u64 size) {
     if (!o.scratch || o.scratch_used + size > o.scratch.length) {
         // Reused across frames: fresh GPU memory is mapped on first use (a stall).
         o.scratch = nil;
-        if (size <= kChunk) {
+        // (Larger requests, indirect geometry draws, in 16 MiB steps so that they pool too.)
+        const u64 length = size <= kChunk ? kChunk : (size + (16ull << 20) - 1) & ~((16ull << 20) - 1);
+        {
             std::scoped_lock lock{scratch_pool_mutex};
-            if (!scratch_pool.empty()) {
-                o.scratch = scratch_pool.back();
-                scratch_pool.pop_back();
+            for (size_t i = scratch_pool.size(); i-- > 0;) {
+                if (scratch_pool[i].length == length) {
+                    o.scratch = scratch_pool[i];
+                    scratch_pool.erase(scratch_pool.begin() + i);
+                    break;
+                }
             }
         }
         if (!o.scratch) {
-            o.scratch = [device newBufferWithLength:std::max(kChunk, size)
-                                            options:MTLResourceStorageModePrivate];
+            o.scratch = [device newBufferWithLength:length options:MTLResourceStorageModePrivate];
         }
         o.scratch_used_buffers.push_back(o.scratch);
         o.scratch_used = 0;
@@ -1418,8 +1422,107 @@ void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
     ++o.chunk_draws;
 }
 
+namespace {
+
+/// An indirect geometry-shader draw (as Huax-1839's RecordGeometryIndirectDraw): per draw a prep
+/// kernel reads the guest's arguments into a control block that sizes the export and geometry
+/// kernels and the strip draw (mtl_geometry.h, "Indirect draws").
+void GeometryDrawIndirect(Owned& o, const BufferRef& args, VkDeviceSize offset, u32 count,
+                          u32 stride, bool indexed) {
+    const Metal::GeometryPipeline& geo = *o.graphics->geometry;
+    const Metal::Geometry::IndirectKernels* kernels = MetalShadow::GeometryIndirectKernels();
+    if (!kernels) {
+        ++stats.skipped_emulated;
+        return;
+    }
+    if (!o.pass) {
+        Log("an indirect geometry-shader draw outside a render pass (skipped)");
+        return;
+    }
+    u32 index_size = 0;
+    if (indexed) {
+        if (!o.index_buffer || o.index_type == VK_INDEX_TYPE_UINT8_EXT) {
+            Log("an indirect geometry-shader indexed draw without usable indices (skipped)");
+            return;
+        }
+        index_size = IndexSize(o.index_type);
+    }
+    std::array<Metal::Tessellation::VertexBinding, 32> bindings;
+    const u32 num_bindings = std::min<u32>(geo.num_vertex_slots, bindings.size());
+    for (u32 j = 0; j < num_bindings; ++j) {
+        const auto& slot = geo.vertex_slots[j];
+        const auto& vb = slot.location < o.vertex_buffers.size() ? o.vertex_buffers[slot.location]
+                                                                 : Owned::VertexBuffer{};
+        bindings[j] = {(__bridge void*)(vb.buffer ? vb.buffer : null_buffer),
+                       vb.buffer ? vb.offset : 0, slot.constant || !vb.stride ? 16 : vb.stride,
+                       slot.slot};
+    }
+    const Metal::Geometry::IndirectPlan plan = Metal::Geometry::PlanIndirect(geo, indexed);
+    struct Span {
+        id<MTLBuffer> buffer;
+        u64 offset;
+    };
+    std::vector<Span> spans;
+    id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
+    const auto bind = [&](const Metal::CompiledShader& shader) {
+        BindStage(o, Stage::Compute, &shader, o.graphics_bindings);
+    };
+    for (u32 i = 0; i < count; ++i) {
+        // (256-aligned: the geometry kernel's params are a constant buffer at +256.)
+        auto [buffer, at] = Scratch(o, plan.total + 256);
+        const u64 aligned = (at + 255) & ~u64(255);
+        spans.push_back({buffer, aligned});
+        Metal::Geometry::IndirectDraw draw;
+        draw.args = (__bridge void*)args.buffer;
+        draw.args_offset = args.offset + offset + u64(i) * stride;
+        draw.index_size = index_size;
+        if (indexed) {
+            draw.index_buffer = (__bridge void*)o.index_buffer;
+            draw.index_offset = o.index_offset;
+            draw.index_limit = o.index_offset < o.index_buffer.length
+                                   ? (o.index_buffer.length - o.index_offset) / index_size
+                                   : 0;
+        }
+        Metal::Geometry::EncodeIndirectKernels((__bridge void*)enc, geo, *kernels, draw,
+                                               std::span{bindings.data(), num_bindings},
+                                               (__bridge void*)buffer, aligned, plan, bind, bind);
+    }
+    if (!PrepareDraw(o)) {
+        return;
+    }
+    for (const Span& span : spans) {
+        SetBuffer(o, Stage::Vertex, span.buffer, span.offset + plan.plan.record_offset, 0);
+        [o.render drawIndexedPrimitives:MTLPrimitiveType(geo.render->primitive_type)
+                              indexType:MTLIndexTypeUInt32
+                            indexBuffer:span.buffer
+                      indexBufferOffset:span.offset + plan.plan.index_offset
+                         indirectBuffer:span.buffer
+                   indirectBufferOffset:span.offset + Metal::Geometry::kControlDraw];
+        ++stats.draws;
+    }
+}
+
+} // namespace
+
 void DrawIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset, u32 count, u32 stride,
                   bool indexed) {
+    if (!(o.graphics && o.graphics->tess)) {
+        o.last_draw_tess = false;
+        FlushPending(o);
+    }
+    if (o.graphics && o.graphics->geometry) {
+        const BufferRef ref = ResolveBuffer(buffer);
+        if (ref.buffer) {
+            GeometryDrawIndirect(o, ref, offset, count, stride, indexed);
+        }
+        return;
+    }
+    if (o.graphics && o.graphics->tess) {
+        // The patch draw needs the kernels' output: not encoded yet (MoltenVK skips these too).
+        ++stats.skipped_tess;
+        Log("indirect tessellated draws are not encoded (skipped)");
+        return;
+    }
     if (!PrepareDraw(o)) {
         return;
     }
