@@ -573,6 +573,105 @@ void TestScissorClampedToTarget() {
            "a draw with a carried, too-large scissor fills the smaller target");
 }
 
+void TestFillPattern() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLBuffer> b = SharedBuffer(device, 64);
+    encoder.FillBuffer(Ref(b), 32, 0x0000000Fu);       // HTile-style pattern: bytes differ
+    encoder.FillBuffer(Ref(b, 32), 32, 0x5a5a5a5au);   // uniform bytes: blit
+    device.Wait(encoder.Submit());
+    const u32* w = static_cast<const u32*>(b.contents);
+    bool ok = true;
+    for (int i = 0; i < 8; ++i) ok &= w[i] == 0x0000000Fu;
+    for (int i = 8; i < 16; ++i) ok &= w[i] == 0x5a5a5a5au;
+    Expect(ok, "FillBuffer writes the exact 32-bit pattern");
+}
+
+void TestSubmitResetsBindings() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLBuffer> b = SharedBuffer(device, 16);
+    encoder.SetBuffer(Metal::Stage::Compute, 3, Ref(b));
+    Expect(encoder.HasBindings(), "a binding is recorded");
+    device.Wait(encoder.Submit());
+    Expect(!encoder.HasBindings(), "Submit clears bindings (objects may be freed after it)");
+}
+
+void TestUntrackedRunsFirst() {
+    Metal::Device device;
+    Metal::Encoder upload{device}, main_encoder{device};
+    id<MTLBuffer> src = SharedBuffer(device, 64), mid = SharedBuffer(device, 64),
+                  dst = SharedBuffer(device, 64);
+    std::memset(src.contents, 0x11, 64);
+    upload.CopyBuffer(Ref(src), Ref(mid), 64);   // "hoisted" upload
+    main_encoder.CopyBuffer(Ref(mid), Ref(dst), 64);
+    upload.SubmitUntracked();
+    const u64 tick = main_encoder.Submit();
+    Expect(tick == 1, "an untracked commit takes no tick");
+    device.Wait(tick);
+    Expect(static_cast<const u8*>(dst.contents)[63] == 0x11,
+           "the untracked command buffer ran before the tracked one");
+}
+
+void TestIndirectResidency() {
+    // A kernel reads a buffer only through its GPU address (as shaders read the arena).
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    NSError* error = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:@R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void through_address(device uint* out [[buffer(0)]], constant ulong& address [[buffer(1)]],
+                            uint i [[thread_position_in_grid]]) {
+    out[i] = ((device const uint*)address)[i];
+}
+)" options:nil error:&error];
+    id<MTLComputePipelineState> k =
+        [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"through_address"] error:&error];
+    id<MTLBuffer> hidden = [dev newBufferWithLength:256 options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> source = SharedBuffer(device, 256), out = SharedBuffer(device, 256);
+    for (u32 i = 0; i < 64; ++i) static_cast<u32*>(source.contents)[i] = 300 + i;
+    device.MakeResident((__bridge void*)hidden);
+    encoder.DeclareIndirect((__bridge void*)hidden);
+    encoder.CopyBuffer(Ref(source), Ref(hidden), 256);  // written by a blit, read by address
+    const u64 address = hidden.gpuAddress;
+    encoder.SetComputePipeline((__bridge void*)k);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(out));
+    encoder.SetBytes(Metal::Stage::Compute, 1, &address, sizeof(address));
+    encoder.Dispatch({1, 1, 1}, {64, 1, 1});
+    device.Wait(encoder.Submit());
+    Expect(static_cast<const u32*>(out.contents)[63] == 363, "a resident buffer reads by address");
+    device.Evict((__bridge void*)hidden);
+}
+
+void TestDepthAspectCopy() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    MTLTextureDescriptor* d = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8 width:4 height:4 mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget;
+    d.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> ds = [dev newTextureWithDescriptor:d];
+    Metal::RenderPassDesc pass;
+    pass.depth.texture = (__bridge void*)ds;
+    pass.depth.has_stencil = true;
+    pass.depth.clear_depth = pass.depth.clear_stencil = true;
+    pass.depth.depth = 0.5;
+    pass.depth.stencil = 7;
+    encoder.BeginRenderPass(pass);
+    encoder.EndRenderPass();
+    id<MTLBuffer> depth = SharedBuffer(device, 64), stencil = SharedBuffer(device, 16);
+    encoder.CopyTextureToBuffer((__bridge void*)ds, 0, 0, {}, {4, 4, 1}, Ref(depth), 16, 64,
+                                Metal::BlitAspect::Depth);
+    encoder.CopyTextureToBuffer((__bridge void*)ds, 0, 0, {}, {4, 4, 1}, Ref(stencil), 4, 16,
+                                Metal::BlitAspect::Stencil);
+    device.Wait(encoder.Submit());
+    Expect(static_cast<const float*>(depth.contents)[5] == 0.5f, "depth aspect copied");
+    Expect(static_cast<const u8*>(stencil.contents)[5] == 7, "stencil aspect copied");
+}
+
 } // namespace
 
 int main() {
@@ -593,6 +692,11 @@ int main() {
         TestNoLeakOnPoollessThread();
         TestCopyInPassSeesClear();
         TestScissorClampedToTarget();
+        TestFillPattern();
+        TestSubmitResetsBindings();
+        TestUntrackedRunsFirst();
+        TestIndirectResidency();
+        TestDepthAspectCopy();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

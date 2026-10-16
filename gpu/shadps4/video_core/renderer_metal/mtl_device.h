@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include "common/types.h"
 
@@ -70,6 +71,13 @@ public:
     /// Commits `command_buffer` (id<MTLCommandBuffer>) so that it signals CurrentTick() when done,
     /// and returns that tick. One thread commits at a time, so ticks follow commit order.
     u64 Commit(void* command_buffer);
+    /// Commits `command_buffer` with no tick of its own. It runs before every later commit on the
+    /// queue and is covered by the next tracked tick (one queue completes in order).
+    void CommitUntracked(void* command_buffer);
+    /// Buffers shaders reach only by GPU address (arena, page table, fault buffer): kept resident
+    /// through the queue's residency set.
+    void MakeResident(void* buffer);
+    void Evict(void* buffer);
     /// Command buffers that completed with an error (each one is logged).
     [[nodiscard]] u64 ErrorCount() const noexcept {
         return counters->errors.load(std::memory_order_relaxed);
@@ -79,6 +87,7 @@ private:
     std::unique_ptr<Impl> impl;
     std::string name;
     Limits limits;
+    std::mutex residency_mutex;
     std::atomic<u64> current_tick{1};
     /// What completion handlers write. Shared with each handler, so a handler that runs after
     /// the Device is gone writes into memory it still owns.

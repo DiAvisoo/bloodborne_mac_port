@@ -21,6 +21,7 @@ enum class Stage : u8 { Vertex, Fragment, Compute };
 enum class Primitive : u8 { Point, Line, LineStrip, Triangle, TriangleStrip };
 enum class IndexType : u8 { U16, U32 };
 enum class CullMode : u8 { None, Front, Back };
+enum class BlitAspect : u8 { All, Depth, Stencil };
 enum class Winding : u8 { Clockwise, CounterClockwise };
 
 struct Origin3 {
@@ -35,6 +36,9 @@ struct ColorAttachment {
     u32 level{}, slice{};
     bool clear{};
     std::array<double, 4> clear_color{};
+    u32 depth_plane{};         ///< 3D targets
+    void* resolve_texture{};   ///< MSAA resolve target (StoreAndMultisampleResolve)
+    u32 resolve_level{}, resolve_slice{};
 };
 
 struct DepthAttachment {
@@ -44,6 +48,7 @@ struct DepthAttachment {
     bool clear_depth{}, clear_stencil{};
     double depth{1.0};
     u32 stencil{};
+    bool stencil_only{}; ///< Stencil8-type formats: bound as the stencil attachment only
 };
 
 struct RenderPassDesc {
@@ -86,10 +91,9 @@ public:
 
     // Resources by stage and slot: render stages apply at the next draw, compute at the next
     // dispatch. Slots: buffers 0-30, textures 0-31, samplers 0-15.
-    // Bindings are unretained pointers that stay bound until replaced, also across Submit and
-    // into new Metal encoders (which get every bound slot again). An object must outlive its
-    // binding: its owner frees it only after replacing the binding (M2's scheduler and caches
-    // define when; open item from the M1 review).
+    // Bindings are unretained pointers that stay bound until replaced, into new Metal encoders
+    // (which get every bound slot again) but not across Submit: a new command buffer starts
+    // unbound, as in Vulkan, so objects may be freed once their command buffer was submitted.
     void SetBuffer(Stage stage, u32 slot, BufferRef buffer);
     /// Copies `size` bytes now. Up to 4 KiB they go inline (setBytes); more go through a
     /// temporary shared buffer kept until the command buffer completes.
@@ -108,14 +112,23 @@ public:
 
     // Blits. Inside a render pass they end the render encoder; the pass continues afterwards.
     void CopyBuffer(BufferRef src, BufferRef dst, u64 size);
-    /// Fills with the low byte of `pattern` (as mtl_frame did; logged once if its bytes differ).
+    /// Fills `size` bytes (offset and size multiples of 4) with the 32-bit `pattern`: a blit when
+    /// all four bytes are equal, else a compute kernel. Replaces the M1 low-byte fill.
     void FillBuffer(BufferRef dst, u64 size, u32 pattern);
     void CopyBufferToTexture(BufferRef src, u32 bytes_per_row, u32 bytes_per_image, void* texture,
-                             u32 level, u32 slice, Origin3 origin, Size3 size);
+                             u32 level, u32 slice, Origin3 origin, Size3 size,
+                             BlitAspect aspect = BlitAspect::All);
     void CopyTextureToBuffer(void* texture, u32 level, u32 slice, Origin3 origin, Size3 size,
-                             BufferRef dst, u32 bytes_per_row, u32 bytes_per_image);
+                             BufferRef dst, u32 bytes_per_row, u32 bytes_per_image,
+                             BlitAspect aspect = BlitAspect::All);
     void CopyTexture(void* src, u32 src_level, u32 src_slice, Origin3 src_origin, void* dst,
                      u32 dst_level, u32 dst_slice, Origin3 dst_origin, Size3 size);
+
+    /// Buffers shaders reach by GPU address, declared on every Metal encoder this Encoder opens
+    /// from now on (render encoders: read; compute: read/write) so Metal orders them.
+    void DeclareIndirect(void* buffer);
+    /// True while any slot, pipeline or render state is set (Submit clears all of it).
+    [[nodiscard]] bool HasBindings() const noexcept;
 
     /// Keeps `object` alive until the current command buffer completes.
     void KeepAlive(Object object);
@@ -127,6 +140,9 @@ public:
     /// Ends encoding, commits with the device's next tick and returns it. Starts a new command
     /// buffer on the next command. Asserts that no render pass is in progress.
     u64 Submit();
+    /// Ends encoding and commits with no tick (Device::CommitUntracked); keep-alive objects are
+    /// released when it completes. For the scheduler's hoisted-upload command buffer.
+    void SubmitUntracked();
 
 private:
     struct Impl;

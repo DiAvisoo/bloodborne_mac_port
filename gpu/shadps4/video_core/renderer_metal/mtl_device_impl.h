@@ -15,6 +15,7 @@ namespace Metal {
 struct Device::Impl {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
+    id<MTLResidencySet> residency API_AVAILABLE(macos(15.0)); ///< arena and address-reached buffers
     id<MTLSharedEvent> event; ///< signalled with each command buffer's tick (for GPU-side waits)
 };
 

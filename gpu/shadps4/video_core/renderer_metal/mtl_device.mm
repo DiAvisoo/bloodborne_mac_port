@@ -27,6 +27,13 @@ Device::Device(void* mtl_device, void* mtl_queue) : impl{std::make_unique<Impl>(
         ASSERT_MSG(impl->queue, "No Metal command queue");
         impl->event = [impl->device newSharedEvent];
         ASSERT_MSG(impl->event, "No Metal shared event");
+        MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
+        rd.label = @"bbport arena and address-reached buffers";
+        NSError* error = nil;
+        impl->residency = [impl->device newResidencySetWithDescriptor:rd error:&error];
+        ASSERT_MSG(impl->residency, "No Metal residency set: {}",
+                   error ? error.localizedDescription.UTF8String : "unknown");
+        [impl->queue addResidencySet:impl->residency];
         name = impl->device.name.UTF8String;
         limits.max_buffer_length = impl->device.maxBufferLength;
         limits.recommended_working_set = impl->device.recommendedMaxWorkingSetSize;
@@ -62,6 +69,22 @@ void Device::Finish() {
     if (last != 0) {
         Wait(last);
     }
+}
+
+void Device::CommitUntracked(void* command_buffer) {
+    [(__bridge id<MTLCommandBuffer>)command_buffer commit];
+}
+
+void Device::MakeResident(void* buffer) {
+    std::scoped_lock lock{residency_mutex};
+    [impl->residency addAllocation:(__bridge id<MTLBuffer>)buffer];
+    [impl->residency commit];
+}
+
+void Device::Evict(void* buffer) {
+    std::scoped_lock lock{residency_mutex};
+    [impl->residency removeAllocation:(__bridge id<MTLBuffer>)buffer];
+    [impl->residency commit];
 }
 
 u64 Device::Commit(void* command_buffer) {

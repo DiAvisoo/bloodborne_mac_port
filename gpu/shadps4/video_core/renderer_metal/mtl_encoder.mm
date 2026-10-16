@@ -81,6 +81,18 @@ MTLCullMode ToMtl(CullMode mode) {
     UNREACHABLE();
 }
 
+MTLBlitOption BlitOptions(BlitAspect aspect) {
+    switch (aspect) {
+    case BlitAspect::All:
+        return MTLBlitOptionNone;
+    case BlitAspect::Depth:
+        return MTLBlitOptionDepthFromDepthStencil;
+    case BlitAspect::Stencil:
+        return MTLBlitOptionStencilFromDepthStencil;
+    }
+    UNREACHABLE();
+}
+
 } // namespace
 
 struct Encoder::Impl {
@@ -132,7 +144,85 @@ struct Encoder::Impl {
     bool compute_pipeline_dirty{};
     StageState compute_stage;
 
-    std::atomic<bool> fill_pattern_logged{};
+    std::vector<void*> indirect; ///< declared on every encoder opened (survives Submit)
+    id<MTLComputePipelineState> fill_u32;
+
+    void DeclareOn(id<MTLRenderCommandEncoder> e) {
+        for (void* b : indirect) {
+            [e useResource:(__bridge id<MTLBuffer>)b
+                     usage:MTLResourceUsageRead
+                    stages:MTLRenderStageVertex | MTLRenderStageFragment];
+        }
+    }
+    void DeclareOn(id<MTLComputeCommandEncoder> e) {
+        for (void* b : indirect) {
+            [e useResource:(__bridge id<MTLBuffer>)b
+                     usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        }
+    }
+
+    /// A new command buffer starts unbound (as in Vulkan).
+    void ResetBindings() {
+        vertex = {};
+        fragment = {};
+        compute_stage = {};
+        render_pipeline = depth_stencil = compute_pipeline = nullptr;
+        render_used = render_dirty = 0;
+        compute_pipeline_dirty = false;
+        viewport = {};
+        scissor = {};
+        cull = CullMode::None;
+        winding = Winding::CounterClockwise;
+        bias[0] = bias[1] = bias[2] = 0;
+        stencil_front = stencil_back = 0;
+        blend[0] = blend[1] = blend[2] = blend[3] = 0;
+    }
+
+    id<MTLComputePipelineState> FillPipeline() {
+        if (!fill_u32) {
+            @autoreleasepool {
+                NSError* error = nil;
+                id<MTLLibrary> lib = [dev newLibraryWithSource:@R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buffer(1)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i < args.y) dst[i] = args.x;
+}
+)" options:nil error:&error];
+                ASSERT_MSG(lib, "fill_u32 kernel: {}",
+                           error ? error.localizedDescription.UTF8String : "unknown");
+                fill_u32 = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fill_u32"]
+                                                              error:&error];
+                ASSERT_MSG(fill_u32, "fill_u32 pipeline: {}",
+                           error ? error.localizedDescription.UTF8String : "unknown");
+            }
+        }
+        return fill_u32;
+    }
+
+    /// Ends encoding and commits; `tracked` takes a tick. Returns 0 for an untracked commit.
+    u64 Finish(bool tracked) {
+        ASSERT_MSG(!in_pass, "Submit inside a render pass");
+        EndRender();
+        EndCompute();
+        EndBlit();
+        id<MTLCommandBuffer> c = Cmd();
+        auto* held = new std::vector<Object>(std::move(keep));
+        keep.clear();
+        [c addCompletedHandler:^(id<MTLCommandBuffer>) {
+            delete held;
+        }];
+        u64 tick = 0;
+        if (tracked) {
+            tick = device.Commit((__bridge void*)c);
+        } else {
+            device.CommitUntracked((__bridge void*)c);
+        }
+        cmd = nil;
+        ResetBindings();
+        return tick;
+    }
 
     id<MTLCommandBuffer> Cmd() {
         if (!cmd) {
@@ -189,6 +279,7 @@ struct Encoder::Impl {
             @autoreleasepool {
                 compute = [Cmd() computeCommandEncoder];
             }
+            DeclareOn(compute);
             compute_stage.Reapply();
             compute_pipeline_dirty = compute_pipeline != nullptr;
         }
@@ -229,6 +320,7 @@ struct Encoder::Impl {
                                                                                : pass_first];
             }
             pass_opened = true;
+            DeclareOn(render);
             render_dirty = render_used; // incl. the scissor, clamped to this pass's target
             vertex.Reapply();
             fragment.Reapply();
@@ -333,10 +425,10 @@ struct Encoder::Impl {
 Encoder::Encoder(Device& device) : impl{std::make_unique<Impl>(device)} {}
 
 Encoder::~Encoder() {
+    if (impl->in_pass) {
+        EndRenderPass();
+    }
     if (impl->cmd) {
-        if (impl->in_pass) {
-            EndRenderPass();
-        }
         Submit(); // nothing recorded is lost, and the keep-alive list is released after the GPU
     }
 }
@@ -352,18 +444,33 @@ void Encoder::CopyBuffer(BufferRef src, BufferRef dst, u64 size) {
 }
 
 void Encoder::FillBuffer(BufferRef dst, u64 size, u32 pattern) {
-    const u8 byte = u8(pattern);
-    if (pattern != u32(byte) * 0x01010101u && !impl->fill_pattern_logged.exchange(true)) {
-        LOG_WARNING(Render, "FillBuffer pattern {:#x} has different bytes; filled with its low byte",
-                    pattern);
+    if (pattern == u32(u8(pattern)) * 0x01010101u) {
+        [impl->Blit() fillBuffer:(__bridge id<MTLBuffer>)dst.buffer
+                           range:NSMakeRange(dst.offset, size)
+                           value:u8(pattern)];
+        return;
     }
-    [impl->Blit() fillBuffer:(__bridge id<MTLBuffer>)dst.buffer
-                       range:NSMakeRange(dst.offset, size)
-                       value:byte];
+    ASSERT((dst.offset | size) % 4 == 0);
+    // A dedicated compute encoder, so the caller's compute state is untouched.
+    impl->FlushPendingClear();
+    impl->EndRender();
+    impl->EndCompute();
+    impl->EndBlit();
+    id<MTLComputePipelineState> pipeline = impl->FillPipeline();
+    const u32 args[2] = {pattern, u32(size / 4)};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = [impl->Cmd() computeCommandEncoder];
+        [e setComputePipelineState:pipeline];
+        [e setBuffer:(__bridge id<MTLBuffer>)dst.buffer offset:dst.offset atIndex:0];
+        [e setBytes:args length:sizeof(args) atIndex:1];
+        [e dispatchThreads:MTLSizeMake(size / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [e endEncoding];
+    }
 }
 
 void Encoder::CopyBufferToTexture(BufferRef src, u32 bytes_per_row, u32 bytes_per_image,
-                                  void* texture, u32 level, u32 slice, Origin3 origin, Size3 size) {
+                                  void* texture, u32 level, u32 slice, Origin3 origin, Size3 size,
+                                  BlitAspect aspect) {
     [impl->Blit() copyFromBuffer:(__bridge id<MTLBuffer>)src.buffer
                     sourceOffset:src.offset
                sourceBytesPerRow:bytes_per_row
@@ -372,11 +479,13 @@ void Encoder::CopyBufferToTexture(BufferRef src, u32 bytes_per_row, u32 bytes_pe
                        toTexture:(__bridge id<MTLTexture>)texture
                 destinationSlice:slice
                 destinationLevel:level
-               destinationOrigin:MTLOriginMake(origin.x, origin.y, origin.z)];
+               destinationOrigin:MTLOriginMake(origin.x, origin.y, origin.z)
+                        options:BlitOptions(aspect)];
 }
 
 void Encoder::CopyTextureToBuffer(void* texture, u32 level, u32 slice, Origin3 origin, Size3 size,
-                                  BufferRef dst, u32 bytes_per_row, u32 bytes_per_image) {
+                                  BufferRef dst, u32 bytes_per_row, u32 bytes_per_image,
+                                  BlitAspect aspect) {
     [impl->Blit() copyFromTexture:(__bridge id<MTLTexture>)texture
                       sourceSlice:slice
                       sourceLevel:level
@@ -385,7 +494,8 @@ void Encoder::CopyTextureToBuffer(void* texture, u32 level, u32 slice, Origin3 o
                          toBuffer:(__bridge id<MTLBuffer>)dst.buffer
                 destinationOffset:dst.offset
            destinationBytesPerRow:bytes_per_row
-         destinationBytesPerImage:bytes_per_image];
+         destinationBytesPerImage:bytes_per_image
+                          options:BlitOptions(aspect)];
 }
 
 void Encoder::CopyTexture(void* src, u32 src_level, u32 src_slice, Origin3 src_origin, void* dst,
@@ -418,17 +528,35 @@ void* Encoder::CommandBuffer() {
 }
 
 u64 Encoder::Submit() {
-    ASSERT_MSG(!impl->in_pass, "Submit inside a render pass");
-    EndEncoding();
-    id<MTLCommandBuffer> cmd = impl->Cmd();
-    auto* held = new std::vector<Object>(std::move(impl->keep));
-    impl->keep.clear();
-    [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
-        delete held;
-    }];
-    const u64 tick = impl->device.Commit((__bridge void*)cmd);
-    impl->cmd = nil;
-    return tick;
+    return impl->Finish(true);
+}
+
+void Encoder::SubmitUntracked() {
+    impl->Finish(false);
+}
+
+void Encoder::DeclareIndirect(void* buffer) {
+    if (std::find(impl->indirect.begin(), impl->indirect.end(), buffer) != impl->indirect.end()) {
+        return;
+    }
+    impl->indirect.push_back(buffer);
+    id<MTLBuffer> b = (__bridge id<MTLBuffer>)buffer;
+    if (impl->render) {
+        [impl->render useResource:b
+                            usage:MTLResourceUsageRead
+                           stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    }
+    if (impl->compute) {
+        [impl->compute useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    }
+}
+
+bool Encoder::HasBindings() const noexcept {
+    const auto used = [](const StageState& s) {
+        return s.buffers_used | s.textures_used | s.samplers_used;
+    };
+    return impl->render_used || impl->compute_pipeline || used(impl->vertex) ||
+           used(impl->fragment) || used(impl->compute_stage);
 }
 
 // ---- Compute (Task 4) ----
@@ -515,26 +643,36 @@ void Encoder::BeginRenderPass(const RenderPassDesc& desc) {
         a.texture = (__bridge id<MTLTexture>)c.texture;
         a.level = c.level;
         a.slice = c.slice;
+        a.depthPlane = c.depth_plane;
         a.loadAction = c.clear ? MTLLoadActionClear : MTLLoadActionLoad;
         a.storeAction = MTLStoreActionStore;
         a.clearColor = MTLClearColorMake(c.clear_color[0], c.clear_color[1], c.clear_color[2],
                                          c.clear_color[3]);
         clears |= c.clear;
+        if (c.resolve_texture) {
+            a.resolveTexture = (__bridge id<MTLTexture>)c.resolve_texture;
+            a.resolveLevel = c.resolve_level;
+            a.resolveSlice = c.resolve_slice;
+            a.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        }
     }
     const DepthAttachment& d = desc.depth;
     if (d.texture) {
         attachments = true;
-        MTLRenderPassDepthAttachmentDescriptor* a = first.depthAttachment;
-        a.texture = (__bridge id<MTLTexture>)d.texture;
-        a.level = d.level;
-        a.slice = d.slice;
-        a.loadAction = d.clear_depth ? MTLLoadActionClear : MTLLoadActionLoad;
-        a.storeAction = MTLStoreActionStore;
-        a.clearDepth = d.depth;
-        clears |= d.clear_depth;
-        if (d.has_stencil) {
+        id<MTLTexture> dt = (__bridge id<MTLTexture>)d.texture;
+        if (!d.stencil_only) {
+            MTLRenderPassDepthAttachmentDescriptor* a = first.depthAttachment;
+            a.texture = dt;
+            a.level = d.level;
+            a.slice = d.slice;
+            a.loadAction = d.clear_depth ? MTLLoadActionClear : MTLLoadActionLoad;
+            a.storeAction = MTLStoreActionStore;
+            a.clearDepth = d.depth;
+            clears |= d.clear_depth;
+        }
+        if (d.has_stencil || d.stencil_only) {
             MTLRenderPassStencilAttachmentDescriptor* s = first.stencilAttachment;
-            s.texture = a.texture;
+            s.texture = dt;
             s.level = d.level;
             s.slice = d.slice;
             s.loadAction = d.clear_stencil ? MTLLoadActionClear : MTLLoadActionLoad;
