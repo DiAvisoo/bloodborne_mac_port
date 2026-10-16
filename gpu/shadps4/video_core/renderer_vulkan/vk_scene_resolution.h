@@ -6,6 +6,7 @@
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include "video_core/renderer_vulkan/scene_resolution.h"
 #include "video_core/renderer_metal/mtl_object.h"
 #include "video_core/texture_cache/image.h"
@@ -13,12 +14,11 @@
 namespace VideoCore { class TextureCache; }
 namespace Metal { class Device; }
 namespace Vulkan {
-class Instance;
 class Runtime;
 class Scheduler;
 
 // Reduced raster targets, with native-size images retained for unmodified guest compute,
-// integer texture loads, copies and CPU readbacks. All native access passes Runtime::Transit.
+// integer texture loads, copies and CPU readbacks. All native access passes Runtime::AccessImage.
 class SceneTargets {
 public:
     SceneTargets(Metal::Device&, Scheduler&, Runtime&, VideoCore::TextureCache&);
@@ -39,20 +39,21 @@ public:
         void* texture{}; ///< id<MTLTexture>: the proxy's view for the requested range
     };
     Target Attachment(VideoCore::ImageId, const VideoCore::ImageViewInfo&);
-    Target Read(VideoCore::ImageId, const VideoCore::ImageViewInfo&,
-                vk::PipelineStageFlags2 = vk::PipelineStageFlagBits2::eComputeShader,
-                vk::AccessFlags2 = vk::AccessFlagBits2::eShaderRead);
-    void NativeAccess(VideoCore::Image&, vk::AccessFlags2);
+    /// The proxy (level 0) for reading or writing outside a render pass (compute, copies).
+    Target Read(VideoCore::ImageId, const VideoCore::ImageViewInfo&);
+    /// Before commands on the native image: resolves dirty proxies into it; `write` makes them
+    /// stale (the native image becomes current).
+    void NativeAccess(VideoCore::Image&, bool write);
     /// The proxy of `image` for sampling when it holds the current content (else nullopt: the
-    /// native image is current). Transitions only after other use (attachment, copy).
-    /// Mipmapped targets have one proxy per level: views of one level only.
+    /// native image is current). Mipmapped targets have one proxy per level: views of one level
+    /// only.
     std::optional<Target> SampleProxy(const VideoCore::Image& image,
                                       const VideoCore::ImageViewInfo& info);
     /// Whether SampleProxy would return the proxy of `image` for these levels.
     [[nodiscard]] bool ProxyCurrent(const VideoCore::Image& image, u32 level = 0,
                                     u32 levels = 1) const;
-    /// SampleProxy for a view obtained before (valid while Generation() is unchanged): makes the
-    /// proxy current for sampling.
+    /// SampleProxy for a view obtained before (valid while Generation() is unchanged). Nothing to
+    /// do on Metal (no layouts; Metal tracks the proxies' hazards): kept for the callers.
     void PrepareSample(const VideoCore::Image& image, u32 level = 0);
     /// Changes when proxies and their views are destroyed (SetSize).
     [[nodiscard]] u64 Generation() const noexcept {
@@ -69,29 +70,32 @@ private:
         VideoCore::ImageId source{};
         u64 uid = 0;
         u32 level = 0; ///< mip level of the native image this proxy stands for
+        u32 width = 0, height = 0; ///< proxy size
         Metal::Object image; ///< id<MTLTexture> of the proxy
-        std::vector<std::pair<VideoCore::ImageViewInfo, vk::UniqueImageView>> views;
-        vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+        std::vector<std::pair<VideoCore::ImageViewInfo, Metal::Object>> views;
         SceneResolution::Coherence state;
+    };
+    struct PipelineKey {
+        const char* fragment{};
+        u32 color_format{}, depth_format{}, stencil_format{};
+        bool operator==(const PipelineKey&) const = default;
     };
     static constexpr u64 Key(u64 uid, u32 level) {
         return uid << 4 | level;
     }
     Entry& Get(VideoCore::ImageId, u32 level = 0);
-    vk::ImageView View(Entry&, const VideoCore::Image&, const VideoCore::ImageViewInfo&);
+    void* View(Entry&, const VideoCore::Image&, const VideoCore::ImageViewInfo&);
     void Copy(Entry&, VideoCore::Image&, bool to_native);
-    // Depth/stencil formats without blit support (D32S8 on RADV) are resampled by a
-    // fullscreen draw writing gl_FragDepth and, with stencil export, the stencil value.
-    vk::FormatFeatureFlags Features(vk::Format) const;
-    bool Blittable(vk::Format) const;
+    /// Colour images: copied by CopyTexture at the same size, else by a nearest-texel draw.
+    bool Blittable(const VideoCore::Image&) const;
+    /// Depth (and stencil) images: resampled by a fullscreen draw writing depth and, with
+    /// stencil export, the stencil value (or one draw per stencil bit, BB_SCENE_STENCIL_BITS=1).
     bool ShaderResampled(const VideoCore::Image&) const;
-    void Resample(vk::Image src, vk::Image dst, const VideoCore::Image& original,
-                  vk::Extent2D dst_size);
-    vk::Pipeline ResamplePipeline(vk::Format, bool stencil);
-    void CreateResampleResources();
-    void Transition(Entry&, vk::ImageAspectFlags, vk::ImageLayout,
-                    vk::PipelineStageFlags2, vk::AccessFlags2);
-    const Instance& instance;
+    void Scale(void* src, u32 src_level, void* dst, u32 dst_level, u32 width, u32 height,
+               const VideoCore::Image& original);
+    void Resample(void* src, void* dst, const VideoCore::Image& original, u32 width, u32 height);
+    void* Pipeline(const PipelineKey&);
+    Metal::Device& device;
     Scheduler& scheduler;
     Runtime& runtime;
     Lookup lookup;
@@ -101,14 +105,13 @@ private:
     bool copying = false;
     bool force_stencil_bits = false; ///< test the portable resampler on any driver
     u64 generation = 0;
-    mutable std::unordered_map<vk::Format, vk::FormatFeatureFlags> format_features;
-    mutable std::array<vk::FormatFeatureFlags, 256> format_table{};
-    mutable std::array<bool, 256> format_known{};
     std::array<std::pair<u64, Entry*>, 8> recent{}; ///< last entries by Key
     u32 recent_next = 0;
-    vk::UniqueShaderModule fs_tri_vert, depth_frag, depth_stencil_frag, stencil_bits_frag;
-    vk::UniqueDescriptorSetLayout resample_set_layout;
-    vk::UniquePipelineLayout resample_layout;
-    std::vector<std::pair<std::pair<vk::Format, bool>, vk::UniquePipeline>> resample_pipelines;
+    Metal::Object library; ///< Metal::BlitShaders plus the nearest colour scale
+    std::vector<std::pair<PipelineKey, Metal::Object>> pipelines;
+    void* no_depth_state{};      ///< id<MTLDepthStencilState> (owned by the scheduler's cache)
+    void* depth_write_state{};   ///< depth always/write, no stencil
+    void* depth_stencil_state{}; ///< plus stencil replace (exported value), write mask 0xff
+    std::array<void*, 9> stencil_bit_states{}; ///< write masks 0, 1, 2, 4, ..., 128
 };
 } // namespace Vulkan

@@ -198,8 +198,7 @@ void Runtime::FillBuffer(const VideoCore::Buffer& dst, u64 offset, u64 size, u32
 void Runtime::AccessImage(VideoCore::Image* image, bool write) {
     BeforeImageAccess();
     if (scene_targets) {
-        scene_targets->NativeAccess(*image, write ? vk::AccessFlagBits2::eTransferWrite
-                                                  : vk::AccessFlagBits2::eTransferRead);
+        scene_targets->NativeAccess(*image, write);
     }
 }
 
