@@ -1,6 +1,9 @@
 # Native Metal back end (plan stage 3)
 
-Branch `metal-backend`. Status: M0 interop test passes; M1 shader compiler in (2026-10-15).
+Branch `metal-backend`. **Status (2026-10-16 morning): the whole game renders through our own Metal
+encoding, faster than MoltenVK at 1080p (96.4 vs 94.5 FPS), level at 1440p and with MetalFX,
+drawing geometry-shader effects MoltenVK cannot; FSR 3.1, MetalFX and the overlay work.**
+Try it: `renderer=metal` in bbport.ini (the in-game menu keeps it), or `BB_METAL_FRAME=1`.
 
 ## Why
 

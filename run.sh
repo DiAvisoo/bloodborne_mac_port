@@ -132,6 +132,16 @@ elif [[ -n ${scaled_output:-} ]]; then
 fi
 "$PYTHON" scripts/patches.py --out "$out" --fps "$fps" --extra "${BB_PATCHES:-}" --settings "$BB_CONFIG" --game-dir "$game" --render-res "${BB_RENDER_RES:-}" --output-res "${BB_OUTPUT_RES:-}" \
     --patches-dir "${BB_PATCHES_DIR:-$data/patches}" --patches-config "${BB_PATCHES_CONFIG:-$data/patches.json}"
+# Native Metal renderer (docs/DESIGN_METAL_BACKEND.md; the arm64 GPU process): bbport.ini
+# renderer=metal, or BB_METAL_FRAME=1. Builds without it ignore the setting.
+if [[ -z ${BB_METAL_FRAME:-} && -f $BB_CONFIG ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == renderer=metal ]] && export BB_METAL_FRAME=1
+    done < "$BB_CONFIG"
+fi
+if [[ ${BB_METAL_FRAME:-} == 1 ]]; then
+    echo "Renderer: native Metal (renderer=metal / BB_METAL_FRAME=1)"
+fi
 if [[ -z ${BB_VBLANK_HZ:-} ]]; then
     case $fps in uncap) export BB_VBLANK_HZ=0 ;; 90) export BB_VBLANK_HZ=90 ;; *) export BB_VBLANK_HZ=60 ;; esac
 fi

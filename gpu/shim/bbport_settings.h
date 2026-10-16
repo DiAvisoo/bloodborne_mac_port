@@ -84,6 +84,9 @@ struct Values {
     /// missing for a few frames), Balanced waits within a small time budget and skips past it.
     /// bbport.ini shader_compile=wait|skip|balanced; live.
     std::atomic<int> shader_compile{ShaderBalanced};
+    /// bbport.ini renderer=metal|vulkan, read by run.sh at start (native Metal: the arm64 GPU
+    /// process); kept here so saving the settings does not drop it.
+    std::atomic<bool> metal_renderer{false};
     /// Why FSR 4 cannot run (assets, device features), or null. Set by the renderer.
     std::atomic<const char*> fsr4_problem{nullptr};
     std::atomic<bool> fsr4_supported{false}, fsr411_supported{false};
