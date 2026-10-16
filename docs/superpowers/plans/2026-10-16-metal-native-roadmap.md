@@ -54,3 +54,17 @@ Saves in `out/macdata/save-backups/`: `loadcrash-20261014-134937` (Hunter's Drea
 `cages-20261016` (Central Yharnam lamp), `livecopy-20261016` (Cathedral Ward). Scripts in the
 session scratchpad drive them with `BB_PAD_FILE` (title +30 s, Cross twice, walk/turn,
 screenshots); speed by the head-to-head protocol against 0.4.0.
+
+## Open items carried from M1 (final review, 2026-10-16)
+
+For the M2 plan:
+- **Binding lifetime:** Encoder bindings are unretained and persist across Submit (also >4 KiB
+  `SetBytes` temporaries). The scheduler must rebind per command buffer or reset bindings at
+  Submit before caches start freeing objects at `IsFree(tick)`.
+- `FillBuffer` writes only the low byte of a 32-bit pattern: add a compute fill if the caches
+  use non-uniform patterns.
+- `SetBytes` over 4 KiB allocates a buffer each time: use a tick-recycled ring.
+- Attachments use `slice` only (3D `depthPlane`, stencil-only formats not handled yet).
+- `~Encoder` should end an open clear-only pass before checking for a command buffer; `~Device`
+  `Finish` has no timeout; `Wait` must not be called from a completion handler; `IsFree` assumes
+  same-queue completion order; logging from handlers may outlive logging at exit.
