@@ -153,6 +153,14 @@ Object EncodeSnapshot(Device& device, void* command_buffer, void* texture, u32 w
     if (width == 0 || height == 0) {
         return {};
     }
+    // The PNG writer takes 4-byte BGRA texels; an HDR layer (RGBA16Float, BGR10A2) would need
+    // a conversion pass.
+    const MTLPixelFormat format = ((__bridge id<MTLTexture>)texture).pixelFormat;
+    if (format != MTLPixelFormatBGRA8Unorm && format != MTLPixelFormatBGRA8Unorm_sRGB) {
+        LOG_WARNING(Render, "Snapshot: drawable pixel format {} is not BGRA8; no snapshot",
+                    static_cast<u32>(format));
+        return {};
+    }
     id<MTLBuffer> buffer =
         [(__bridge id<MTLDevice>)device.NativeDevice() newBufferWithLength:NSUInteger(width) * height * 4
                                                                    options:MTLResourceStorageModeShared];

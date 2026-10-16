@@ -147,7 +147,9 @@ private:
     VideoCore::TextureCache& texture_cache;
     void* layer; ///< CAMetalLayer* (the window's, SDL_Metal_GetLayer)
     /// bbport: BB_SNAPSHOT_TRIGGER (empty: off). Present writes the drawable as a PNG when this
-    /// file exists (its first line, else "<trigger>.png"), then removes it.
+    /// file exists (its first line, else "<trigger>.png"), then removes it. Create the trigger
+    /// atomically (temp file + mv) or the path line may not be there yet. The PNG is written by
+    /// a detached thread: one still writing at exit leaves a truncated file (debug tool).
     std::string snapshot_trigger;
     /// The PNG path when the trigger file exists (and removes it); empty otherwise.
     std::string TakeSnapshotRequest();

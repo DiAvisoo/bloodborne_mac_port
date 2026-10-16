@@ -363,7 +363,7 @@ bool PsoCache::WriteArchive() {
                 "%llu compiled\n",
                 static_cast<unsigned long long>(descriptors.count - add_failures),
                 static_cast<unsigned long long>(counters.archive_hits.load()),
-                static_cast<unsigned long long>(counters.archive_adds.load()));
+                static_cast<unsigned long long>(counters.compiled.load()));
     std::fflush(stdout);
     return true;
 }
@@ -682,6 +682,7 @@ const RenderPipeline* PsoCache::GetRenderPipeline(const Vulkan::GraphicsPipeline
     ++counters.render_pipelines;
     counters.render_us += elapsed_us;
     counters.archive_hits += from_archive;
+    counters.compiled += !from_archive && pipeline->state;
     if (!from_archive && pipeline->state && impl->archive) {
         ++counters.archive_adds;
     }
@@ -767,6 +768,7 @@ const ComputePipeline* PsoCache::GetComputePipeline(const Vulkan::ComputePipelin
     ++counters.compute_pipelines;
     counters.compute_us += elapsed_us;
     counters.archive_hits += from_archive;
+    counters.compiled += !from_archive && pipeline->state;
     if (!from_archive && pipeline->state && impl->archive) {
         ++counters.archive_adds;
     }
@@ -1002,6 +1004,7 @@ const TessellationPipeline* PsoCache::GetTessellationPipeline(
     ++counters.tessellation_pipelines;
     counters.compute_us += elapsed_us;
     counters.archive_hits += from_archive && error.empty();
+    counters.compiled += !from_archive && error.empty();
 
     std::unique_lock lock{impl->mutex};
     const auto [it, inserted] = impl->tessellation.try_emplace(map_key, std::move(pipeline));
@@ -1180,6 +1183,7 @@ const GeometryPipeline* PsoCache::GetGeometryPipeline(const Vulkan::GraphicsPipe
     ++counters.geometry_pipelines;
     counters.compute_us += elapsed_us;
     counters.archive_hits += from_archive && error.empty();
+    counters.compiled += !from_archive && error.empty();
 
     std::unique_lock lock{impl->mutex};
     const auto [it, inserted] = impl->geometry.try_emplace(map_key, std::move(pipeline));

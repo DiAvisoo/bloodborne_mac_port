@@ -247,7 +247,10 @@ public:
         std::atomic<u64> geometry_pipelines{};     ///< distinct geometry pipelines built (incl. failed)
         std::atomic<u64> failures{};           ///< render + compute builds that failed
         std::atomic<u64> archive_hits{};       ///< pipelines taken from the binary archive
-        std::atomic<u64> archive_adds{};       ///< pipelines compiled (not from the archive)
+        std::atomic<u64> archive_adds{};       ///< render pipelines compiled into a loaded archive
+        /// Pipelines of every kind (render, tessellation, geometry, compute) built by the
+        /// compiler rather than taken from the archive, with or without an archive.
+        std::atomic<u64> compiled{};
         std::atomic<u64> archive_writes{};          ///< archive files written
         std::atomic<u64> archive_write_failures{};  ///< writes that failed
         std::atomic<u64> archive_add_failures{};    ///< descriptors a write could not add (left out)

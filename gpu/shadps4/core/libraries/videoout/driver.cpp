@@ -784,7 +784,7 @@ void VideoOutDriver::Flip(const Request& req) {
             if (presenter) {
                 const auto& psos = presenter->GetRasterizer().GetPipelineCache().Psos().GetCounters();
                 archive_hits = psos.archive_hits.load();
-                compiled = psos.archive_adds.load();
+                compiled = psos.compiled.load();
             }
             std::printf("GPU memory: %.0f MiB allocated, %.0f MiB resident buffers; collector "
                         "usage %.0f MiB, trigger %.0f MiB, %llu images freed; pipelines: %llu "

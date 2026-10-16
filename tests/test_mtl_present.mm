@@ -406,6 +406,19 @@ void TestSnapshot(Device& device, PresentPasses& passes, PresentQueue& queue) {
     });
     queue.WaitIdle();
     Expect(written, "snapshot PNG written");
+    // Not BGRA8 (an HDR layer): no snapshot rather than wrong bytes.
+    Object half = CreateTexture(device,
+                                TextureDesc{.pixel_format = MTLPixelFormatRGBA16Float,
+                                            .width = kW,
+                                            .height = kH,
+                                            .render_target = true},
+                                "test half", nullptr);
+    WithAutoreleasePool([&] {
+        void* cb = queue.Begin();
+        Expect(!EncodeSnapshot(device, cb, half.Get(), kW, kH), "no snapshot of RGBA16Float");
+        queue.Commit(cb, nullptr, {});
+    });
+    queue.WaitIdle();
     NSData* data = [NSData dataWithContentsOfFile:@(path)];
     CGImageSourceRef source =
         data ? CGImageSourceCreateWithData((__bridge CFDataRef)data, nullptr) : nullptr;
