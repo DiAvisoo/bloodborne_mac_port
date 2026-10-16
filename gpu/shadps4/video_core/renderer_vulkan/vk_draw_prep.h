@@ -60,14 +60,12 @@ inline u64 ImageDescHash(const AmdGpu::Image& sharp, const Shader::ImageResource
     return hash;
 }
 
-/// Vertex inputs of a draw (the dynamic vertex input path): the attribute and binding
-/// descriptions, the V# of each stream, and the stream memory merged into ranges.
+/// Vertex streams of a draw: the V# of each stream (fetch shader order) and the stream memory
+/// merged into ranges. The attribute formats and step rates belong to the pipeline (its key).
 struct PreparedVertexInputs {
     struct Range {
         VAddr base, end;
     };
-    const vk::VertexInputAttributeDescription2EXT* attributes;
-    const vk::VertexInputBindingDescription2EXT* bindings;
     const AmdGpu::Buffer* buffers;
     const u8* range_index; ///< per stream with memory: its entry in `ranges`
     const Range* ranges;

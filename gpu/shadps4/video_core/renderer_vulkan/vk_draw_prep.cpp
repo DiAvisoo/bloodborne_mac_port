@@ -116,24 +116,18 @@ void PrepareResources(const Shader::Info& info, PreparedStage& stage, FlatArena&
     stage.num_buffers = static_cast<u32>(buffers.size());
 }
 
-/// Rasterizer::BindVertexBuffers' pure part (GraphicsPipeline::GetVertexInputs for the dynamic
-/// vertex input path, and the merge of the stream memory into ranges).
+/// Rasterizer::ResolveVertexBuffers' pure part (the V#s of the fetch shader's streams and the
+/// merge of the stream memory into ranges).
 void PrepareVertexInputs(const Shader::Info& vs, const Shader::Gcn::FetchShaderData& fetch,
-                         const AmdGpu::Regs& regs, PreparedVertexInputs& out, FlatArena& arena) {
-    using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    thread_local std::vector<vk::VertexInputAttributeDescription2EXT> attributes;
-    thread_local std::vector<vk::VertexInputBindingDescription2EXT> bindings;
+                         PreparedVertexInputs& out, FlatArena& arena) {
     thread_local std::vector<AmdGpu::Buffer> buffers;
     thread_local std::vector<PreparedVertexInputs::Range> ranges, merged;
     thread_local std::vector<u8> range_index;
-    attributes.clear();
-    bindings.clear();
     buffers.clear();
     ranges.clear();
     merged.clear();
     range_index.clear();
     for (const auto& attrib : fetch.attributes) {
-        const auto step_rate = attrib.GetStepRate();
         const auto buffer = attrib.GetSharp(vs);
         // The V# may come from user data the guest is still writing: an unknown format leaves
         // the inputs to the GPU thread, which reads them once the draw is submitted (the
@@ -145,22 +139,6 @@ void PrepareVertexInputs(const Shader::Info& vs, const Shader::Gcn::FetchShaderD
             out.valid = false;
             return;
         }
-        attributes.push_back({
-            .location = attrib.semantic,
-            .binding = attrib.semantic,
-            .format = format,
-            .offset = 0,
-        });
-        bindings.push_back({
-            .binding = attrib.semantic,
-            .stride = buffer.GetStride(),
-            .inputRate = step_rate == InstanceIdType::None ? vk::VertexInputRate::eVertex
-                                                           : vk::VertexInputRate::eInstance,
-            .divisor = step_rate == InstanceIdType::OverStepRate0 ? regs.vgt_instance_step_rate_0
-                       : step_rate == InstanceIdType::OverStepRate1
-                           ? regs.vgt_instance_step_rate_1
-                           : 1u,
-        });
         buffers.push_back(buffer);
         if (buffer.base_address != 0 && buffer.GetSize() > 0) {
             ranges.push_back({buffer.base_address, buffer.base_address + buffer.GetSize()});
@@ -182,12 +160,10 @@ void PrepareVertexInputs(const Shader::Info& vs, const Shader::Gcn::FetchShaderD
             range_index.push_back(static_cast<u8>(it - merged.begin()));
         }
     }
-    out.attributes = arena.AppendArray(attributes.data(), attributes.size());
-    out.bindings = arena.AppendArray(bindings.data(), bindings.size());
     out.buffers = arena.AppendArray(buffers.data(), buffers.size());
     out.range_index = arena.AppendArray(range_index.data(), range_index.size());
     out.ranges = arena.AppendArray(merged.data(), merged.size());
-    out.count = static_cast<u32>(attributes.size());
+    out.count = static_cast<u32>(buffers.size());
     out.num_ranges = static_cast<u32>(merged.size());
     out.buffers_hash =
         buffers.empty() ? 0 : XXH3_64bits(buffers.data(), buffers.size() * sizeof(AmdGpu::Buffer));
@@ -468,7 +444,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
                     draw.vertex.valid = false;
                     const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
                     if (vs && sel.fetch_shader) {
-                        PrepareVertexInputs(*vs, *sel.fetch_shader, *regs, draw.vertex, arena);
+                        PrepareVertexInputs(*vs, *sel.fetch_shader, draw.vertex, arena);
                     }
                     draw.state.store(PreparedDraw::Ready, std::memory_order_release);
                 } else {

@@ -7,9 +7,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "video_core/renderer_vulkan/scene_resolution.h"
+#include "video_core/renderer_metal/mtl_object.h"
 #include "video_core/texture_cache/image.h"
 
 namespace VideoCore { class TextureCache; }
+namespace Metal { class Device; }
 namespace Vulkan {
 class Instance;
 class Runtime;
@@ -19,9 +21,9 @@ class Scheduler;
 // integer texture loads, copies and CPU readbacks. All native access passes Runtime::Transit.
 class SceneTargets {
 public:
-    SceneTargets(const Instance&, Scheduler&, Runtime&, VideoCore::TextureCache&);
+    SceneTargets(Metal::Device&, Scheduler&, Runtime&, VideoCore::TextureCache&);
     using Lookup = std::function<VideoCore::Image*(VideoCore::ImageId, u64)>;
-    SceneTargets(const Instance&, Scheduler&, Runtime&, Lookup);
+    SceneTargets(Metal::Device&, Scheduler&, Runtime&, Lookup);
     ~SceneTargets();
     bool SetSize(SceneResolution::Size);
     SceneResolution::Size Size() const { return size; }
@@ -34,10 +36,7 @@ public:
     /// The proxy size of an eligible image: the scene size divided like the native size.
     SceneResolution::Size ProxySize(const VideoCore::Image&, u32 level = 0) const;
     struct Target {
-        vk::Image image;
-        vk::ImageView view;
-        vk::ImageLayout layout;
-        vk::ImageUsageFlags usage;
+        void* texture{}; ///< id<MTLTexture>: the proxy's view for the requested range
     };
     Target Attachment(VideoCore::ImageId, const VideoCore::ImageViewInfo&);
     Target Read(VideoCore::ImageId, const VideoCore::ImageViewInfo&,
@@ -52,9 +51,9 @@ public:
     /// Whether SampleProxy would return the proxy of `image` for these levels.
     [[nodiscard]] bool ProxyCurrent(const VideoCore::Image& image, u32 level = 0,
                                     u32 levels = 1) const;
-    /// SampleProxy for a view obtained before (valid while Generation() is unchanged): the
-    /// layout to sample it in.
-    vk::ImageLayout PrepareSample(const VideoCore::Image& image, u32 level = 0);
+    /// SampleProxy for a view obtained before (valid while Generation() is unchanged): makes the
+    /// proxy current for sampling.
+    void PrepareSample(const VideoCore::Image& image, u32 level = 0);
     /// Changes when proxies and their views are destroyed (SetSize).
     [[nodiscard]] u64 Generation() const noexcept {
         return generation;
@@ -70,7 +69,7 @@ private:
         VideoCore::ImageId source{};
         u64 uid = 0;
         u32 level = 0; ///< mip level of the native image this proxy stands for
-        VideoCore::UniqueImage image;
+        Metal::Object image; ///< id<MTLTexture> of the proxy
         std::vector<std::pair<VideoCore::ImageViewInfo, vk::UniqueImageView>> views;
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
         SceneResolution::Coherence state;

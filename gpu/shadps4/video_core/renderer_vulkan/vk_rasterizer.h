@@ -8,6 +8,7 @@
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_metal/mtl_draw.h"
 #include "video_core/renderer_vulkan/vk_bind_helper.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
@@ -28,6 +29,10 @@ namespace Core {
 class MemoryManager;
 }
 
+namespace Metal {
+class Device;
+}
+
 namespace Vulkan {
 
 class GraphicsPipeline;
@@ -35,7 +40,7 @@ class Runtime;
 
 class Rasterizer {
 public:
-    explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
+    explicit Rasterizer(Metal::Device& device, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
 
@@ -246,21 +251,27 @@ private:
     AmdGpu::CbDbExtent DbExtent() const;
 
     void BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
-                     Shader::Backend::Bindings& binding,
-                     Shader::PushData& push_data, u32& write_index);
-    /// `on_helper`: run by the texture binding helper; out-of-date images are not refreshed.
+                     Shader::Backend::Bindings& binding, Shader::PushData& push_data);
+    /// `on_helper`: run by the texture binding helper; out-of-date images are not refreshed,
+    /// and the images' Runtime::AccessImage calls are left to this thread (texture_task).
     void BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
-                      Shader::Backend::Bindings& binding, u32& write_index, bool& barrier,
-                      bool on_helper = false);
+                      Shader::Backend::Bindings& binding, bool on_helper = false);
     bool BindResources(const Pipeline* pipeline);
     void ForceAnisotropy(AmdGpu::Sampler& sharp, bool is_depth) const;
     void BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
-                      Shader::Backend::Bindings& binding, u32& write_index);
+                      Shader::Backend::Bindings& binding);
+    /// The element of `bound` at a unified binding, grown to fit (not on the helper thread: its
+    /// slots are sized before it starts).
+    Metal::Draw::Bound& BoundAt(u32 binding);
+    /// Image accesses before a draw or dispatch reads or writes `image` (Runtime::AccessImage:
+    /// the image access hook and the scene-proxy sync), or, on the texture binding helper,
+    /// noted for this thread to run after the join (the runtime is not thread-safe).
+    void AccessBoundImage(VideoCore::Image& image, bool write, bool on_helper);
     /// bbport: a stage's resolved textures remembered by its prepared T# hashes
     /// (TextureSetMemo): a hit only redoes the per-draw effects (binding flags, transitions).
     struct TextureSetEntry {
-        VideoCore::ImageId id{}; ///< after the depth redirect; null descriptor when invalid
-        vk::ImageView view;
+        VideoCore::ImageId id{}; ///< after the depth redirect; null stand-in when invalid
+        void* texture{};         ///< id<MTLTexture> of the view
         const void* backing = nullptr;
         VideoCore::SubresourceRange range;
         bool proxy = false; ///< sampled from the scene proxy (view: SampleProxy on each use)
@@ -280,7 +291,7 @@ private:
     std::array<u64, 4> texture_set_why{}; ///< misses: other key, generation, image check, new
     /// Returns true when the stage's images were bound from the memo.
     bool BindTexturesFromSet(const Shader::Info& stage, const PreparedStage* prepared,
-                             u32 first_image_idx, bool& barrier, TextureSet*& slot);
+                             TextureSet*& slot);
     /// The prepared sharps of `stage` in the current prepared draw, if they fit it.
     const PreparedStage* FindPreparedStage(const Shader::Info& stage) const;
     /// Whether the helper may bind textures for this pipeline at all (fixed descriptor layout,
@@ -296,17 +307,18 @@ private:
     void NoteFrameStart();
     /// BB_GPU_PROFILE: a timestamp where a render pass starts (vk_gpu_profiler.h).
     void MarkPass(const GraphicsPipeline* pipeline, const RenderState& state);
-    void BindVertexBuffers(const GraphicsPipeline* pipeline,
-                           const PreparedDraw* prepared = nullptr);
-    void BindIndexBuffer(u32 index_offset = 0);
-    /// bbport: BindVertexBuffers/BindIndexBuffer in two halves: obtaining the buffers
-    /// (vertex_binds, index_bind) and recording the binds.
-    void ResolveVertexBuffers(const GraphicsPipeline* pipeline, const PreparedDraw* prepared);
-    void EmitVertexBuffers();
-    void ResolveIndexBuffer(u32 index_offset);
-    void EmitIndexBuffer();
+    /// bbport: obtains the draw's vertex streams (vertex_binds) and index buffer (index_bind);
+    /// the draw binds them in its recorded command (bindings do not survive a submission).
+    void ResolveVertexBuffers(const GraphicsPipeline* pipeline,
+                              const PreparedDraw* prepared = nullptr);
+    void ResolveIndexBuffer(u32 index_offset = 0);
+    /// The bound resources, push constants and vertex streams of the draw or dispatch being
+    /// recorded, copied into recording storage (Scheduler::RecordData) for its recorded command,
+    /// with the index buffer when `indexed`. Called last, after push_data is final, and right
+    /// before the command is recorded (the copies share its recording chunk).
+    Metal::Draw::Resources RecordResources(bool indexed);
 
-    void ResetBindings(bool is_compute);
+    void ResetBindings();
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -315,17 +327,17 @@ private:
 private:
     friend class VideoCore::BufferCache;
 
-    const Instance& instance;
+    Metal::Device& device;
     Scheduler& scheduler;
     Runtime& runtime;
     VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
     static constexpr u64 NullBufferSize = 64_KB;
-    /// bbport: zero-filled stand-in for null buffer bindings without nullDescriptor (MoltenVK).
+    /// bbport: zero-filled stand-in for null buffer bindings (Metal has no null descriptors).
     std::optional<VideoCore::Buffer> null_buffer;
-    vk::Buffer NullBuffer() const {
-        return null_buffer ? null_buffer->Handle() : vk::Buffer{};
+    Metal::Draw::Bound NullBufferBinding() const {
+        return {.buffer = null_buffer->Ref(), .size = NullBufferSize};
     }
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
@@ -349,19 +361,21 @@ private:
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
-    boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
-    boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+    /// A stage's resolved textures and samplers, in binding order, before they are placed in
+    /// `bound` (textures only, or samplers only, per element).
+    boost::container::static_vector<Metal::Draw::Bound, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
         u64 offset;
         u32 size;
-        bool is_written;
     };
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
 
-    u32 set_write_index{};
-    Pipeline::DescriptorWrites set_writes;
+    /// The resources of the draw or dispatch being bound, by the shaders' unified binding
+    /// (Shader::Backend::Bindings::unified; array elements contiguous), for
+    /// Metal::Draw::BindStage. Empty elements get the draw helper's null stand-ins.
+    std::vector<Metal::Draw::Bound> bound;
     Shader::PushData push_data;
 
     // bbport: bindings point at their description instead of copying it (a hot spot): into
@@ -429,18 +443,13 @@ private:
     }
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     struct VertexBinds {
-        VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-        VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
-        VertexInputs<vk::Buffer> host_buffers;
-        VertexInputs<vk::DeviceSize> host_offsets;
-        VertexInputs<vk::DeviceSize> host_sizes;
-        VertexInputs<vk::DeviceSize> host_strides;
-        u32 num_buffers = 0;
+        /// By attribute location (the pipeline's vertex slots look them up there); locations
+        /// without a stream get the null stand-in.
+        VertexInputs<Metal::Draw::VertexStream> streams;
     } vertex_binds;
     struct IndexBind {
-        vk::Buffer handle;
-        u64 offset;
-        vk::IndexType type;
+        Metal::BufferRef buffer{}; ///< at the first index
+        Metal::IndexType type{Metal::IndexType::U16};
     } index_bind{};
     /// The direct draw whose vertex/index buffers BindResources may resolve early.
     struct DrawInputs {
@@ -459,12 +468,16 @@ private:
             const Shader::Info* info;
             const PreparedStage* prepared;
             Shader::Backend::Bindings binding;
-            u32 write_index;
         };
         std::array<Stage, Shader::MaxStageTypes> stages;
         u32 count = 0;
         u32 completed = 0; ///< stages the helper bound; the rest are bound after the join
-        bool barrier = false;
+        /// The helper's image accesses (AccessBoundImage), run on this thread after the join.
+        struct Access {
+            VideoCore::Image* image;
+            bool write;
+        };
+        boost::container::static_vector<Access, Shader::NUM_IMAGES> accesses;
     } texture_task;
     /// Draws whose textures the helper bound completely, partly or not at all (BB_FRAME_STATS).
     u64 helper_full = 0, helper_partial = 0, helper_serial = 0;
@@ -472,7 +485,6 @@ private:
     boost::container::static_vector<ImageDescCacheEntry*, Shader::NUM_IMAGES> image_binding_entries;
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
-    bool needs_barrier{};
     // bbport: two-stage draw pipeline (stage B state; the thread is the last member so it
     // stops first).
     static inline thread_local const AmdGpu::Regs* stage_regs = nullptr;
