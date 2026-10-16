@@ -5,17 +5,17 @@
 
 #include "video_core/amdgpu/regs_texture.h"
 #include "video_core/amdgpu/resource.h"
-#include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_metal/mtl_object.h"
 
-namespace Vulkan {
-class Instance;
+namespace Metal {
+class Device;
 }
 
 namespace VideoCore {
 
 class Sampler {
 public:
-    explicit Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
+    explicit Sampler(Metal::Device& device, const AmdGpu::Sampler& sampler,
                      const AmdGpu::BorderColorBuffer border_color_base, bool is_depth,
                      float extra_lod_bias = 0.0f);
     ~Sampler();
@@ -26,14 +26,15 @@ public:
     Sampler(Sampler&&) = default;
     Sampler& operator=(Sampler&&) = default;
 
-    vk::Sampler Handle() const noexcept {
-        return *handle;
+    /// The id<MTLSamplerState> (unretained).
+    void* Handle() const noexcept {
+        return handle.Get();
     }
 
     size_t lru_id{};
 
 private:
-    vk::UniqueSampler handle;
+    Metal::Object handle;
 };
 
 } // namespace VideoCore

@@ -6,22 +6,23 @@
 #include "common/enum.h"
 #include "common/incremental_id.h"
 #include "common/types.h"
+#include "video_core/renderer_metal/mtl_object.h"
+#include "video_core/renderer_metal/mtl_texture.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
 #include <deque>
-#include <optional>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 
 namespace Vulkan {
-class Instance;
 class Runtime;
 } // namespace Vulkan
 
-VK_DEFINE_HANDLE(VmaAllocation)
-VK_DEFINE_HANDLE(VmaAllocator)
+namespace Metal {
+class Device;
+} // namespace Metal
 
 namespace VideoCore {
 
@@ -37,53 +38,8 @@ enum ImageFlagBits : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
-struct UniqueImage {
-    explicit UniqueImage() = default;
-    explicit UniqueImage(vk::Device device, VmaAllocator allocator)
-        : device{device}, allocator{allocator} {}
-    ~UniqueImage();
-
-    UniqueImage(const UniqueImage&) = delete;
-    UniqueImage& operator=(const UniqueImage&) = delete;
-
-    UniqueImage(UniqueImage&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
-          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
-    UniqueImage& operator=(UniqueImage&& other) {
-        if (this == &other) return *this;
-        Destroy();
-        device = other.device;
-        image = std::exchange(other.image, VK_NULL_HANDLE);
-        allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
-        allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
-        image_ci = std::move(other.image_ci);
-        return *this;
-    }
-
-    void Create(const vk::ImageCreateInfo& image_ci);
-
-    void Destroy();
-
-    operator vk::Image() const {
-        return image;
-    }
-
-    operator bool() const {
-        return image;
-    }
-
-public:
-    vk::Device device{};
-    VmaAllocator allocator{};
-    VmaAllocation allocation{};
-    vk::Image image{};
-    vk::ImageCreateInfo image_ci{};
-    vk::DeviceSize size_bytes{};
-};
-
 struct Image {
-    explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
+    explicit Image(Metal::Device& device, Vulkan::Runtime& runtime,
                    Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
     ~Image();
 
@@ -100,12 +56,13 @@ struct Image {
         return image_addr < overlap_end && overlap_cpu_addr < image_end;
     }
 
-    vk::Image GetImage() const {
-        return backing->image.image;
+    /// The current backing's id<MTLTexture> (unretained).
+    void* GetImage() const {
+        return backing->texture.Get();
     }
 
-    vk::DeviceSize GetHostImageSize() const {
-        return backing->image.size_bytes;
+    u64 GetHostImageSize() const {
+        return backing->allocated_size;
     }
 
     bool IsTracked() {
@@ -128,13 +85,12 @@ struct Image {
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
-    using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
-    void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                     vk::PipelineStageFlags2 dst_stage,
-                     std::optional<SubresourceRange> subres_range = {});
+    struct BackingImage;
+    /// Adds a backing texture with `num_samples` samples (clamped to what the device supports),
+    /// made from the image's texture description; the image's current backing is unchanged.
+    BackingImage& CreateBacking(u32 num_samples);
 
 public:
-    struct BackingImage;
     // bbport: fields every binding of the image reads, together ahead of the large ImageInfo
     // (they were spread over several cache lines: one miss each per texture per draw).
     ImageFlagBits flags = ImageFlagBits::Dirty;
@@ -167,20 +123,19 @@ public:
     ImageInfo info;
     Vulkan::Runtime* runtime;
     Common::SlotVector<ImageView>* slot_image_views;
-    vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
-    vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
+    Metal::Device* device;
+    bool has_depth = false;
+    bool has_stencil = false;
+    /// Sample counts the device supports for textures: `mask & N` for N = 1, 2, 4, 8 (the bits of
+    /// vk::SampleCountFlags).
+    u32 supported_samples_mask = 1;
+    /// The texture description backings are made from (samples are per backing).
+    Metal::TextureDesc texture_desc{};
 
-    vk::ImageUsageFlags usage_flags;
-    vk::FormatFeatureFlags2 format_features;
-    struct State {
-        vk::PipelineStageFlags2 pl_stage = vk::PipelineStageFlagBits2::eAllCommands;
-        vk::AccessFlags2 access_mask = vk::AccessFlagBits2::eNone;
-        vk::ImageLayout layout = vk::ImageLayout::eUndefined;
-    };
     struct BackingImage {
-        UniqueImage image;
-        State state;
-        std::vector<State> subresource_states;
+        Metal::Object texture; ///< id<MTLTexture>
+        Metal::TextureDesc desc;
+        u64 allocated_size{};
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 last_view = 0; ///< bbport: index of the view FindView returned last

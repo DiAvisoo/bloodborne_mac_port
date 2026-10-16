@@ -3,32 +3,48 @@
 
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/renderer_metal/mtl_texture.h"
+#include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <algorithm>
+#include <atomic>
 #include <magic_enum/magic_enum.hpp>
 
 namespace VideoCore {
 
-vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
-    switch (type) {
-    case AmdGpu::ImageType::Color1D:
-        return vk::ImageViewType::e1D;
-    case AmdGpu::ImageType::Color1DArray:
-        return vk::ImageViewType::e1DArray;
-    case AmdGpu::ImageType::Color2D:
-    case AmdGpu::ImageType::Color2DMsaa:
-        return vk::ImageViewType::e2D;
-    case AmdGpu::ImageType::Color2DArray:
-        return vk::ImageViewType::e2DArray;
-    case AmdGpu::ImageType::Color3D:
-        return vk::ImageViewType::e3D;
-    default:
-        UNREACHABLE();
+namespace {
+
+bool IsArrayViewType(AmdGpu::ImageType type) {
+    return type == AmdGpu::ImageType::Color1DArray || type == AmdGpu::ImageType::Color2DArray ||
+           type == AmdGpu::ImageType::Color2DMsaaArray;
+}
+
+/// The Metal texture type of a view: 1D views are 2D (1D images are 2D textures one texel high),
+/// multisampled when the backing texture is, and 3D for every view of a 3D texture (Metal has no
+/// 2D views of 3D textures).
+Metal::TextureType ViewTextureType(AmdGpu::ImageType type, Metal::TextureType texture_type) {
+    if (texture_type == Metal::TextureType::Tex3D) {
+        return Metal::TextureType::Tex3D;
+    }
+    const bool multisample = texture_type == Metal::TextureType::Tex2DMultisample ||
+                             texture_type == Metal::TextureType::Tex2DMultisampleArray;
+    if (IsArrayViewType(type)) {
+        return multisample ? Metal::TextureType::Tex2DMultisampleArray
+                           : Metal::TextureType::Tex2DArray;
+    }
+    return multisample ? Metal::TextureType::Tex2DMultisample : Metal::TextureType::Tex2D;
+}
+
+void LogOnce(std::atomic<bool>& logged, const char* what) {
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        LOG_WARNING(Render_Vulkan, "{}", what);
     }
 }
+
+} // namespace
 
 bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_type) {
     switch (view_type) {
@@ -89,67 +105,65 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::De
     type = range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
 }
 
-ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info_,
-                     const Image& image)
-    : info{info_} {
-    vk::ImageViewUsageCreateInfo usage_ci{.usage = image.usage_flags};
-    if (!info.is_storage) {
-        usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
+ImageView::ImageView(const ImageViewInfo& info_, const Image& image) : info{info_} {
+    if (info.min_lod != 0) {
+        static std::atomic<bool> logged{false};
+        LogOnce(logged, "view min LOD has no Metal equivalent (ignored)");
     }
-    vk::ImageViewMinLodCreateInfoEXT min_lod_ci{};
-    if (info.min_lod != 0 && instance.IsImageViewMinLodSupported()) {
-        const float last_level =
-            static_cast<float>(info.range.base.level + info.range.extent.levels - 1);
-        min_lod_ci.minLod = std::min(static_cast<float>(info.min_lod) / 256.f, last_level);
-        usage_ci.pNext = &min_lod_ci;
-    }
-    // When sampling D32/D16 texture from shader, the T# specifies R32/R16 format so adjust it.
-    vk::Format format = info.format;
-    vk::ImageAspectFlags aspect = image.aspect_mask;
-    if (image.aspect_mask & vk::ImageAspectFlagBits::eDepth &&
-        Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format)) {
-        format = image.info.pixel_format;
-        aspect = vk::ImageAspectFlagBits::eDepth;
-    }
-    if (image.aspect_mask & vk::ImageAspectFlagBits::eStencil &&
-        Vulkan::LiverpoolToVK::IsFormatStencilCompatible(format)) {
-        format = image.info.pixel_format;
-        aspect = vk::ImageAspectFlagBits::eStencil;
-    }
-
-    const vk::ImageViewCreateInfo image_view_ci = {
-        .pNext = &usage_ci,
-        .image = image.GetImage(),
-        .viewType = ConvertImageViewType(info.type),
-        .format = instance.GetSupportedFormat(format, image.format_features),
-        .components = info.mapping,
-        .subresourceRange{
-            .aspectMask = aspect,
-            .baseMipLevel = info.range.base.level,
-            .levelCount = info.range.extent.levels,
-            .baseArrayLayer = info.range.base.layer,
-            .layerCount = info.range.extent.layers,
-        },
-    };
     if (!IsViewTypeCompatible(info.type, image.info.type)) {
         LOG_ERROR(Render_Vulkan, "image view type {} is incompatible with image type {}",
                   magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
     }
 
-    auto [view_result, view] = instance.GetDevice().createImageViewUnique(image_view_ci);
-    ASSERT_MSG(view_result == vk::Result::eSuccess, "Failed to create image view: {}",
-               vk::to_string(view_result));
-    image_view = std::move(view);
+    const Metal::TextureDesc& desc = image.backing->desc;
+    // When sampling D32/D16 texture from shader, the T# specifies R32/R16 format: depth views
+    // keep the image's format. Stencil views of depth-stencil images read the stencil plane.
+    vk::Format format = info.format;
+    u32 pixel_format = 0;
+    if (image.has_depth && Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format)) {
+        format = image.info.pixel_format;
+        pixel_format = desc.pixel_format;
+    } else if (image.has_stencil && Vulkan::LiverpoolToVK::IsFormatStencilCompatible(format)) {
+        format = image.info.pixel_format;
+        pixel_format = Metal::StencilViewPixelFormat(desc.pixel_format);
+    } else {
+        pixel_format = Metal::VkToMtl::PixelFormat(format);
+        if (pixel_format == 0) {
+            static std::atomic<bool> logged{false};
+            LogOnce(logged, "image view format has no Metal pixel format (using the image's)");
+            pixel_format = desc.pixel_format;
+        }
+    }
 
-    const auto view_aspect = aspect & vk::ImageAspectFlagBits::eDepth     ? "Depth"
-                             : aspect & vk::ImageAspectFlagBits::eStencil ? "Stencil"
-                                                                          : "Color";
-    Vulkan::SetObjectName(
-        instance.GetDevice(), *image_view, "ImageView {}x{}x{} {:#x}:{:#x} {}:{} {}:{} ({})",
-        image.info.size.width, image.info.size.height, image.info.size.depth,
-        image.info.guest_address, image.info.guest_size, info.range.base.level,
-        info.range.base.level + info.range.extent.levels - 1, info.range.base.layer,
-        info.range.base.layer + info.range.extent.layers - 1, view_aspect);
+    const Metal::TextureType type = ViewTextureType(info.type, desc.type);
+    const bool is_3d = type == Metal::TextureType::Tex3D;
+    if (is_3d && image.info.type == AmdGpu::ImageType::Color3D &&
+        info.type != AmdGpu::ImageType::Color3D) {
+        static std::atomic<bool> logged{false};
+        LogOnce(logged, "2D views of 3D images have no Metal equivalent (the 3D texture is bound)");
+    }
+    const bool is_array = type == Metal::TextureType::Tex2DArray ||
+                          type == Metal::TextureType::Tex2DMultisampleArray;
+    const u32 base_level = std::min(info.range.base.level, desc.levels - 1);
+    const u32 levels = std::clamp(info.range.extent.levels, 1u, desc.levels - base_level);
+    const u32 base_layer = is_3d ? 0 : std::min(info.range.base.layer, desc.layers - 1);
+    const u32 layers =
+        is_3d || !is_array ? 1 : std::clamp(info.range.extent.layers, 1u, desc.layers - base_layer);
+    const auto swizzle = Metal::VkToMtl::ComposeSwizzle(info.mapping, format);
+
+    const bool identical = pixel_format == desc.pixel_format && type == desc.type &&
+                           base_level == 0 && levels == desc.levels && base_layer == 0 &&
+                           layers == desc.layers && swizzle == Metal::VkToMtl::IdentitySwizzle;
+    if (identical) {
+        view = Metal::Object::Retain(image.GetImage());
+        return;
+    }
+    view = Metal::CreateTextureView(image.GetImage(), pixel_format, type, base_level, levels,
+                                    base_layer, layers, {swizzle.r, swizzle.g, swizzle.b, swizzle.a});
+    ASSERT_MSG(view, "Failed to create texture view of image {:#x} ({}x{}x{}) {}:{} {}:{}",
+               image.info.guest_address, image.info.size.width, image.info.size.height,
+               image.info.size.depth, base_level, base_level + levels - 1, base_layer,
+               base_layer + layers - 1);
 }
 
 ImageView::~ImageView() = default;

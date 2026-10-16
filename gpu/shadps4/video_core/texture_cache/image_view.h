@@ -5,6 +5,7 @@
 
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/resource.h"
+#include "video_core/renderer_metal/mtl_object.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/types.h"
 
@@ -15,11 +16,6 @@ struct ColorBuffer;
 namespace Shader {
 struct ImageResource;
 }
-
-namespace Vulkan {
-class Instance;
-class Scheduler;
-} // namespace Vulkan
 
 namespace VideoCore {
 
@@ -43,7 +39,8 @@ struct ImageViewInfo {
 struct Image;
 
 struct ImageView {
-    ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info, const Image& image);
+    /// A view of the image's current backing texture.
+    ImageView(const ImageViewInfo& info, const Image& image);
     ~ImageView();
 
     ImageView(const ImageView&) = delete;
@@ -52,8 +49,15 @@ struct ImageView {
     ImageView(ImageView&&) = default;
     ImageView& operator=(ImageView&&) = default;
 
+    /// The id<MTLTexture> to bind (unretained): a texture view, or the backing texture itself
+    /// when the view would be identical to it (same format and type, full range, identity
+    /// swizzle), which render targets can then use.
+    void* Texture() const noexcept {
+        return view.Get();
+    }
+
     ImageViewInfo info;
-    vk::UniqueImageView image_view;
+    Metal::Object view; ///< id<MTLTexture>
 };
 
 } // namespace VideoCore

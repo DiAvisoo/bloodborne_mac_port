@@ -139,7 +139,6 @@ private:
     Scheduler& scheduler;
     std::unique_ptr<VideoCore::BlitHelper> blit_helper;
     StagingBufferPool staging_pool;
-    VideoCore::Image::Barriers image_barriers;
 };
 
 } // namespace Vulkan

@@ -17,6 +17,7 @@
 #include "video_core/renderer_metal/mtl_shader.h"
 #include "video_core/renderer_metal/mtl_shadow.h"
 #include "video_core/renderer_metal/mtl_tessellation.h"
+#include "video_core/renderer_metal/mtl_texture.h"
 #include "video_core/renderer_metal/mtl_geometry.h"
 #include "video_core/renderer_metal/vk_to_mtl.h"
 
@@ -540,48 +541,6 @@ MTLPrimitiveType PrimitiveOf(const Owned& o) {
                                  : MTLPrimitiveType(o.graphics->render->primitive_type);
 }
 
-/// Bytes and block size of a pixel format, for buffer <-> texture copies.
-struct Block {
-    u32 bytes{}, width{1}, height{1};
-};
-Block BlockOf(MTLPixelFormat f) {
-    switch (f) {
-    case MTLPixelFormatA8Unorm: case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Snorm:
-    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatStencil8:
-        return {1};
-    case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm: case MTLPixelFormatR16Uint:
-    case MTLPixelFormatR16Sint: case MTLPixelFormatR16Float: case MTLPixelFormatRG8Unorm:
-    case MTLPixelFormatRG8Snorm: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
-    case MTLPixelFormatB5G6R5Unorm: case MTLPixelFormatA1BGR5Unorm: case MTLPixelFormatABGR4Unorm:
-    case MTLPixelFormatBGR5A1Unorm: case MTLPixelFormatDepth16Unorm:
-        return {2};
-    case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatR32Float:
-    case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm: case MTLPixelFormatRG16Uint:
-    case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA8Unorm:
-    case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatRGBA8Snorm: case MTLPixelFormatRGBA8Uint:
-    case MTLPixelFormatRGBA8Sint: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
-    case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG11B10Float:
-    case MTLPixelFormatRGB9E5Float: case MTLPixelFormatBGR10A2Unorm: case MTLPixelFormatDepth32Float:
-        return {4};
-    case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float:
-    case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm: case MTLPixelFormatRGBA16Uint:
-    case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float:
-        return {8};
-    case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float:
-        return {16};
-    case MTLPixelFormatBC1_RGBA: case MTLPixelFormatBC1_RGBA_sRGB: case MTLPixelFormatBC4_RUnorm:
-    case MTLPixelFormatBC4_RSnorm:
-        return {8, 4, 4};
-    case MTLPixelFormatBC2_RGBA: case MTLPixelFormatBC2_RGBA_sRGB: case MTLPixelFormatBC3_RGBA:
-    case MTLPixelFormatBC3_RGBA_sRGB: case MTLPixelFormatBC5_RGUnorm: case MTLPixelFormatBC5_RGSnorm:
-    case MTLPixelFormatBC6H_RGBFloat: case MTLPixelFormatBC6H_RGBUfloat: case MTLPixelFormatBC7_RGBAUnorm:
-    case MTLPixelFormatBC7_RGBAUnorm_sRGB:
-        return {16, 4, 4};
-    default:
-        return {};
-    }
-}
-
 void BufferImageCopy(Owned& o, BufferRef buffer, id<MTLTexture> texture,
                      const VkBufferImageCopy& r, bool to_image) {
     MTLPixelFormat format = texture.pixelFormat;
@@ -594,15 +553,17 @@ void BufferImageCopy(Owned& o, BufferRef buffer, id<MTLTexture> texture,
         option = MTLBlitOptionDepthFromDepthStencil;
         format = MTLPixelFormatDepth32Float;
     }
-    const Block block = BlockOf(format);
-    if (!block.bytes) {
+    const u32 block_bytes = Metal::BytesPerBlock(u32(format));
+    const u32 block_width = Metal::BlockWidth(u32(format));
+    const u32 block_height = Metal::BlockHeight(u32(format));
+    if (!block_bytes) {
         Log("a buffer/image copy with a pixel format without a size table entry (skipped)");
         return;
     }
     const u32 row_texels = r.bufferRowLength ? r.bufferRowLength : r.imageExtent.width;
     const u32 image_rows = r.bufferImageHeight ? r.bufferImageHeight : r.imageExtent.height;
-    const u64 bytes_per_row = u64((row_texels + block.width - 1) / block.width) * block.bytes;
-    const u64 bytes_per_image = bytes_per_row * ((image_rows + block.height - 1) / block.height);
+    const u64 bytes_per_row = u64((row_texels + block_width - 1) / block_width) * block_bytes;
+    const u64 bytes_per_image = bytes_per_row * ((image_rows + block_height - 1) / block_height);
     const MTLSize size = MTLSizeMake(r.imageExtent.width, r.imageExtent.height, r.imageExtent.depth);
     const MTLOrigin origin = MTLOriginMake(r.imageOffset.x, r.imageOffset.y, r.imageOffset.z);
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);

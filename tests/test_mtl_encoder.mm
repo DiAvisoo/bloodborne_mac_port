@@ -20,6 +20,7 @@
 #include "video_core/renderer_metal/mtl_encoder.h"
 #include "video_core/renderer_metal/mtl_depth_stencil.h"
 #include "video_core/renderer_metal/mtl_specialize.h"
+#include "video_core/renderer_metal/mtl_texture.h"
 #include "video_core/renderer_metal/mtl_timeline.h"
 
 namespace {
@@ -821,6 +822,72 @@ void TestBufferCreation() {
     Expect(stream_address != 0 && private_address != 0, "both buffers have a GPU address");
 }
 
+void TestTextures() {
+    Metal::Device device;
+    u64 rgba_size = 0, bc1_size = 0;
+    Metal::TextureDesc rgba{};
+    rgba.pixel_format = MTLPixelFormatRGBA8Unorm;
+    rgba.width = rgba.height = 4;
+    rgba.render_target = rgba.shader_write = rgba.format_views = true;
+    Metal::Object rgba_tex = Metal::CreateTexture(device, rgba, "rgba", &rgba_size);
+    Metal::TextureDesc bc1{};
+    bc1.pixel_format = MTLPixelFormatBC1_RGBA;
+    bc1.width = bc1.height = 8;
+    Metal::Object bc1_tex = Metal::CreateTexture(device, bc1, "", &bc1_size);
+    Expect(rgba_tex && bc1_tex, "4x4 RGBA8 and 8x8 BC1 textures created");
+    Expect(rgba_size > 0 && bc1_size > 0, "textures report an allocated size");
+    if (rgba_tex) {
+        id<MTLTexture> t = (__bridge id<MTLTexture>)rgba_tex.Get();
+        Expect(t.storageMode == MTLStorageModePrivate, "texture storage is private");
+        Expect((t.usage & (MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget |
+                           MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView)) ==
+                   (MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget |
+                    MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView),
+               "texture usage follows the desc");
+    }
+    if (bc1_tex) {
+        id<MTLTexture> t = (__bridge id<MTLTexture>)bc1_tex.Get();
+        Expect(t.usage == MTLTextureUsageShaderRead, "BC1 texture is shader-read only");
+    }
+    Expect(Metal::BytesPerBlock(MTLPixelFormatBC1_RGBA) == 8, "BC1 block is 8 bytes");
+    Expect(Metal::BlockWidth(MTLPixelFormatBC1_RGBA) == 4 &&
+               Metal::BlockHeight(MTLPixelFormatBC1_RGBA) == 4,
+           "BC1 block is 4x4");
+    Expect(Metal::BytesPerBlock(MTLPixelFormatRGBA8Unorm) == 4 &&
+               Metal::BlockWidth(MTLPixelFormatRGBA8Unorm) == 1,
+           "RGBA8 texel is 4 bytes");
+    Expect(Metal::BytesPerBlock(MTLPixelFormatInvalid) == 0, "unknown format has no size");
+    Expect(Metal::StencilViewPixelFormat(MTLPixelFormatDepth32Float_Stencil8) ==
+                   MTLPixelFormatX32_Stencil8 &&
+               Metal::StencilViewPixelFormat(MTLPixelFormatDepth32Float) == 0,
+           "stencil view formats");
+
+    Metal::Object view = Metal::CreateTextureView(
+        rgba_tex.Get(), MTLPixelFormatRGBA8Unorm_sRGB, Metal::TextureType::Tex2D, 0, 1, 0, 1,
+        {MTLTextureSwizzleBlue, MTLTextureSwizzleGreen, MTLTextureSwizzleRed,
+         MTLTextureSwizzleOne});
+    Expect(bool(view), "swizzled sRGB view created");
+    if (view) {
+        id<MTLTexture> v = (__bridge id<MTLTexture>)view.Get();
+        Expect(v.swizzle.red == MTLTextureSwizzleBlue && v.swizzle.alpha == MTLTextureSwizzleOne,
+               "view carries the swizzle");
+        Expect(v.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB, "view has the requested format");
+    }
+
+    Metal::SamplerDesc sd{};
+    sd.min_filter = sd.mag_filter = MTLSamplerMinMagFilterLinear;
+    sd.mip_filter = MTLSamplerMipFilterLinear;
+    sd.address_u = sd.address_v = sd.address_w = MTLSamplerAddressModeClampToEdge;
+    sd.max_lod = 4.0f;
+    sd.max_anisotropy = 64; // clamped to 16
+    sd.compare = true;
+    sd.compare_function = MTLCompareFunctionLessEqual;
+    Metal::Object sampler = Metal::CreateSampler(device, sd);
+    Expect(bool(sampler), "sampler created");
+    Expect(Metal::SupportsSampleCount(device, 1) && Metal::SupportsSampleCount(device, 4),
+           "1x and 4x samples supported");
+}
+
 int main() {
     @autoreleasepool {
         TestObject();
@@ -848,6 +915,7 @@ int main() {
         TestDepthStencilCache();
         TestTimelines();
         TestBufferCreation();
+        TestTextures();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);
