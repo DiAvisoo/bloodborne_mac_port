@@ -46,13 +46,19 @@ struct Binding {
 struct Owned {
     id<MTLCommandBuffer> cmd; ///< unretained references: the Vulkan objects keep resources alive
     std::vector<id<MTLBuffer>> keep; ///< our temporary buffers, released when the GPU is done
+    u32 chunk_draws{}; ///< draws since the last partial commit (CommitChunk)
     id<MTLRenderCommandEncoder> render;
     id<MTLComputeCommandEncoder> compute;
     id<MTLBlitCommandEncoder> blit;
     unsigned commands{};
 
-    // Render pass (vkCmdBeginRendering .. vkCmdEndRendering).
+    // Render pass (vkCmdBeginRendering .. vkCmdEndRendering). `pass` reopens it (loading, not
+    // clearing) after work that had to interrupt it (tessellation kernels).
     bool rendering{};
+    MTLRenderPassDescriptor* pass;
+    // Scratch memory for tessellation (bump-allocated, kept until the GPU is done).
+    id<MTLBuffer> scratch;
+    u64 scratch_used{};
     u32 target_width{}, target_height{};
 
     // Bound state.
@@ -98,6 +104,11 @@ void Init(VkDevice device, id<MTLCommandQueue> queue, PFN_vkExportMetalObjectsEX
 
 /// Ends whatever encoder is open (before the command buffer is committed, at barriers, ...).
 void EndEncoders(Owned& o);
+
+/// Commits what is encoded so far and continues in a new command buffer (same queue, so in
+/// order): the GPU starts on the frame while the rest is recorded. Also hands `keep` to the
+/// committed one.
+void CommitChunk(Owned& o);
 
 // Resource bookkeeping from the device functions the layer sees.
 void SamplerCreated(VkSampler sampler, const VkSamplerCreateInfo* info);

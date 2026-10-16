@@ -4,6 +4,7 @@
 #include <mach-o/dyld.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -13,6 +14,7 @@
 #include "video_core/renderer_metal/mtl_raster_util.h"
 #include "video_core/renderer_metal/mtl_shader.h"
 #include "video_core/renderer_metal/mtl_shadow.h"
+#include "video_core/renderer_metal/mtl_tessellation.h"
 #include "video_core/renderer_metal/vk_to_mtl.h"
 
 namespace MetalFrame {
@@ -146,10 +148,17 @@ void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
     }
     std::vector<id<MTLResource>> resources(declared_buffers.begin(), declared_buffers.end());
     if (render) {
+        // Render passes read guest memory through pointers; writes come from compute. Declaring
+        // them writers too made every pass wait for the one before (no vertex/fragment overlap).
+        // BB_METAL_RENDER_WRITES=1: declare writes as well.
+        static const bool writes = [] {
+            const char* env = std::getenv("BB_METAL_RENDER_WRITES");
+            return env && env[0] == '1';
+        }();
         [(id<MTLRenderCommandEncoder>)encoder
             useResources:resources.data()
                    count:resources.size()
-                   usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                   usage:writes ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead
                   stages:MTLRenderStageVertex | MTLRenderStageFragment];
     } else {
         [(id<MTLComputeCommandEncoder>)encoder useResources:resources.data()
@@ -308,13 +317,8 @@ bool PrepareDraw(Owned& o) {
         ++stats.skipped_no_pipeline;
         return false;
     }
-    if (entry->tess) {
-        ++stats.skipped_tess;
-        Log("tessellated draws are not encoded yet (skipped)");
-        return false;
-    }
     const Metal::RenderPipeline& p = *entry->render;
-    if (p.primitive_emulated && !entry->rect_list) {
+    if (p.primitive_emulated && !entry->rect_list && !entry->tess) {
         ++stats.skipped_emulated;
         Log("a topology Metal lacks (fan, quad list, adjacency) is not expanded yet (skipped)");
         return false;
@@ -593,6 +597,23 @@ void EndEncoders(Owned& o) {
     }
 }
 
+void CommitChunk(Owned& o) {
+    EndEncoders(o);
+    if (!o.keep.empty()) {
+        __block std::vector<id<MTLBuffer>> keep = std::move(o.keep);
+        o.keep.clear();
+        [o.cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+          keep.clear();
+        }];
+    }
+    [o.cmd commit];
+    o.cmd = [queue commandBufferWithUnretainedReferences];
+    o.cmd.label = @"bbport Metal path";
+    o.scratch = nil; // its chunk now belongs to the committed command buffer
+    o.scratch_used = 0;
+    o.chunk_draws = 0;
+}
+
 void SamplerCreated(VkSampler sampler, const VkSamplerCreateInfo* info) {
     using namespace Metal::VkToMtl;
     MTLSamplerDescriptor* d = [MTLSamplerDescriptor new];
@@ -768,6 +789,17 @@ void BeginRendering(Owned& o, const VkRenderingInfo* info) {
     o.target_height = height;
     o.render = [o.cmd renderCommandEncoderWithDescriptor:rp];
     o.rendering = true;
+    // A reopened pass loads what this one cleared and drew.
+    MTLRenderPassDescriptor* again = [rp copy];
+    for (u32 i = 0; i < info->colorAttachmentCount; ++i) {
+        again.colorAttachments[i].loadAction = MTLLoadActionLoad;
+        again.colorAttachments[i].storeAction = MTLStoreActionStore;
+    }
+    again.depthAttachment.loadAction = MTLLoadActionLoad;
+    again.depthAttachment.storeAction = MTLStoreActionStore;
+    again.stencilAttachment.loadAction = MTLLoadActionLoad;
+    again.stencilAttachment.storeAction = MTLStoreActionStore;
+    o.pass = again;
     if (!o.render) {
         Log("a render pass Metal refused (its draws are skipped)");
         return;
@@ -781,6 +813,15 @@ void EndRendering(Owned& o) {
         o.render = nil;
     }
     o.rendering = false;
+    o.pass = nil;
+    // BB_METAL_CHUNK=<draws> (default 200, 0: off): commit partway through the frame.
+    static const u32 chunk = [] {
+        const char* env = std::getenv("BB_METAL_CHUNK");
+        return env ? u32(std::strtoul(env, nullptr, 10)) : 200u;
+    }();
+    if (chunk && o.chunk_draws >= chunk) {
+        CommitChunk(o);
+    }
 }
 
 void BindPipeline(Owned& o, VkPipelineBindPoint point, VkPipeline pipeline) {
@@ -879,7 +920,112 @@ void SetScissors(Owned& o, u32 count, const VkRect2D* scissors) {
     o.scissors.assign(scissors, scissors + count);
 }
 
+namespace {
+/// Bump allocation from the command buffer's scratch buffer (16-byte aligned).
+std::pair<id<MTLBuffer>, u64> Scratch(Owned& o, u64 size) {
+    constexpr u64 kChunk = 8ull << 20;
+    size = (size + 15) & ~u64(15);
+    if (!o.scratch || o.scratch_used + size > o.scratch.length) {
+        o.scratch = [device newBufferWithLength:std::max(kChunk, size)
+                                        options:MTLResourceStorageModePrivate];
+        o.keep.push_back(o.scratch);
+        o.scratch_used = 0;
+    }
+    const u64 at = o.scratch_used;
+    o.scratch_used += size;
+    return {o.scratch, at};
+}
+
+/// A tessellated draw (as Huax-1839's RecordTessellationDraw): the vertex and control shaders as
+/// compute kernels writing scratch memory, then the patch draw in the reopened render pass.
+void TessellatedDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 vertex_offset,
+                     u32 first_instance, bool indexed, u32 first_index) {
+    const auto* entry = o.graphics;
+    const Metal::TessellationPipeline& tess = *entry->tess;
+    const u32 patches = tess.input_control_points ? count / tess.input_control_points : 0;
+    if (!patches || !instance_count) {
+        return;
+    }
+    if (instance_count > 1) {
+        ++stats.skipped_tess;
+        Log("instanced tessellated draws are not encoded (skipped)");
+        return;
+    }
+    if (!o.pass) {
+        Log("a tessellated draw outside a render pass (skipped)");
+        return;
+    }
+    Metal::Tessellation::DrawParams params;
+    params.num_vertices = patches * tess.input_control_points;
+    params.first_vertex = indexed ? u32(vertex_offset) : first;
+    params.first_instance = first_instance;
+    if (indexed) {
+        if (!o.index_buffer || o.index_type == VK_INDEX_TYPE_UINT8_EXT) {
+            Log("a tessellated indexed draw without usable indices (skipped)");
+            return;
+        }
+        const u32 size = IndexSize(o.index_type);
+        params.index_type = size == 4 ? 2 : 1;
+        params.index_buffer = (__bridge void*)o.index_buffer;
+        params.index_offset = o.index_offset + u64(first_index) * size;
+    }
+    std::array<Metal::Tessellation::VertexBinding, 32> bindings;
+    const u32 num_bindings = std::min<u32>(tess.num_vertex_slots, bindings.size());
+    for (u32 j = 0; j < num_bindings; ++j) {
+        const auto& slot = tess.vertex_slots[j];
+        const auto& vb = slot.location < o.vertex_buffers.size() ? o.vertex_buffers[slot.location]
+                                                                 : Owned::VertexBuffer{};
+        bindings[j] = {(__bridge void*)(vb.buffer ? vb.buffer : null_buffer),
+                       vb.buffer ? vb.offset : 0, slot.constant || !vb.stride ? 16 : vb.stride,
+                       slot.slot};
+    }
+    // Steps 1 and 2: the kernels interrupt the render pass.
+    [o.render endEncoding];
+    o.render = nil;
+    id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
+    const auto plan = Metal::Tessellation::PlanScratch(tess, patches);
+    const auto [scratch, scratch_offset] = Scratch(o, plan.total);
+    const auto bind = [&](const Metal::CompiledShader& shader) {
+        BindStage(o, Stage::Compute, &shader, o.graphics_bindings);
+    };
+    Metal::Tessellation::EncodeKernels((__bridge void*)enc, tess, params,
+                                       std::span{bindings.data(), num_bindings},
+                                       (__bridge void*)scratch, scratch_offset, plan, bind, bind);
+    [o.compute endEncoding];
+    o.compute = nil;
+    // Step 3: the render pass again (loading), the patch draw.
+    o.render = [o.cmd renderCommandEncoderWithDescriptor:o.pass];
+    UseAddressBuffers(o.render, true);
+    if (!PrepareDraw(o)) {
+        return;
+    }
+    [o.render setTessellationFactorBuffer:scratch offset:scratch_offset + plan.factor_offset
+                           instanceStride:0];
+    [o.render setVertexBuffer:scratch
+                       offset:scratch_offset + plan.control_offset
+                      atIndex:Metal::kTessInputBuffer];
+    [o.render setVertexBuffer:scratch
+                       offset:scratch_offset + plan.patch_offset
+                      atIndex:Metal::kTessPatchBuffer];
+    [o.render setVertexBuffer:scratch
+                       offset:scratch_offset + plan.factor_offset
+                      atIndex:Metal::kTessFactorBuffer];
+    [o.render drawPatches:tess.output_control_points
+               patchStart:0
+               patchCount:plan.patches
+         patchIndexBuffer:nil
+   patchIndexBufferOffset:0
+            instanceCount:1
+             baseInstance:0];
+    ++stats.draws;
+}
+} // namespace
+
 void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 first_instance) {
+    if (o.graphics && o.graphics->tess) {
+        TessellatedDraw(o, vertex_count, instance_count, first_vertex, 0, first_instance, false, 0);
+        return;
+    }
     if (!PrepareDraw(o)) {
         return;
     }
@@ -895,10 +1041,16 @@ void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 
                instanceCount:instance_count
                 baseInstance:first_instance];
     ++stats.draws;
+    ++o.chunk_draws;
 }
 
 void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
                  s32 vertex_offset, u32 first_instance) {
+    if (o.graphics && o.graphics->tess) {
+        TessellatedDraw(o, index_count, instance_count, 0, vertex_offset, first_instance, true,
+                        first_index);
+        return;
+    }
     if (!PrepareDraw(o)) {
         return;
     }
@@ -920,6 +1072,7 @@ void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
                          baseVertex:vertex_offset
                        baseInstance:first_instance];
     ++stats.draws;
+    ++o.chunk_draws;
 }
 
 void DrawIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset, u32 count, u32 stride,
