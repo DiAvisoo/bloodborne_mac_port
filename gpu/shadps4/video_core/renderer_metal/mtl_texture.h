@@ -72,4 +72,7 @@ u32 BytesPerBlock(u32 pixel_format);
 u32 BlockWidth(u32 pixel_format);
 u32 BlockHeight(u32 pixel_format);
 
+/// True for integer (Uint/Sint) colour formats: Metal cannot multisample-resolve them.
+bool IsIntegerPixelFormat(u32 pixel_format);
+
 } // namespace Metal

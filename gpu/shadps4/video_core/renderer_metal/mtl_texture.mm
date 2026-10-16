@@ -263,4 +263,19 @@ u32 BlockHeight(u32 pixel_format) {
     return BlockOf(MTLPixelFormat(pixel_format)).height;
 }
 
+bool IsIntegerPixelFormat(u32 pixel_format) {
+    switch (MTLPixelFormat(pixel_format)) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint:
+    case MTLPixelFormatR16Sint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
+    case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatRG16Uint:
+    case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint:
+    case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Uint:
+    case MTLPixelFormatRGBA32Sint:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace Metal

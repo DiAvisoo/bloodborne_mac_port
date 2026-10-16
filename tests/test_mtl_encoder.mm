@@ -934,6 +934,13 @@ void TestTextures() {
            "1x and 4x samples supported");
 }
 
+void TestIntegerPixelFormats() {
+    Expect(Metal::IsIntegerPixelFormat(MTLPixelFormatRGBA8Uint), "RGBA8Uint is integer");
+    Expect(Metal::IsIntegerPixelFormat(MTLPixelFormatR32Sint), "R32Sint is integer");
+    Expect(!Metal::IsIntegerPixelFormat(MTLPixelFormatRGBA8Unorm), "RGBA8Unorm is not integer");
+    Expect(!Metal::IsIntegerPixelFormat(MTLPixelFormatRGBA16Float), "RGBA16Float is not integer");
+}
+
 void TestSafeViewFormats() {
     using Metal::SafeViewPixelFormat;
     Expect(SafeViewPixelFormat(MTLPixelFormatBC1_RGBA, MTLPixelFormatRG32Uint, false) ==
@@ -1030,6 +1037,7 @@ int main() {
         TestBufferCreation();
         TestTextures();
         TestSafeViewFormats();
+        TestIntegerPixelFormats();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

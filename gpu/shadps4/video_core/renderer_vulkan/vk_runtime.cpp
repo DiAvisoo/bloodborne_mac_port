@@ -349,6 +349,12 @@ void Runtime::CopyBufferImage(VideoCore::Image& image, const VideoCore::Buffer& 
         return;
     }
     const Metal::TextureDesc& desc = image.backing->desc;
+    if (desc.samples > 1) {
+        // Metal has no buffer copies of multisample textures.
+        LogOncePerFormat(image.info.pixel_format,
+                         "CopyBufferImage: buffer copy of a multisampled image skipped");
+        return;
+    }
     boost::container::small_vector<BufferTextureCopy, 16> blits;
     for (const auto& copy : copies) {
         const auto& sub = copy.imageSubresource;
@@ -814,6 +820,12 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
         return;
     }
     if (!HasMetalFormat(*src) || !HasMetalFormat(*dst)) {
+        return;
+    }
+    if (Metal::IsIntegerPixelFormat(sd.pixel_format)) {
+        // Metal cannot multisample-resolve integer formats.
+        LogOncePerFormat(src->info.pixel_format,
+                         "ResolveImage: resolve of an integer format skipped (source)");
         return;
     }
     // A pass that loads the multisampled texture and resolves it into the destination (Metal's
