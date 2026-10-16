@@ -11,7 +11,7 @@
 #include <vector>
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_device_impl.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
 
 namespace Metal {
@@ -437,6 +437,9 @@ Encoder::~Encoder() {
 // ---- Blits ----
 
 void Encoder::CopyBuffer(BufferRef src, BufferRef dst, u64 size) {
+    if (size == 0) {
+        return; // Metal rejects empty blits (MTL_DEBUG_LAYER aborts)
+    }
     [impl->Blit() copyFromBuffer:(__bridge id<MTLBuffer>)src.buffer
                     sourceOffset:src.offset
                         toBuffer:(__bridge id<MTLBuffer>)dst.buffer
@@ -445,13 +448,35 @@ void Encoder::CopyBuffer(BufferRef src, BufferRef dst, u64 size) {
 }
 
 void Encoder::FillBuffer(BufferRef dst, u64 size, u32 pattern) {
+    if (size == 0) {
+        return; // Metal rejects empty blits (MTL_DEBUG_LAYER aborts)
+    }
     if (pattern == u32(u8(pattern)) * 0x01010101u) {
         [impl->Blit() fillBuffer:(__bridge id<MTLBuffer>)dst.buffer
                            range:NSMakeRange(dst.offset, size)
                            value:u8(pattern)];
         return;
     }
-    ASSERT((dst.offset | size) % 4 == 0);
+    // Guest sizes (HTile clears) need not be whole words: fill the whole words only.
+    if (dst.offset % 4 != 0) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            LOG_WARNING(Render, "FillBuffer: pattern fill at unaligned offset {:#x} skipped",
+                        dst.offset);
+        }
+        return;
+    }
+    if (size % 4 != 0) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            LOG_WARNING(Render, "FillBuffer: pattern fill of {} bytes rounded down to {}", size,
+                        size & ~u64{3});
+        }
+        size &= ~u64{3};
+        if (size == 0) {
+            return;
+        }
+    }
     // A dedicated compute encoder, so the caller's compute state is untouched.
     impl->FlushPendingClear();
     impl->EndRender();
@@ -516,6 +541,18 @@ void Encoder::CopyTexture(void* src, u32 src_level, u32 src_slice, Origin3 src_o
 
 void Encoder::KeepAlive(Object object) {
     impl->keep.push_back(std::move(object));
+}
+
+void Encoder::WaitForDeviceTick(u64 device_tick) {
+    if (device_tick == 0) {
+        return;
+    }
+    ASSERT_MSG(device_tick < impl->device.CurrentTick(),
+               "Waiting for device tick {} that was never committed (it would never signal)",
+               device_tick);
+    impl->FlushPendingClear(); // commands recorded before the wait stay before it
+    EndEncoding();
+    [impl->Cmd() encodeWaitForEvent:impl->device.GetImpl().event value:device_tick];
 }
 
 void Encoder::EndEncoding() {

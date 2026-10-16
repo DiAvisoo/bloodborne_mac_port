@@ -81,14 +81,27 @@ void Device::CommitUntracked(void* command_buffer) {
 
 void Device::MakeResident(void* buffer) {
     std::scoped_lock lock{residency_mutex};
-    [impl->residency addAllocation:(__bridge id<MTLBuffer>)buffer];
+    id<MTLBuffer> b = (__bridge id<MTLBuffer>)buffer;
+    [impl->residency addAllocation:b];
     [impl->residency commit];
+    if (resident.emplace(buffer, b.length).second) {
+        resident_bytes += b.length;
+    }
 }
 
 void Device::Evict(void* buffer) {
     std::scoped_lock lock{residency_mutex};
     [impl->residency removeAllocation:(__bridge id<MTLBuffer>)buffer];
     [impl->residency commit];
+    if (const auto it = resident.find(buffer); it != resident.end()) {
+        resident_bytes -= it->second;
+        resident.erase(it);
+    }
+}
+
+u64 Device::ResidentBytes() const {
+    std::scoped_lock lock{residency_mutex};
+    return resident_bytes;
 }
 
 u64 Device::Commit(void* command_buffer) {

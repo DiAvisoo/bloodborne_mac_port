@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <thread>
 #include <vector>
 #include "video_core/renderer_metal/mtl_blit_shaders.h"
@@ -1171,6 +1172,108 @@ void TestSafeViewFormats() {
     Expect(view_ok(rgba, MTLPixelFormatR32Uint, MTLPixelFormatRGBA8Unorm, true), "RGBA8 view");
 }
 
+/// The GC measures images as AllocatedSize() - ResidentBytes(): the private guest arena is
+/// allocated in full at once and must not count as texture memory.
+void TestResidentBytes() {
+    Metal::Device device;
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    const u64 before = device.ResidentBytes();
+    id<MTLBuffer> arena = [dev newBufferWithLength:64ull << 20 options:MTLResourceStorageModePrivate];
+    device.MakeResident((__bridge void*)arena);
+    Expect(device.ResidentBytes() == before + (64ull << 20),
+           "MakeResident counts the buffer's length in ResidentBytes");
+    device.MakeResident((__bridge void*)arena);
+    Expect(device.ResidentBytes() == before + (64ull << 20), "a buffer counts once");
+    device.Evict((__bridge void*)arena);
+    Expect(device.ResidentBytes() == before, "Evict takes the buffer's length off again");
+}
+
+/// Metal aborts on zero-length blits under MTL_DEBUG_LAYER; guest sizes can be 0.
+void TestZeroSizeBlits() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLBuffer> a = SharedBuffer(device, 64), b = SharedBuffer(device, 64);
+    encoder.FillBuffer(Ref(b), 0, 0x7f7f7f7fu);
+    encoder.FillBuffer(Ref(b), 0, 0x0000000Fu);
+    encoder.CopyBuffer(Ref(a), Ref(b), 0);
+    device.Wait(encoder.Submit());
+    const u8* d = static_cast<const u8*>(b.contents);
+    Expect(std::all_of(d, d + 64, [](u8 v) { return v == 0; }), "size-0 fill and copy do nothing");
+    Expect(device.ErrorCount() == 0, "size-0 blits ran without errors");
+}
+
+/// HTile fills come with guest sizes: an unaligned size fills the whole words and never aborts.
+void TestUnalignedPatternFill() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLBuffer> b = SharedBuffer(device, 64);
+    std::memset(b.contents, 0xee, 64);
+    encoder.FillBuffer(Ref(b), 30, 0x0000000Fu);
+    encoder.FillBuffer(Ref(b, 34), 8, 0x0000000Fu); // unaligned offset: skipped
+    device.Wait(encoder.Submit());
+    const u32* w = static_cast<const u32*>(b.contents);
+    const u8* d = static_cast<const u8*>(b.contents);
+    bool ok = true;
+    for (int i = 0; i < 7; ++i) ok &= w[i] == 0x0000000Fu;
+    Expect(ok, "a size-30 pattern fill fills 28 bytes");
+    Expect(d[28] == 0xee && d[29] == 0xee, "bytes 28-29 are untouched");
+    Expect(std::all_of(d + 30, d + 64, [](u8 v) { return v == 0xee; }),
+           "a fill at an unaligned offset is skipped");
+    Expect(device.ErrorCount() == 0, "unaligned pattern fills ran without errors");
+}
+
+/// GPU-side ordering across schedulers: B (the presenter, say) waits for the device tick of A's
+/// frame. A must be committed first: a wait for a later commit on the one queue never ends (the
+/// queue starts command buffers in commit order; measured: GPU timeout error).
+void TestCrossEncoderWait() {
+    Metal::Device device;
+    Metal::Encoder enc_a{device}, enc_b{device};
+    Metal::Timeline timeline_a{device};
+    Expect(!timeline_a.DeviceTickOf(1).has_value(), "an uncommitted tick has no device tick");
+    Expect(timeline_a.DeviceTickOf(0) == u64(0), "tick 0 maps to 0 (already complete)");
+
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    id<MTLSharedEvent> gate = [dev newSharedEvent];
+    id<MTLBuffer> src = SharedBuffer(device, 256), dst = SharedBuffer(device, 256);
+    std::atomic<int> order{0}, a_done{0}, b_done{0};
+    std::atomic<int>* order_p = &order;
+    std::atomic<int>* a_done_p = &a_done;
+    std::atomic<int>* b_done_p = &b_done;
+
+    // A's frame: held by a CPU-signalled gate so it is still pending while B is recorded.
+    [(__bridge id<MTLCommandBuffer>)enc_a.CommandBuffer() encodeWaitForEvent:gate value:1];
+    enc_a.FillBuffer(Ref(src), 256, 0x3c3c3c3cu);
+    [(__bridge id<MTLCommandBuffer>)enc_a.CommandBuffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+        a_done_p->store(++*order_p);
+    }];
+    const u64 a_device = enc_a.Submit();
+    const u64 a_logical = timeline_a.Committed(a_device);
+    const std::optional<u64> wait_tick = timeline_a.DeviceTickOf(a_logical);
+    Expect(wait_tick == a_device, "a pending logical tick maps to the device tick it signals");
+
+    enc_b.WaitForDeviceTick(0); // no-op
+    enc_b.WaitForDeviceTick(wait_tick.value_or(0));
+    enc_b.CopyBuffer(Ref(src), Ref(dst), 256);
+    [(__bridge id<MTLCommandBuffer>)enc_b.CommandBuffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+        b_done_p->store(++*order_p);
+    }];
+    const u64 b_device = enc_b.Submit();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Expect(b_done.load() == 0 && a_done.load() == 0, "B does not complete while A is held");
+
+    gate.signaledValue = 1;
+    device.Wait(b_device);
+    for (int i = 0; i < 100 && (a_done == 0 || b_done == 0); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const u8* d = static_cast<const u8*>(dst.contents);
+    Expect(std::all_of(d, d + 256, [](u8 v) { return v == 0x3c; }), "B's copy sees what A wrote");
+    Expect(a_done.load() == 1 && b_done.load() == 2, "A completes before B");
+    Expect(timeline_a.DeviceTickOf(a_logical) == u64(0),
+           "a completed logical tick maps to 0 (already complete)");
+    Expect(device.ErrorCount() == 0, "cross-encoder wait ran without errors");
+}
+
 int main() {
     @autoreleasepool {
         TestObject();
@@ -1203,6 +1306,10 @@ int main() {
         TestTextures();
         TestSafeViewFormats();
         TestIntegerPixelFormats();
+        TestResidentBytes();
+        TestZeroSizeBlits();
+        TestUnalignedPatternFill();
+        TestCrossEncoderWait();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

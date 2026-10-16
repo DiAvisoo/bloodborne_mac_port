@@ -62,6 +62,19 @@ u64 Timeline::Committed(u64 device_tick) {
     return logical;
 }
 
+std::optional<u64> Timeline::DeviceTickOf(u64 logical) const {
+    if (logical >= CurrentTick()) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock{mutex};
+    Refresh();
+    if (logical <= known.load(std::memory_order_acquire)) {
+        return u64{0};
+    }
+    // Logical ticks are consecutive: the front mapping is known + 1.
+    return pending[logical - pending.front().logical].device;
+}
+
 size_t Timeline::PendingCount() const {
     std::scoped_lock lock{mutex};
     Refresh();

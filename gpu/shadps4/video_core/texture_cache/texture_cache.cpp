@@ -999,7 +999,11 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 
 void TextureCache::GarbageCollectImages() {
     { // Metal always reports usage (Device::AllocatedSize)
-        total_used_memory = device.AllocatedSize();
+        // Without the resident buffers: the guest arena (8-16 GiB, private) counts in full from
+        // its creation, which kept a 16 GB Mac above the trigger and evicted textures for nothing.
+        const u64 allocated = device.AllocatedSize();
+        const u64 resident = device.ResidentBytes();
+        total_used_memory = allocated > resident ? allocated - resident : 0;
         // bbport: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
         // much more than images (buffers backing guest memory), and the startup budget left
         // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the
@@ -1167,6 +1171,14 @@ void TextureCache::GarbageCollectSamplers() {
     if (total_used_samplers < trigger_gc_samplers) {
         return;
     }
+    // Command buffers do not retain what they use: evicted samplers live until the GPU passed
+    // the current tick (deferred below, outside samplers_mutex).
+    std::vector<Sampler> retired;
+    SCOPE_EXIT {
+        if (!retired.empty()) {
+            scheduler.DeferOperation([retired = std::move(retired)] {});
+        }
+    };
     std::scoped_lock lock{samplers_mutex};
     bool pressured = false;
     bool aggresive = false;
@@ -1185,7 +1197,9 @@ void TextureCache::GarbageCollectSamplers() {
             return true;
         }
         --num_deletions;
-        const size_t lru_id = samplers.at(hash).lru_id;
+        Sampler& sampler = samplers.at(hash);
+        const size_t lru_id = sampler.lru_id;
+        retired.push_back(std::move(sampler));
         samplers.erase(hash);
         sampler_lru_cache.Free(lru_id);
         return false;

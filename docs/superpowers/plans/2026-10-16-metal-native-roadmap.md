@@ -75,8 +75,7 @@ For M5 (fidelity/performance):
 - RGB32 formats need an expand step (no Metal RGB32 texture); view min LOD, sampler LOD bias,
   custom border colours are not carried over; `PixelFormatView` disables lossless compression
   (bandwidth cost). 8 GB Macs: recommended working set (~5.3 GB) is above the texture cache's
-  4 GB low-VRAM cutoff, so tune `BB_GC_*` there. `Device::AllocatedSize()` counts all of the
-  process's Metal allocations, not only images.
+  4 GB low-VRAM cutoff, so tune `BB_GC_*` there.
 - `BlitHelper` is owned by `Runtime` only; `TextureCache` no longer has one.
 - `Image` no longer has `aspect_mask`; buffer_cache/texture_cache derive it from `props.is_depth`.
 
@@ -97,3 +96,13 @@ For the M3 plan, external consumers still on the old API:
   `RasterUtil::ToMetalViewport`.
 - `GetWorkSemaphore` residue in pipeline_cache, constant_ring, presenter. The presenter's three
   schedulers share one device with per-scheduler timelines.
+
+For the M3 plan, from the M2 final review:
+- The presenter and other consumers of the draw scheduler's frame must order after it on the
+  GPU: `Timeline::DeviceTickOf(logical)` + `Encoder::WaitForDeviceTick(tick)`, or `Flush` the
+  draw scheduler first. The tick must already be committed (one queue starts command buffers in
+  commit order: a wait for a later commit never ends; `WaitForDeviceTick` asserts it).
+- `FrontAndBack` cull must discard the draw (Metal has no such cull mode).
+- Value-initialise `RenderAttachment::clear_value`.
+- Every rasterizer image path must call `Runtime::AccessImage`: `FlushBarriers` no longer runs
+  `BeforeImageAccess`.

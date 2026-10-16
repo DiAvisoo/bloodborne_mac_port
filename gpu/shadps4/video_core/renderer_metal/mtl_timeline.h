@@ -6,6 +6,7 @@
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include "common/types.h"
 
 namespace Metal {
@@ -36,6 +37,10 @@ public:
     /// Records that this timeline's next commit signalled `device_tick` (a tracked
     /// Device::Commit, later than this timeline's previous one) and returns its logical tick.
     u64 Committed(u64 device_tick);
+    /// The device tick `logical` signals, for GPU-side waits by other submitters
+    /// (Encoder::WaitForDeviceTick). nullopt: not committed yet (Flush first). 0: already complete
+    /// (tick 0, or completed and pruned), which a wait treats as a no-op.
+    [[nodiscard]] std::optional<u64> DeviceTickOf(u64 logical) const;
     /// Committed ticks not yet known complete (their mappings), for tests.
     [[nodiscard]] size_t PendingCount() const;
 

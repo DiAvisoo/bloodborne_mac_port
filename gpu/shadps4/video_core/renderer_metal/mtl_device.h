@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include "common/types.h"
 
 namespace Metal {
@@ -80,6 +81,9 @@ public:
     /// through the queue's residency set.
     void MakeResident(void* buffer);
     void Evict(void* buffer);
+    /// Bytes of the buffers made resident (each counted once): the guest arena and the other
+    /// address-reached buffers, which AllocatedSize() includes in full from their creation.
+    [[nodiscard]] u64 ResidentBytes() const;
     /// Command buffers that completed with an error (each one is logged).
     [[nodiscard]] u64 ErrorCount() const noexcept {
         return counters->errors.load(std::memory_order_relaxed);
@@ -89,7 +93,9 @@ private:
     std::unique_ptr<Impl> impl;
     std::string name;
     Limits limits;
-    std::mutex residency_mutex;
+    mutable std::mutex residency_mutex;
+    std::unordered_map<void*, u64> resident; ///< buffer -> length (residency_mutex)
+    u64 resident_bytes{};                    ///< sum of `resident` (residency_mutex)
     std::atomic<u64> current_tick{1};
     /// What completion handlers write. Shared with each handler, so a handler that runs after
     /// the Device is gone writes into memory it still owns.

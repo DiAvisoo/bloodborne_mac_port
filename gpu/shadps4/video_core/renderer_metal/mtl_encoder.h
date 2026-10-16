@@ -112,8 +112,9 @@ public:
 
     // Blits. Inside a render pass they end the render encoder; the pass continues afterwards.
     void CopyBuffer(BufferRef src, BufferRef dst, u64 size);
-    /// Fills `size` bytes (offset and size multiples of 4) with the 32-bit `pattern`: a blit when
-    /// all four bytes are equal, else a compute kernel. Replaces the M1 low-byte fill.
+    /// Fills `size` bytes with the 32-bit `pattern`: a blit when all four bytes are equal, else a
+    /// compute kernel over whole words (an unaligned size is rounded down, an unaligned offset
+    /// skips the fill; both log once). Size 0 does nothing (also for CopyBuffer).
     void FillBuffer(BufferRef dst, u64 size, u32 pattern);
     void CopyBufferToTexture(BufferRef src, u32 bytes_per_row, u32 bytes_per_image, void* texture,
                              u32 level, u32 slice, Origin3 origin, Size3 size,
@@ -130,6 +131,12 @@ public:
     /// True while any slot, pipeline or render state is set (Submit clears all of it).
     [[nodiscard]] bool HasBindings() const noexcept;
 
+    /// Makes the GPU wait, before the commands recorded after this call, until the device has
+    /// signalled `device_tick` (Device::Commit; Timeline::DeviceTickOf for another submitter's
+    /// logical tick). Ends the open Metal encoder (a pass in progress reopens with Load).
+    /// 0: no-op (already complete). `device_tick` must already be committed (asserted): the queue
+    /// starts command buffers in commit order, so waiting for a later commit never ends.
+    void WaitForDeviceTick(u64 device_tick);
     /// Keeps `object` alive until the current command buffer completes.
     void KeepAlive(Object object);
     /// Ends the open render, compute or blit encoder (a pass in progress reopens with Load).

@@ -98,6 +98,10 @@ Scheduler::~Scheduler() {
         recorder_cv.notify_all();
         recorder_thread.join();
     }
+    // Commit what is still recorded through the timeline (not left to ~Encoder, outside
+    // submit_mutex and unknown to it) and wait for it. The submit callback's owner may be gone.
+    on_submit = nullptr;
+    Finish();
 }
 
 namespace {
@@ -472,10 +476,16 @@ void Scheduler::PopPendingOperations() {
 
 void Scheduler::RecordHoistedCopy(Metal::BufferRef src, Metal::BufferRef dst,
                                   std::span<const VideoCore::BufferCopy> copies,
-                                  [[maybe_unused]] bool ordered) {
+                                  bool ordered) {
     std::scoped_lock lk{upload_mutex};
     upload_open = true;
     for (const VideoCore::BufferCopy& c : copies) {
+        // Metal does not document the order of copies within one blit encoder: a copy that may
+        // overlap an earlier one (of this call or one before) starts a new blit encoder, and
+        // encoders run in order. No encoder open: nothing to end.
+        if (ordered) {
+            upload_encoder.EndEncoding();
+        }
         upload_encoder.CopyBuffer({src.buffer, src.offset + c.src_offset},
                                   {dst.buffer, dst.offset + c.dst_offset}, c.size);
     }

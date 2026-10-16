@@ -661,8 +661,9 @@ public:
     /// run before all of its commands (Runtime::HoistCopy decides when that is safe). Copies
     /// there do not end the current render pass: on a tile-based GPU every reopened pass reloads
     /// its attachments.
-    /// `ordered`: the copy may read or write memory that copies hoisted before it wrote (one
-    /// blit encoder runs its copies in order, so nothing is needed for it).
+    /// `ordered`: the copy may read or write memory that copies hoisted before it (in this call or
+    /// earlier) wrote: each copy starts a new blit encoder (Metal does not document the order of
+    /// copies within one).
     void RecordHoistedCopy(Metal::BufferRef src, Metal::BufferRef dst,
                            std::span<const VideoCore::BufferCopy> copies, bool ordered = false);
 
