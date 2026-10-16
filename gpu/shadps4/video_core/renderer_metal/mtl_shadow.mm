@@ -607,6 +607,15 @@ void GraphicsCreated(const VkGraphicsPipelineCreateInfo* info, VkPipeline pipeli
         if (rendering) {
             for (u32 i = 0; i < rendering->colorAttachmentCount; ++i) {
                 const u32 format = PixelFormat(vk::Format(rendering->pColorAttachmentFormats[i]));
+                if (format && IsDepthPixelFormat(format)) {
+                    // Metal asserts on a depth format as a color target (never valid Vulkan
+                    // either); the pipeline is left without a Metal counterpart.
+                    const std::string why =
+                        "color attachment " + std::to_string(i) + " has the depth format " +
+                        vk::to_string(vk::Format(rendering->pColorAttachmentFormats[i]));
+                    NoteGeneric(false, why.c_str());
+                    return;
+                }
                 entry->color_pixel_formats[i] = format;
                 d.colorAttachments[i].pixelFormat = MTLPixelFormat(format);
                 if (blend && i < blend->attachmentCount) {

@@ -1461,7 +1461,11 @@ id<MTLRenderPipelineState> BlitPipeline(MTLPixelFormat format) {
              "    float2 t = float2(p.x, 1.0 - p.y);\n" // Metal NDC y up, texture y down
              "    v.uv = mix(src.xy, src.zw, t); return v; }\n"
              "fragment float4 blit_fs(V in [[stage_in]], texture2d<float> tex [[texture(0)]],\n"
-             "                        sampler s [[sampler(0)]]) { return tex.sample(s, in.uv); }\n";
+             "                        sampler s [[sampler(0)]]) { return tex.sample(s, in.uv); }\n"
+             "struct D { float depth [[depth(any)]]; };\n"
+             "fragment D blit_depth_fs(V in [[stage_in]], depth2d<float> tex [[texture(0)]],\n"
+             "                         sampler s [[sampler(0)]]) { D d; d.depth = tex.sample(s, in.uv);\n"
+             "                         return d; }\n";
         blit_library = [device newLibraryWithSource:source options:nil error:&error];
         if (!blit_library) {
             std::printf("Metal frame: blit shader: %s\n", error.localizedDescription.UTF8String);
@@ -1476,8 +1480,17 @@ id<MTLRenderPipelineState> BlitPipeline(MTLPixelFormat format) {
     }
     MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [blit_library newFunctionWithName:@"blit_vs"];
-    d.fragmentFunction = [blit_library newFunctionWithName:@"blit_fs"];
-    d.colorAttachments[0].pixelFormat = format;
+    // Depth images (the upscaler scales depth with vkCmdBlitImage) write depth, not color.
+    const bool is_depth = Metal::VkToMtl::IsDepthPixelFormat(u32(format));
+    d.fragmentFunction = [blit_library newFunctionWithName:is_depth ? @"blit_depth_fs" : @"blit_fs"];
+    if (is_depth) {
+        d.depthAttachmentPixelFormat = format;
+        if (Metal::VkToMtl::HasStencilPixelFormat(u32(format))) {
+            d.stencilAttachmentPixelFormat = format;
+        }
+    } else {
+        d.colorAttachments[0].pixelFormat = format;
+    }
     id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:d error:&error];
     if (!state) {
         std::printf("Metal frame: blit pipeline for format %lu: %s\n", (unsigned long)format,
@@ -1518,13 +1531,33 @@ void BlitImage(Owned& o, VkImage src_image, VkImage dst_image, u32 count,
             continue;
         }
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture = dst;
-        rp.colorAttachments[0].level = b.dstSubresource.mipLevel;
-        rp.colorAttachments[0].slice = b.dstSubresource.baseArrayLayer;
-        rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        const bool is_depth = Metal::VkToMtl::IsDepthPixelFormat(u32(dst.pixelFormat));
+        auto* att = is_depth ? (MTLRenderPassAttachmentDescriptor*)rp.depthAttachment
+                             : (MTLRenderPassAttachmentDescriptor*)rp.colorAttachments[0];
+        att.texture = dst;
+        att.level = b.dstSubresource.mipLevel;
+        att.slice = b.dstSubresource.baseArrayLayer;
+        att.loadAction = MTLLoadActionLoad;
+        att.storeAction = MTLStoreActionStore;
+        if (is_depth && Metal::VkToMtl::HasStencilPixelFormat(u32(dst.pixelFormat))) {
+            rp.stencilAttachment.texture = dst;
+            rp.stencilAttachment.level = b.dstSubresource.mipLevel;
+            rp.stencilAttachment.slice = b.dstSubresource.baseArrayLayer;
+            rp.stencilAttachment.loadAction = MTLLoadActionLoad;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
         id<MTLRenderCommandEncoder> enc = [o.cmd renderCommandEncoderWithDescriptor:rp];
         [enc setRenderPipelineState:pipeline];
+        if (is_depth) {
+            static id<MTLDepthStencilState> write_always = [] {
+                MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+                dd.depthCompareFunction = MTLCompareFunctionAlways;
+                dd.depthWriteEnabled = YES;
+                return [device newDepthStencilStateWithDescriptor:dd];
+            }();
+            [enc setDepthStencilState:write_always];
+            filter = VK_FILTER_NEAREST; // depth is not filtered
+        }
         [enc setViewport:(MTLViewport){double(x0), double(y0), double(x1 - x0), double(y1 - y0),
                                        0.0, 1.0}];
         [enc setVertexBytes:uv length:sizeof uv atIndex:0];
