@@ -88,8 +88,13 @@ GraphicsPsos PipelineFactory::BuildGraphics(const Vulkan::GraphicsPipelineKey& k
                                             bool clip_emulation_fragment) {
     GraphicsPsos result;
     @autoreleasepool { // pipeline-creation threads drain no pool of their own
-        if (ModuleOf(modules, Stage::TessellationControl) ||
-            ModuleOf(modules, Stage::TessellationEval)) {
+        const bool tessellated = ModuleOf(modules, Stage::TessellationControl) ||
+                                 ModuleOf(modules, Stage::TessellationEval);
+        if (tessellated && ModuleOf(modules, Stage::Geometry)) {
+            // LsHsEsGs: the evaluation shader is compiled as an export shader (ES ring, no
+            // position), so it cannot be the post-tessellation vertex function; skip the draws.
+            result.error = "tessellation with a geometry shader has no Metal path";
+        } else if (tessellated) {
             result = TessellationPsos(key, modules, attributes);
         } else if (ModuleOf(modules, Stage::Geometry)) {
             result = GeometryPsos(key, modules, attributes);
