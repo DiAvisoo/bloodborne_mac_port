@@ -608,6 +608,7 @@ void Init(VkDevice dev, id<MTLCommandQueue> q, PFN_vkExportMetalObjectsEXT expor
 }
 
 void EndEncoders(Owned& o) {
+    FlushPending(o);
     if (o.render) {
         [o.render endEncoding];
         o.render = nil;
@@ -813,6 +814,7 @@ void BeginRendering(Owned& o, const VkRenderingInfo* info) {
     o.target_width = width;
     o.target_height = height;
     o.rendering = true;
+    o.last_draw_tess = false;
     o.pass_first = rp;
     o.pass_opened = false;
     o.pass_clears = false;
@@ -838,6 +840,7 @@ void BeginRendering(Owned& o, const VkRenderingInfo* info) {
 }
 
 void EndRendering(Owned& o) {
+    FlushPending(o);
     if (!o.render && !o.pass_opened && o.pass_clears) {
         RenderEncoder(o); // a pass without draws still performs its clears
     }
@@ -994,6 +997,48 @@ void SetScissors(Owned& o, u32 count, const VkRect2D* scissors) {
 }
 
 namespace {
+DrawSnap Snap(const Owned& o) {
+    DrawSnap s;
+    s.graphics = o.graphics;
+    s.push = o.push;
+    s.bindings = o.graphics_bindings;
+    s.viewports = o.viewports;
+    s.scissors = o.scissors;
+    s.cull_mode = o.cull_mode;
+    s.front_face = o.front_face;
+    s.depth_test = o.depth_test;
+    s.depth_write = o.depth_write;
+    s.stencil_test = o.stencil_test;
+    s.depth_bias_enable = o.depth_bias_enable;
+    s.rasterizer_discard = o.rasterizer_discard;
+    s.depth_compare = o.depth_compare;
+    s.front = o.front;
+    s.back = o.back;
+    std::copy_n(o.depth_bias, 3, s.depth_bias);
+    std::copy_n(o.blend_constants, 4, s.blend_constants);
+    return s;
+}
+
+void Apply(Owned& o, DrawSnap&& s) {
+    o.graphics = s.graphics;
+    o.push = s.push;
+    o.graphics_bindings = std::move(s.bindings);
+    o.viewports = std::move(s.viewports);
+    o.scissors = std::move(s.scissors);
+    o.cull_mode = s.cull_mode;
+    o.front_face = s.front_face;
+    o.depth_test = s.depth_test;
+    o.depth_write = s.depth_write;
+    o.stencil_test = s.stencil_test;
+    o.depth_bias_enable = s.depth_bias_enable;
+    o.rasterizer_discard = s.rasterizer_discard;
+    o.depth_compare = s.depth_compare;
+    o.front = s.front;
+    o.back = s.back;
+    std::copy_n(s.depth_bias, 3, o.depth_bias);
+    std::copy_n(s.blend_constants, 4, o.blend_constants);
+}
+
 /// Bump allocation from the command buffer's scratch buffer (16-byte aligned).
 std::pair<id<MTLBuffer>, u64> Scratch(Owned& o, u64 size) {
     constexpr u64 kChunk = 8ull << 20;
@@ -1015,6 +1060,10 @@ void TessellatedDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 ver
                      u32 first_instance, bool indexed, u32 first_index) {
     const auto* entry = o.graphics;
     const Metal::TessellationPipeline& tess = *entry->tess;
+    ++stats.tess_draws;
+    if (o.last_draw_tess) {
+        ++stats.tess_after_tess;
+    }
     const u32 patches = tess.input_control_points ? count / tess.input_control_points : 0;
     if (!patches || !instance_count) {
         return;
@@ -1062,31 +1111,19 @@ void TessellatedDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 ver
     Metal::Tessellation::EncodeKernels((__bridge void*)enc, tess, params,
                                        std::span{bindings.data(), num_bindings},
                                        (__bridge void*)scratch, scratch_offset, plan, bind, bind);
-    [o.compute endEncoding];
-    o.compute = nil;
-    // Step 3: the render pass (begun, or reopened loading), the patch draw.
-    if (!PrepareDraw(o)) {
-        return;
-    }
-    [o.render setTessellationFactorBuffer:scratch offset:scratch_offset + plan.factor_offset
-                           instanceStride:0];
-    [o.render setVertexBuffer:scratch
-                       offset:scratch_offset + plan.control_offset
-                      atIndex:Metal::kTessInputBuffer];
-    [o.render setVertexBuffer:scratch
-                       offset:scratch_offset + plan.patch_offset
-                      atIndex:Metal::kTessPatchBuffer];
-    [o.render setVertexBuffer:scratch
-                       offset:scratch_offset + plan.factor_offset
-                      atIndex:Metal::kTessFactorBuffer];
-    [o.render drawPatches:tess.output_control_points
-               patchStart:0
-               patchCount:plan.patches
-         patchIndexBuffer:nil
-   patchIndexBufferOffset:0
-            instanceCount:1
-             baseInstance:0];
+    // Step 3 waits for the end of the run of tessellated draws (FlushPending): the kernels of
+    // the whole run share one compute pass and the patch draws one reopened render pass.
+    PendingPatch pending;
+    pending.snap = Snap(o);
+    pending.scratch = scratch;
+    pending.control_offset = scratch_offset + plan.control_offset;
+    pending.patch_offset = scratch_offset + plan.patch_offset;
+    pending.factor_offset = scratch_offset + plan.factor_offset;
+    pending.patches = plan.patches;
+    pending.output_control_points = tess.output_control_points;
+    o.pending.push_back(std::move(pending));
     ++stats.draws;
+    o.last_draw_tess = true;
 }
 /// A geometry-shader draw (as Huax-1839's RecordGeometryDraw): per chunk of primitives the
 /// export shader and the geometry shader as compute kernels writing vertex records and strip
@@ -1182,7 +1219,38 @@ void GeometryDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 vertex
 }
 } // namespace
 
+void FlushPending(Owned& o) {
+    if (o.pending.empty()) {
+        return;
+    }
+    std::vector<PendingPatch> pending = std::move(o.pending);
+    o.pending.clear();
+    DrawSnap current = Snap(o);
+    for (PendingPatch& p : pending) {
+        Apply(o, std::move(p.snap));
+        if (!PrepareDraw(o)) {
+            continue;
+        }
+        [o.render setTessellationFactorBuffer:p.scratch offset:p.factor_offset instanceStride:0];
+        [o.render setVertexBuffer:p.scratch offset:p.control_offset atIndex:Metal::kTessInputBuffer];
+        [o.render setVertexBuffer:p.scratch offset:p.patch_offset atIndex:Metal::kTessPatchBuffer];
+        [o.render setVertexBuffer:p.scratch offset:p.factor_offset atIndex:Metal::kTessFactorBuffer];
+        [o.render drawPatches:p.output_control_points
+                   patchStart:0
+                   patchCount:p.patches
+             patchIndexBuffer:nil
+       patchIndexBufferOffset:0
+                instanceCount:1
+                 baseInstance:0];
+    }
+    Apply(o, std::move(current));
+}
+
 void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 first_instance) {
+    if (!(o.graphics && o.graphics->tess)) {
+        o.last_draw_tess = false;
+        FlushPending(o);
+    }
     if (o.graphics && o.graphics->geometry) {
         GeometryDraw(o, vertex_count, instance_count, first_vertex, 0, first_instance, false, 0);
         return;
@@ -1211,6 +1279,10 @@ void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 
 
 void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
                  s32 vertex_offset, u32 first_instance) {
+    if (!(o.graphics && o.graphics->tess)) {
+        o.last_draw_tess = false;
+        FlushPending(o);
+    }
     if (o.graphics && o.graphics->geometry) {
         GeometryDraw(o, index_count, instance_count, 0, vertex_offset, first_instance, true,
                      first_index);

@@ -21,6 +21,10 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 1. Stability
 
+- **1440p (live resolution path): the item icon in the HUD is missing** (black square where the
+  Oil Urn picture is; present at 1080p). Seen 2026-10-16 night in both MoltenVK and Metal frame
+  path screenshots (Hunter's Dream). Not yet investigated.
+
 - **PARKED (2026-10-13): the game window sometimes closes by itself in split mode** (grey screen,
   then the host exits with status 0 and no error). Seen 3 times: after turning subpixel jitter on
   in the menu (user), after the same via `BB_TOGGLE_FILE` (bit 25), and during a profiling run with

@@ -42,11 +42,15 @@ struct Binding {
     std::vector<Bound> elements; ///< array elements
 };
 
+struct PendingPatch;
+
 /// What the frame encoder keeps for one owned command buffer.
 struct Owned {
     id<MTLCommandBuffer> cmd; ///< unretained references: the Vulkan objects keep resources alive
     std::vector<id<MTLBuffer>> keep; ///< our temporary buffers, released when the GPU is done
     u32 chunk_draws{}; ///< draws since the last partial commit (CommitChunk)
+    bool last_draw_tess{}; ///< the previous draw of this pass was tessellated (statistics)
+    std::vector<PendingPatch> pending; ///< patch draws of the current tessellation run
     id<MTLRenderCommandEncoder> render;
     id<MTLComputeCommandEncoder> compute;
     id<MTLBlitCommandEncoder> blit;
@@ -100,6 +104,34 @@ struct Owned {
     float blend_constants[4]{};
     bool rasterizer_discard{};
 };
+
+/// The draw state a deferred patch draw needs (tessellation runs, FlushPending).
+struct DrawSnap {
+    const MetalShadow::GraphicsEntry* graphics{};
+    std::array<u8, 256> push{};
+    std::unordered_map<u32, Binding> bindings;
+    std::vector<VkViewport> viewports;
+    std::vector<VkRect2D> scissors;
+    VkCullModeFlags cull_mode{};
+    VkFrontFace front_face{};
+    bool depth_test{}, depth_write{}, stencil_test{}, depth_bias_enable{}, rasterizer_discard{};
+    VkCompareOp depth_compare{};
+    Owned::Face front, back;
+    float depth_bias[3]{};
+    float blend_constants[4]{};
+};
+
+/// A tessellated draw whose kernels ran and whose patch draw waits for the end of the run.
+struct PendingPatch {
+    DrawSnap snap;
+    id<MTLBuffer> scratch;
+    u64 control_offset{}, patch_offset{}, factor_offset{};
+    u32 patches{}, output_control_points{};
+};
+
+/// Encodes the waiting patch draws (in the reopened pass). Every command except state setup and
+/// another tessellated draw calls it first.
+void FlushPending(Owned& o);
 
 /// The device, queue and export entry point (from the layer's SetDevice).
 void Init(VkDevice device, id<MTLCommandQueue> queue, PFN_vkExportMetalObjectsEXT export_objects,
@@ -166,7 +198,7 @@ size_t AddressBufferCount();
 /// Counters for BB_FRAME_STATS-style reports (skipped work by reason).
 struct Stats {
     std::atomic<u64> draws{}, dispatches{}, skipped_no_pipeline{}, skipped_tess{},
-        skipped_emulated{}, skipped_discard{}, unsupported{};
+        skipped_emulated{}, skipped_discard{}, unsupported{}, tess_draws{}, tess_after_tess{};
 };
 Stats& GetStats();
 

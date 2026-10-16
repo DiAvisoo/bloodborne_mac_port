@@ -151,6 +151,15 @@ which is not where the time goes. So, in stages:
   MoltenVK 91.2 (86.5, 91.8, 95.2)**, Metal drawing everything incl. tessellation and geometry
   shaders; walk correct. Known gap: passes whose pipeline names a depth format without a depth
   attachment (Metal validation error, harmless in practice; needs pipeline variants).
+  *Parity (2026-10-16, ~03:30):* render encoders open at the first draw (passes without draws
+  and without clears cost nothing; ~45/frame); tessellated draws come in runs (78% follow another
+  directly): the kernels of a run share one compute pass and the patch draws wait (snapshot of
+  the draw state) for one reopened render pass. Descriptor sets and `vkGet*ProcAddr` through the
+  layer: **FSR 3.1 and the overlay work**; MetalFX works (depth blits write depth). 6 walks clean;
+  pacing better than MoltenVK (0.9 vs 1.4–2.4 late game frames per 5 s; 3–4 vs 8–9 late display
+  frames). **1080p native: Metal 95.5/95.7 vs MoltenVK 95.9 FPS**, drawing the geometry-shader
+  effect MoltenVK skips; 1440p: 64.9 vs 67.7 (before the tessellation runs); FSR 1080p 99.9;
+  MetalFX 1080p 100.3 (vs 107.2).
 - **M3, pass merging:** load/store actions from what we know is read later; merge passes split by
   copies/uploads; one compute encoder for consecutive dispatches.
 - **M4, tessellation:** Metal tessellation (control stage as a compute kernel, post-tessellation

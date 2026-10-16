@@ -98,11 +98,13 @@ void Report() {
         auto& s = MetalFrame::GetStats();
         std::printf("Metal frame: per second: %.0f draws, %.0f dispatches; skipped: %.0f without "
                     "a Metal pipeline, %.0f tessellated, %.0f emulated topology, %.0f discarded; "
-                    "%.0f unsupported commands; %zu device-address buffers declared per encoder\n",
+                    "%.0f unsupported commands; %zu device-address buffers declared per encoder; tessellated "
+                    "draws %.0f, of them right after another %.0f\n",
                     s.draws.exchange(0) / seconds, s.dispatches.exchange(0) / seconds,
                     s.skipped_no_pipeline.exchange(0) / seconds, s.skipped_tess.exchange(0) / seconds,
                     s.skipped_emulated.exchange(0) / seconds, s.skipped_discard.exchange(0) / seconds,
-                    s.unsupported.exchange(0) / seconds, MetalFrame::AddressBufferCount());
+                    s.unsupported.exchange(0) / seconds, MetalFrame::AddressBufferCount(),
+                    s.tess_draws.exchange(0) / seconds, s.tess_after_tess.exchange(0) / seconds);
     }
     if (!trace) {
         return;
