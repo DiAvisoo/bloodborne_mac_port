@@ -9,6 +9,7 @@
 #include <vector>
 #include "video_core/renderer_vulkan/scene_resolution.h"
 #include "video_core/renderer_metal/mtl_object.h"
+#include "video_core/renderer_metal/mtl_scale.h"
 #include "video_core/texture_cache/image.h"
 
 namespace VideoCore { class TextureCache; }
@@ -75,11 +76,6 @@ private:
         std::vector<std::pair<VideoCore::ImageViewInfo, Metal::Object>> views;
         SceneResolution::Coherence state;
     };
-    struct PipelineKey {
-        const char* fragment{};
-        u32 color_format{}, depth_format{}, stencil_format{};
-        bool operator==(const PipelineKey&) const = default;
-    };
     static constexpr u64 Key(u64 uid, u32 level) {
         return uid << 4 | level;
     }
@@ -91,10 +87,6 @@ private:
     /// Depth (and stencil) images: resampled by a fullscreen draw writing depth and, with
     /// stencil export, the stencil value (or one draw per stencil bit, BB_SCENE_STENCIL_BITS=1).
     bool ShaderResampled(const VideoCore::Image&) const;
-    void Scale(void* src, u32 src_level, void* dst, u32 dst_level, u32 width, u32 height,
-               const VideoCore::Image& original);
-    void Resample(void* src, void* dst, const VideoCore::Image& original, u32 width, u32 height);
-    void* Pipeline(const PipelineKey&);
     Metal::Device& device;
     Scheduler& scheduler;
     Runtime& runtime;
@@ -107,11 +99,6 @@ private:
     u64 generation = 0;
     std::array<std::pair<u64, Entry*>, 8> recent{}; ///< last entries by Key
     u32 recent_next = 0;
-    Metal::Object library; ///< Metal::BlitShaders plus the nearest colour scale
-    std::vector<std::pair<PipelineKey, Metal::Object>> pipelines;
-    void* no_depth_state{};      ///< id<MTLDepthStencilState> (owned by the scheduler's cache)
-    void* depth_write_state{};   ///< depth always/write, no stencil
-    void* depth_stencil_state{}; ///< plus stencil replace (exported value), write mask 0xff
-    std::array<void*, 9> stencil_bit_states{}; ///< write masks 0, 1, 2, 4, ..., 128
+    Metal::ScaleHelper scale; ///< scaled copies and depth resamples (used by the encoder thread)
 };
 } // namespace Vulkan

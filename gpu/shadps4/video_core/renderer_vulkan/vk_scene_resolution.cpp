@@ -2,94 +2,17 @@
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <string>
 #include <fmt/format.h>
 #include "bbport_toggles.h"
 #include "common/assert.h"
-#include "video_core/renderer_metal/mtl_blit_shaders.h"
-#include "video_core/renderer_metal/mtl_depth_stencil.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
-#include "video_core/renderer_metal/mtl_render_pipeline.h"
 #include "video_core/renderer_metal/mtl_texture.h"
 #include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
-#include <vulkan/vulkan_format_traits.hpp>
-
 namespace Vulkan {
-namespace {
-
-constexpr std::array<u8, 4> IdentitySwizzle{
-    Metal::VkToMtl::SwizzleRed, Metal::VkToMtl::SwizzleGreen, Metal::VkToMtl::SwizzleBlue,
-    Metal::VkToMtl::SwizzleAlpha};
-
-// Scaled colour copies: the texel nearest to the target pixel's centre, as the Vulkan path's
-// blitImage with eNearest (floor((x + 0.5) * src / dst)). Metal blits cannot scale. Nearest
-// preserves integer G-buffer formats; FSR reconstructs colour at the HDR scene boundary.
-// Float, uint and int flavours (the shader's type must match the format's).
-constexpr const char* ScaleSource = R"msl(
-#define SCENE_SCALE(T, SUFFIX)                                                                    \
-    fragment vec<T, 4> scene_scale##SUFFIX##_fs(FsTriOut in [[stage_in]],                        \
-                                                texture2d<T> src [[texture(0)]]) {               \
-        return src.read(TexelOf(in.uv, uint2(src.get_width(), src.get_height())), 0);           \
-    }
-SCENE_SCALE(float, )
-SCENE_SCALE(uint, _uint)
-SCENE_SCALE(int, _int)
-)msl";
-constexpr const char* ScaleFunctions[3] = {"scene_scale_fs", "scene_scale_uint_fs",
-                                           "scene_scale_int_fs"};
-
-/// Which flavour of scene_scale reads and writes the format: 0 float, 1 uint, 2 int.
-u32 NumericFlavour(vk::Format format) {
-    const char* numeric = vk::componentNumericFormat(format, 0);
-    if (std::strcmp(numeric, "UINT") == 0) {
-        return 1;
-    }
-    if (std::strcmp(numeric, "SINT") == 0) {
-        return 2;
-    }
-    return 0;
-}
-
-constexpr u8 StencilOpReplace = 2; // VK_STENCIL_OP_REPLACE
-constexpr u8 CompareAlways = 7;    // VK_COMPARE_OP_ALWAYS
-
-Metal::DepthStencilKey ResampleState(bool stencil, u8 write_mask) {
-    Metal::DepthStencilKey key{};
-    key.depth_test = true;
-    key.depth_write = true;
-    key.depth_compare = CompareAlways;
-    key.stencil_test = stencil;
-    if (stencil) {
-        // Reference and compare are fixed; an exported stencil value replaces the reference.
-        const Metal::StencilFace face{.fail = StencilOpReplace,
-                                      .pass = StencilOpReplace,
-                                      .depth_fail = StencilOpReplace,
-                                      .compare = CompareAlways,
-                                      .read_mask = 0xff,
-                                      .write_mask = write_mask};
-        key.front = face;
-        key.back = face;
-    }
-    return key;
-}
-
-/// Fullscreen-triangle render state: what the rasterizer may have left is reset.
-void SetFullscreenState(Metal::Encoder& e, void* pipeline, u32 width, u32 height) {
-    e.SetRenderPipeline(pipeline);
-    e.SetCullMode(Metal::CullMode::None);
-    e.SetDepthBias(0.0f, 0.0f, 0.0f);
-    e.SetFillMode(Metal::FillMode::Fill);
-    e.SetDepthClip(Metal::DepthClip::Clip);
-    e.SetViewport({0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f});
-    e.SetScissor({0, 0, width, height});
-}
-
-} // namespace
 
 SceneTargets::SceneTargets(Metal::Device& d, Scheduler& s, Runtime& r,
                            VideoCore::TextureCache& t)
@@ -97,20 +20,10 @@ SceneTargets::SceneTargets(Metal::Device& d, Scheduler& s, Runtime& r,
         return t.TryGetImage(id, uid);
     }) {}
 SceneTargets::SceneTargets(Metal::Device& d, Scheduler& s, Runtime& r, Lookup get)
-    : device{d}, scheduler{s}, runtime{r}, lookup{std::move(get)} {
+    : device{d}, scheduler{s}, runtime{r}, lookup{std::move(get)}, scale{d} {
     runtime.scene_targets = this;
     const char* force = std::getenv("BB_SCENE_STENCIL_BITS");
     force_stencil_bits = force && force[0] == '1';
-    library = Metal::CompileLibrary(device, std::string{Metal::BlitShaders::Source} + ScaleSource,
-                                    "Scene resolution");
-    auto& states = scheduler.GetDepthStencilCache();
-    no_depth_state = states.Get(Metal::DepthStencilKey{});
-    depth_write_state = states.Get(ResampleState(false, 0));
-    depth_stencil_state = states.Get(ResampleState(true, 0xff));
-    stencil_bit_states[0] = states.Get(ResampleState(true, 0));
-    for (u32 i = 1; i < stencil_bit_states.size(); ++i) {
-        stencil_bit_states[i] = states.Get(ResampleState(true, u8(1u << (i - 1))));
-    }
 }
 SceneTargets::~SceneTargets() {
     scheduler.Finish();
@@ -222,111 +135,29 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
                             {dst_width, dst_height, 1});
         });
     } else if (ShaderResampled(original)) {
-        // (Depth proxies are single-level: Eligible.)
-        Resample(src, dst, original, dst_width, dst_height);
+        // (Depth proxies are single-level: Eligible.) Apple GPUs export stencil from fragment
+        // shaders; BB_SCENE_STENCIL_BITS=1 tests the per-bit resampler instead.
+        const bool has_stencil =
+            Metal::VkToMtl::HasStencilPixelFormat(Metal::TexturePixelFormat(dst));
+        const auto stencil = !has_stencil         ? Metal::StencilCopy::None
+                             : force_stencil_bits ? Metal::StencilCopy::PerBit
+                                                  : Metal::StencilCopy::Export;
+        scheduler.Record([this, src, dst, stencil](Metal::Encoder& enc) {
+            scale.ResampleDepth(enc, src, dst, stencil);
+        });
+        // The guest pipelines' dynamic state must be emitted again after this pipeline.
+        scheduler.GetDynamicState().Invalidate();
     } else {
-        Scale(src, src_level, dst, dst_level, dst_width, dst_height, original);
+        // Nearest texel: preserves integer G-buffer formats; FSR reconstructs colour at the HDR
+        // scene boundary.
+        scheduler.Record([this, src, src_level, dst, dst_level](Metal::Encoder& enc) {
+            scale.ScaleColor(enc, src, dst, Metal::ScaleFilter::Nearest, {}, src_level,
+                             dst_level);
+        });
+        scheduler.GetDynamicState().Invalidate();
     }
     if (to_native) e.state.Resolved(); else e.state.CopiedToProxy();
     copying = false;
-}
-void* SceneTargets::Pipeline(const PipelineKey& key) {
-    for (const auto& [k, pipeline] : pipelines) if (k == key) return pipeline.Get();
-    const Metal::RenderPipelineDesc desc{
-        .library = library.Get(),
-        .vertex_function = Metal::BlitShaders::FullscreenTriangle,
-        .fragment_function = key.fragment,
-        .color_format = key.color_format,
-        .depth_format = key.depth_format,
-        .stencil_format = key.stencil_format,
-    };
-    const std::string label = fmt::format("scene {} {}/{}/{}", key.fragment, key.color_format,
-                                          key.depth_format, key.stencil_format);
-    pipelines.emplace_back(key, Metal::CreateRenderPipeline(device, desc, label));
-    return pipelines.back().second.Get();
-}
-void SceneTargets::Scale(void* src, u32 src_level, void* dst, u32 dst_level, u32 width,
-                         u32 height, const VideoCore::Image& original) {
-    const u32 format = Metal::TexturePixelFormat(dst);
-    Metal::Object source = Metal::CreateTextureView(src, Metal::TexturePixelFormat(src),
-                                                    Metal::TextureType::Tex2D, src_level, 1, 0, 1,
-                                                    IdentitySwizzle);
-    ASSERT_MSG(source, "Scene proxy copy: no 2D view of level {}", src_level);
-    void* const pipeline =
-        Pipeline({.fragment = ScaleFunctions[NumericFlavour(original.info.pixel_format)],
-                  .color_format = format});
-    Metal::RenderPassDesc pass{};
-    pass.colors[0].texture = dst;
-    pass.colors[0].level = dst_level;
-    pass.width = width;
-    pass.height = height;
-    scheduler.Record([pass, pipeline, state = no_depth_state,
-                      source = std::move(source)](Metal::Encoder& e) mutable {
-        void* const texture = source.Get();
-        e.KeepAlive(std::move(source));
-        e.BeginRenderPass(pass);
-        SetFullscreenState(e, pipeline, pass.width, pass.height);
-        e.SetDepthStencil(state);
-        e.SetTexture(Metal::Stage::Fragment, 0, texture);
-        e.Draw(Metal::Primitive::Triangle, 3);
-        e.EndRenderPass();
-    });
-    // The guest pipelines' dynamic state must be emitted again after this pipeline.
-    scheduler.GetDynamicState().Invalidate();
-}
-void SceneTargets::Resample(void* src, void* dst, const VideoCore::Image& original, u32 width,
-                            u32 height) {
-    const u32 format = Metal::TexturePixelFormat(dst);
-    const bool stencil = Metal::VkToMtl::HasStencilPixelFormat(format);
-    const bool stencil_bits = stencil && force_stencil_bits;
-    Metal::Object stencil_view;
-    if (stencil) {
-        stencil_view = Metal::CreateTextureView(
-            src, Metal::StencilViewPixelFormat(Metal::TexturePixelFormat(src)),
-            Metal::TextureType::Tex2D, 0, 1, 0, 1, IdentitySwizzle);
-        ASSERT_MSG(stencil_view, "Scene proxy resample: no stencil view of {}",
-                   vk::to_string(original.info.pixel_format));
-    }
-    const char* fragment = !stencil       ? Metal::BlitShaders::DepthResample
-                           : stencil_bits ? Metal::BlitShaders::DepthResampleStencilBits
-                                          : Metal::BlitShaders::DepthResampleStencil;
-    void* const pipeline = Pipeline(
-        {.fragment = fragment, .depth_format = format, .stencil_format = stencil ? format : 0});
-    Metal::RenderPassDesc pass{};
-    pass.depth.texture = dst;
-    pass.depth.has_stencil = stencil;
-    pass.depth.clear_depth = true; // every pixel is written (compare always)
-    pass.depth.clear_stencil = stencil; // the per-bit path ORs bits into zero
-    pass.depth.stencil = 0;
-    pass.width = width;
-    pass.height = height;
-    void* const state = !stencil ? depth_write_state : depth_stencil_state;
-    scheduler.Record([pass, pipeline, state, stencil_bits, bit_states = stencil_bit_states, src,
-                      stencil_view = std::move(stencil_view)](Metal::Encoder& e) mutable {
-        void* const stencil_texture = stencil_view.Get();
-        if (stencil_view) e.KeepAlive(std::move(stencil_view));
-        e.BeginRenderPass(pass);
-        SetFullscreenState(e, pipeline, pass.width, pass.height);
-        e.SetTexture(Metal::Stage::Fragment, 0, src);
-        if (stencil_texture) e.SetTexture(Metal::Stage::Fragment, 1, stencil_texture);
-        if (stencil_bits) {
-            // Copy depth first (bit 0, write mask 0), then reconstruct all eight stencil bits
-            // with fixed-function replacement; discard keeps unset bits clear.
-            for (u32 i = 0; i < bit_states.size(); ++i) {
-                const u32 bit = i ? 1u << (i - 1) : 0u;
-                e.SetBytes(Metal::Stage::Fragment, 0, &bit, sizeof(bit));
-                e.SetDepthStencil(bit_states[i]);
-                e.SetStencilReference(bit, bit);
-                e.Draw(Metal::Primitive::Triangle, 3);
-            }
-        } else {
-            e.SetDepthStencil(state);
-            e.Draw(Metal::Primitive::Triangle, 3);
-        }
-        e.EndRenderPass();
-    });
-    // The guest pipelines' dynamic state must be emitted again after this pipeline.
-    scheduler.GetDynamicState().Invalidate();
 }
 SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level) {
     auto& original = *lookup(id, 0);

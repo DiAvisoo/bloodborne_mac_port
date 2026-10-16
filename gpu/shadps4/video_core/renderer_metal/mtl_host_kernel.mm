@@ -18,15 +18,21 @@ namespace Metal {
 
 namespace {
 
+std::filesystem::path& CacheDirOverride() {
+    static std::filesystem::path dir;
+    return dir;
+}
+
 /// One compiler for every host kernel of the process, with the GPU shader cache directory
-/// (<user>/cache/<title>/metal, ShaderCompiler::DefaultCacheDir) as its MSL disk cache.
+/// (<user>/cache/<title>/metal, ShaderCompiler::DefaultCacheDir; SetHostKernelCacheDir) as its
+/// MSL disk cache.
 ShaderCompiler& HostCompiler(Device& device) {
     static std::mutex mutex;
     static std::unique_ptr<ShaderCompiler> compiler;
     static Device* owner = nullptr;
     std::scoped_lock lock{mutex};
     if (!compiler) {
-        compiler = std::make_unique<ShaderCompiler>(device);
+        compiler = std::make_unique<ShaderCompiler>(device, CacheDirOverride());
         owner = &device;
     }
     ASSERT_MSG(owner == &device, "Host kernels are built for one Metal device only");
@@ -34,6 +40,10 @@ ShaderCompiler& HostCompiler(Device& device) {
 }
 
 } // namespace
+
+void SetHostKernelCacheDir(std::filesystem::path dir) {
+    CacheDirOverride() = std::move(dir);
+}
 
 HostKernel BuildHostKernel(Device& device, std::span<const u32> spirv,
                            std::span<const SpecConstant> constants, std::string_view name) {
@@ -58,6 +68,7 @@ HostKernel BuildHostKernel(Device& device, std::span<const u32> spirv,
     kernel.pipeline = Object::Adopt((__bridge_retained void*)pipeline);
     kernel.buffer_slot.fill(~0u);
     kernel.texture_slot.fill(~0u);
+    kernel.sampler_slot.fill(~0u);
     for (u32 b = 0; b < kernel.buffer_slot.size(); ++b) {
         if (const auto* binding = shader.Find(0, b, ShaderBinding::Kind::Buffer)) {
             kernel.buffer_slot[b] = binding->msl_index;
@@ -68,6 +79,9 @@ HostKernel BuildHostKernel(Device& device, std::span<const u32> spirv,
                 kernel.texture_slot[b] = binding->msl_index;
                 break;
             }
+        }
+        if (const auto* binding = shader.Find(0, b, ShaderBinding::Kind::Sampler)) {
+            kernel.sampler_slot[b] = binding->msl_index;
         }
     }
     kernel.local_size = shader.local_size;

@@ -146,6 +146,12 @@ if [[ ${1:-} == --test ]]; then
             -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework Foundation -o out/mtl-present-test
         out/mtl-present-test
         MTL_DEBUG_LAYER=1 out/mtl-present-test
+        # Metal-native M5: the scale helper (scaled colour copies, depth resample and clear).
+        /usr/bin/clang++ -arch arm64 -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -std=c++20 -fobjc-arc -O2 -g \
+            -Wall -Wextra -Werror -Igpu/shim -Igpu/shadps4 -I"$ARM64_PREFIX/include" tests/test_mtl_scale.mm gpu/shim/common/logging/log.cpp gpu/shim/common/assert.cpp out/gpu-arm64/libbbmetal_core.a -L"$ARM64_PREFIX/lib" -lfmt \
+            -framework Metal -framework Foundation -o out/mtl-scale-test
+        out/mtl-scale-test
+        MTL_DEBUG_LAYER=1 out/mtl-scale-test
     fi
     # Metal-native M4: what an MTLBinaryArchive can serialize (pure Metal), plain and under
     # validation.
@@ -159,6 +165,10 @@ if [[ ${1:-} == --test ]]; then
         ninja -C out/gpu-arm64 scene-resolution-test >/dev/null
         out/gpu-arm64/scene-resolution-test 2>&1 | grep -E 'PASS|FAIL'
         BB_SCENE_STENCIL_BITS=1 out/gpu-arm64/scene-resolution-test 2>&1 | grep -E 'PASS|FAIL'
+        # Metal-native M5: host kernels with combined image samplers, plain and under validation.
+        ninja -C out/gpu-arm64 host-kernel-test >/dev/null
+        out/gpu-arm64/host-kernel-test
+        MTL_DEBUG_LAYER=1 out/gpu-arm64/host-kernel-test 2>&1 | grep -E 'PASS|FAIL' || { echo 'FAIL: host-kernel-test (validation)'; exit 1; }
         # Saved upscaler choices (FSR 4 runs as off, the ini keeps the user's value).
         ninja -C out/gpu-arm64 upscaler-support-test >/dev/null
         out/gpu-arm64/upscaler-support-test 2>&1 | grep -E 'PASS|FAIL' || { echo 'FAIL: upscaler-support-test'; exit 1; }

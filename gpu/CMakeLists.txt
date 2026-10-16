@@ -99,16 +99,22 @@ set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
 set(SHADER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/include)
 set(SHADER_DIR ${SHADER_INCLUDE}/video_core/host_shaders)
 set(SHADER_HEADERS "")
+# FILENAME: relative to host_shaders/, or an absolute path (test kernels).
 function(add_host_shader FILENAME SHADER_NAME)
     set(OUT ${SHADER_DIR}/${SHADER_NAME}.h)
+    if (IS_ABSOLUTE ${FILENAME})
+        set(SOURCE ${FILENAME})
+    else()
+        set(SOURCE ${SHADER_SRC}/${FILENAME})
+    endif()
     string(TOUPPER ${SHADER_NAME} SYMBOL)
     set(DEFINES ${ARGN})
     list(TRANSFORM DEFINES PREPEND "-D")
     add_custom_command(OUTPUT ${OUT}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
-        COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -o ${OUT} --vn ${SYMBOL} ${DEFINES} ${SHADER_SRC}/${FILENAME}
+        COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -o ${OUT} --vn ${SYMBOL} ${DEFINES} ${SOURCE}
         COMMAND ${CMAKE_COMMAND} "-DHEADER_FILE=${OUT}" -P ${SHADER_SRC}/AddShaderHeaderInclude.cmake
-        DEPENDS ${SHADER_SRC}/${FILENAME} VERBATIM)
+        DEPENDS ${SOURCE} VERBATIM)
     set(SHADER_HEADERS ${SHADER_HEADERS} ${OUT} PARENT_SCOPE)
 endfunction()
 add_host_shader(color_to_ms_depth.frag color_to_ms_depth_frag)
@@ -132,6 +138,8 @@ foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
 endforeach()
+# Test kernels (host-kernel-test).
+add_host_shader(${CMAKE_CURRENT_SOURCE_DIR}/../tests/shaders/host_kernel_sampler.comp host_kernel_sampler_comp)
 add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
 
 file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
@@ -261,6 +269,7 @@ if (APPLE)
         shadps4/video_core/renderer_metal/mtl_depth_stencil.mm
         shadps4/video_core/renderer_metal/mtl_present.mm
         shadps4/video_core/renderer_metal/mtl_render_pipeline.mm
+        shadps4/video_core/renderer_metal/mtl_scale.mm
         shadps4/video_core/renderer_metal/mtl_specialize.cpp
         shadps4/video_core/renderer_metal/mtl_texture.mm
         shadps4/video_core/renderer_metal/mtl_timeline.cpp
@@ -278,7 +287,7 @@ if (APPLE)
     endforeach()
     file(GLOB METAL_SOURCES CONFIGURE_DEPENDS shadps4/video_core/renderer_metal/*.cpp
          shadps4/video_core/renderer_metal/*.mm)
-    list(REMOVE_ITEM METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_object.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_buffer.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_compiled_shader.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_device.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_draw_core.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_encoder.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_depth_stencil.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_present.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_render_pipeline.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_specialize.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_texture.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_timeline.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/vk_to_mtl.mm)
+    list(REMOVE_ITEM METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_object.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_buffer.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_compiled_shader.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_device.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_draw_core.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_encoder.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_depth_stencil.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_present.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_render_pipeline.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_scale.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_specialize.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_texture.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_timeline.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/vk_to_mtl.mm)
     target_sources(bbgpu PRIVATE ${METAL_SOURCES})
     target_link_libraries(bbgpu PRIVATE bbmetal_core "-framework Metal" "-framework QuartzCore"
         "-framework CoreGraphics" "-framework ImageIO" "-framework Foundation")
@@ -332,6 +341,17 @@ target_link_libraries(scene-resolution-test PRIVATE bbgpu)
 # keep LTO from internalizing them.
 target_link_options(scene-resolution-test PRIVATE -Wl,-export_dynamic)
 target_link_options(motion-shader-test PRIVATE -Wl,-export_dynamic)
+if (APPLE)
+    # Metal::BuildHostKernel (SPIR-V -> MSL through the renderer's ShaderCompiler, in libbbgpu):
+    # sampler slots and a linear sample through a combined image sampler.
+    add_executable(host-kernel-test EXCLUDE_FROM_ALL ../tests/test_mtl_host_kernel.mm ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(host-kernel-test PRIVATE shim shadps4 ${SHADER_INCLUDE})
+    target_compile_options(host-kernel-test PRIVATE -UNDEBUG)
+    set_source_files_properties(../tests/test_mtl_host_kernel.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(host-kernel-test PRIVATE bbgpu "-framework Metal" "-framework Foundation")
+    target_link_options(host-kernel-test PRIVATE -Wl,-export_dynamic)
+    add_dependencies(host-kernel-test host_shaders)
+endif()
 # These two test the TAA and camera motion kernels. They are ported to Metal with their sources
 # (M5 Tasks 7 and 5): built from stage 5 on, but not while the Vulkan versions are pending.
 if (NOT "vk_temporal_upscaler" IN_LIST BB_M5_PENDING)

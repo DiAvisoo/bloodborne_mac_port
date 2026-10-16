@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: the texture cache's and the presenter's blit programs in MSL (Metal-native renderer),
 // translated by hand from host_shaders/fs_tri.vert, color_to_ms_depth.frag, ms_image_blit.frag,
-// depth_resample.frag and post_process.frag. One library; inputs at textures 0/1, push constants
-// at buffer 0.
+// depth_resample.frag and post_process.frag, plus the scale helper's nearest colour copy. One
+// library; inputs at textures 0/1, push constants at buffer 0.
 
 #pragma once
 
@@ -25,8 +25,13 @@ inline constexpr const char* DepthResampleStencil = "depth_resample_stencil_fs";
 inline constexpr const char* DepthResampleStencilBits = "depth_resample_stencil_bits_fs";
 /// post_process.frag (the presenter's gamma pass): texture 0, sampler 0, PpSettings at buffer 0.
 inline constexpr const char* PostProcess = "post_process_fs";
-/// The present blit: a linear sample of texture 0 (sampler 0) over the viewport.
+/// The present blit: a linear sample of texture 0 (sampler 0) over the viewport (also the scale
+/// helper's linear colour copy).
 inline constexpr const char* Present = "present_fs";
+/// Scaled colour copy (mtl_scale.h): the texel of texture 0 nearest to the pixel's centre, as
+/// Vulkan's blitImage with eNearest (floor((x + 0.5) * src / dst)); float, uint and int flavours.
+inline constexpr const char* ScaleNearest[3] = {"scale_nearest_fs", "scale_nearest_uint_fs",
+                                                "scale_nearest_int_fs"};
 
 inline constexpr const char* Source = R"msl(
 #include <metal_stdlib>
@@ -153,6 +158,16 @@ fragment float4 present_fs(FsTriOut in [[stage_in]], texture2d<float> tex [[text
                            sampler s [[sampler(0)]]) {
     return tex.sample(s, in.uv);
 }
+
+// Scaled colour copies (mtl_scale.h): nearest texel over the viewport. Metal blits cannot scale.
+#define SCALE_NEAREST(T, SUFFIX)                                                                  \
+    fragment vec<T, 4> scale_nearest##SUFFIX##_fs(FsTriOut in [[stage_in]],                      \
+                                                  texture2d<T> src [[texture(0)]]) {             \
+        return src.read(TexelOf(in.uv, uint2(src.get_width(), src.get_height())), 0);           \
+    }
+SCALE_NEAREST(float, )
+SCALE_NEAREST(uint, _uint)
+SCALE_NEAREST(int, _int)
 )msl";
 
 } // namespace Metal::BlitShaders
