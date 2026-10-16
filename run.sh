@@ -40,6 +40,9 @@ fi
 out=$data/out
 mkdir -p "$out"
 export BB_CONFIG=${BB_CONFIG:-$data/bbport.ini}
+# The launcher's fps_cap / fullscreen (bbport.ini) as BB_FPS_LIMIT / BB_FULLSCREEN.
+source scripts/launch_settings.sh
+bb_launch_settings "$BB_CONFIG"
 # GPU caches (pipelines, shaders) next to the saves. Exported before anything starts: the GPU
 # library reads it while loading, in bb-probe and in the native GPU host alike.
 export BB_GPU_USER_DIR=${BB_GPU_USER_DIR:-${BB_USER_DIR:-$data/user}}

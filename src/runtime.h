@@ -110,6 +110,8 @@ void runtime_pad_report(void);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);
 void runtime_savedata_configure(const char *title);
+/* The save folder: BB_SAVE_DIR (the launcher's choice) when set, else <user>/savedata. */
+void runtime_savedata_dir(char *out, size_t size);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
 void runtime_thread_attach_host(const char *name);

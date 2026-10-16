@@ -136,6 +136,14 @@ the live path (the startup patch breaks geometry there). Check screenshots when 
   (`docs/STATIC_RECOMPILATION_PLAN.md`): survey, test vectors, discovery, and a prototype where
   47k game functions lift to C and run natively on arm64, matching x86 bit for bit.
 
+## State as of 2026-10-16 (mac-v0.4.0)
+
+- **Launcher** (`launcher/App`, `launcher/Model`, Swift; `scripts/macos/build_launcher.sh --test`):
+  the main executable of both apps; two-column window sized for a 13" Air. Writes `bbport.ini` and
+  `launch.conf` (`BB_SHOW_LAUNCHER`, `BB_SAVE_DIR`); ⌥ at open shows it when hidden. Test runs:
+  `open -n --env BB_DATA_DIR=$PWD/out/macdata --env BB_LAUNCH_CONF=$PWD/out/macdata/launch.conf Bloodborne.app`.
+- **0.5.0 = the full native Metal renderer** (separate branch; `renderer=metal`).
+
 ## Next steps (in order)
 
 1. **Native arm64 GPU process** (docs/DESIGN_NATIVE_GPU_PROCESS.md): M0 spike passed (1.75× on

@@ -9,7 +9,7 @@
 # usage: bash scripts/macos/package_app.sh [version]     (build first: bash build_macos.sh)
 #
 # Layout of Bloodborne.app/Contents:
-#   MacOS/Bloodborne              launcher (bash): game folder, checks, logs, error dialogs
+#   MacOS/Bloodborne              launcher window (Swift, launcher/): settings, folders, Play
 #   MacOS/bb-probe                game process (x86-64, Rosetta 2)
 #   MacOS/bbgpu-host              GPU process (arm64; owns the window, so the Dock shows the app)
 #   MacOS/bb-gpu-capabilities     GPU check used by run.sh
@@ -89,6 +89,7 @@ EOF
 # Launch scripts and patches (run.sh runs them; BB_PREBUILT=1 skips building).
 install -m755 run.sh "$contents/Resources/port/"
 install -m644 scripts/*.py "$contents/Resources/port/scripts/"
+install -m644 scripts/launch_settings.sh "$contents/Resources/port/scripts/"
 cp -R patches "$contents/Resources/port/patches"
 
 # Python.
@@ -180,11 +181,17 @@ cat > "$contents/Info.plist" <<EOF
 </plist>
 EOF
 
-install -m755 scripts/macos/app_launcher.sh "$contents/MacOS/Bloodborne"
+# The launcher window (launcher/, Swift): settings, folders, Play.
+bash scripts/macos/build_launcher.sh
+install -m755 out/launcher/Bloodborne "$contents/MacOS/Bloodborne"
+# The launcher offers the renderer choice only in builds with the Metal renderer.
+if [[ -d gpu/shadps4/video_core/renderer_metal ]]; then touch "$contents/Resources/port/metal-renderer"; fi
 
 # Ad-hoc signature (arm64 code must be signed to run; install_name_tool invalidated the build's).
 find "$contents/MacOS" "$contents/Frameworks" "$py" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.so' \) -print0 |
     while IFS= read -r -d '' file; do
+        # The main executable is signed with the bundle (after everything it contains).
+        [[ $file == "$contents/MacOS/Bloodborne" ]] && continue
         if file -b "$file" | grep -q Mach-O; then codesign --force --sign - "$file" 2>/dev/null; fi
     done
 codesign --force --sign - "$app"

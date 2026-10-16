@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace BbSettings {
 
@@ -15,6 +16,27 @@ namespace {
 const char* Path() {
     const char* env = std::getenv("BB_CONFIG");
     return env && env[0] ? env : "bbport.ini";
+}
+
+/// Keys Save() writes; every other key=value line of the file is kept as it is (the launcher's
+/// fps_cap and fullscreen, ...).
+bool OwnedKey(const std::string& key) {
+    static constexpr const char* owned[] = {
+        "upscaler", "preset", "sharpen", "sharpness", "jitter", "reactive", "object_motion",
+        "reactive_scale", "reactive_threshold", "reactive_max", "debug_view", "show_fps",
+        "fsr4_auto_exposure", "fsr4_invert_jitter", "model_lod", "output_res",
+        "live_resolution", "shader_compile", "renderer"};
+    for (const char* k : owned) {
+        if (key == k) {
+            return true;
+        }
+    }
+    for (const auto& effect : Effects) {
+        if (key == effect.key) {
+            return true;
+        }
+    }
+    return false;
 }
 
 float Clamp(float v, float lo, float hi) {
@@ -178,6 +200,21 @@ bool ResolutionNeedsRestart() {
 
 void Save() {
     const auto& v = Get();
+    std::vector<std::string> kept;
+    if (FILE* old = std::fopen(Path(), "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof(line), old)) {
+            std::string text{line};
+            text.erase(text.find_last_not_of(" \t\r\n") + 1);
+            const auto eq = text.find('=');
+            if (text.empty() || text[0] == '#' || eq == std::string::npos ||
+                OwnedKey(text.substr(0, eq))) {
+                continue;
+            }
+            kept.push_back(text);
+        }
+        std::fclose(old);
+    }
     FILE* file = std::fopen(Path(), "w");
     if (!file) {
         std::printf("Settings: cannot write %s\n", Path());
@@ -210,6 +247,9 @@ void Save() {
                  compile_modes[std::clamp(v.shader_compile.load(), 0, 2)]);
     // Read by run.sh at start.
     std::fprintf(file, "renderer=%s\n", v.metal_renderer ? "metal" : "vulkan");
+    for (const std::string& line : kept) {
+        std::fprintf(file, "%s\n", line.c_str());
+    }
     std::fclose(file);
 }
 

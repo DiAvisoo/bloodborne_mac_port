@@ -1,7 +1,8 @@
 /* libSceSaveData on host directories:
- *   <user>/savedata/<user id>/<title id>/<dir name>/        files the game writes
- *   <user>/savedata/<user id>/<title id>/<dir name>.sce_sys/ param.bin, icon0.png
- *   <user>/savedata/<user id>/<title id>.memory/memory.dat  SaveDataMemory
+ *   <save folder>/<user id>/<title id>/<dir name>/        files the game writes
+ *   <save folder>/<user id>/<title id>/<dir name>.sce_sys/ param.bin, icon0.png
+ *   <save folder>/<user id>/<title id>.memory/memory.dat  SaveDataMemory
+ * <save folder> = BB_SAVE_DIR (the launcher's choice), else <user>/savedata.
  * A mounted directory appears to the guest as /savedata0../savedata15.
  * Metadata lives beside the directory so the guest's own files are untouched. */
 #define _GNU_SOURCE
@@ -71,6 +72,12 @@ static size_t mounts_done, memory_writes;
  * save carries a flag at 0x204E of userdata0010; with it clear, parts of the game's audio
  * (e.g. the player's weapon sounds) never play. It is set before the game reads the save.
  * BB_SOUND_HACK=0 leaves saves untouched. */
+void runtime_savedata_dir(char *out, size_t size) {
+    const char *env=getenv("BB_SAVE_DIR");
+    if (env && *env) snprintf(out,size,"%s",env);
+    else snprintf(out,size,"%s/savedata",runtime_file_user_dir());
+}
+
 static void bloodborne_sound_hack(void) {
     static const char *const ids[]={"CUSA00207","CUSA00208","CUSA00299","CUSA00900","CUSA01363","CUSA03014","CUSA03023","CUSA03173"};
     const char *env=getenv("BB_SOUND_HACK");
@@ -79,7 +86,7 @@ static void bloodborne_sound_hack(void) {
     for (size_t i=0;i<sizeof(ids)/sizeof(*ids);++i) if (!strcmp(title_id,ids[i])) bloodborne=1;
     if (!bloodborne) return;
     char users[700];
-    snprintf(users,sizeof(users),"%s/savedata",runtime_file_user_dir());
+    runtime_savedata_dir(users,sizeof(users));
     DIR *dir=opendir(users);
     if (!dir) return;
     for (struct dirent *e; (e=readdir(dir));) {
@@ -118,7 +125,8 @@ static int make_dirs(const char *path) {
 }
 
 static void root(int32_t user, const char *title, char *out, size_t size) {
-    snprintf(out,size,"%s/savedata/%d/%s",runtime_file_user_dir(),user,title && *title ? title : title_id);
+    char dir[700]; runtime_savedata_dir(dir,sizeof(dir));
+    snprintf(out,size,"%s/%d/%s",dir,user,title && *title ? title : title_id);
 }
 
 static void target_paths(int32_t user, const char *title, const DirName *dir, char *host, char *meta, size_t size) {

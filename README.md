@@ -15,9 +15,9 @@ process.
 > This project is not affiliated with or endorsed by Sony Interactive Entertainment,
 > FromSoftware, or AMD.
 
-## Status (2026-10-14)
+## Status (2026-10-16)
 
-**Current version: [mac-v0.3.3](https://github.com/Wooloomooloo2/bloodborne_mac_port/releases/tag/mac-v0.3.3)** (download the app, or build it as below).
+**Current version: [mac-v0.4.0](https://github.com/Wooloomooloo2/bloodborne_mac_port/releases/tag/mac-v0.4.0)** (download the app, or build it as below).
 
 **Work in progress, playable.** On an Apple M4 Max the game boots, character creation works,
 saves load, and the game runs at a **locked 60 FPS** at 1080p and 1440p native, or upscaled with
@@ -60,7 +60,27 @@ got it to 60 and beyond, in order:
 Also fixed along the way: a MoltenVK crash from two threads sharing one command pool, and
 geometry corruption at 1440p (scenes above 1080p now use live resolution changes).
 
-### Latest changes (2026-10-14)
+### New in 0.4.0: the launcher
+
+`Bloodborne.app` now opens a launcher window (native SwiftUI) before the game, like a Steam
+launcher, with every setting on one screen (no scrolling, even on a 13" MacBook Air):
+
+- **Display:** output resolution, windowed or full screen, frame rate cap (30, 40, 60, 90, 120).
+- **Upscaler:** off, MetalFX or FSR 3.1, its quality level, and the resolution the game
+  actually renders at (for example 1280 × 720 → 1920 × 1080); FSR sharpening.
+- **Effects:** depth of field, motion blur, chromatic aberration, ambient occlusion, shadows
+  from dynamic lights, screen-space reflections, the game's own anti-aliasing, the FPS counter,
+  and **skip intro videos** (straight to the title screen, no Sony and FromSoftware logos).
+- **Locations:** the game folder (checked before Play is enabled) and the save folder (it
+  offers to copy your saves to a new folder; the originals stay where they were).
+- **Show launcher every time:** untick it to start the game directly next time; hold **⌥
+  (Option)** while opening the app to get the window back.
+
+Settings are shared with the in-game overlay (`⌘,`) and stored in `bbport.ini`. When the game
+quits, the launcher comes back; if it stopped with an error, the launcher says so and offers
+the log.
+
+### Earlier changes (0.3.x, 2026-10-14)
 
 - **Load crash fixed.** The intermittent crash while loading an area (the GPU window closing
   during a loading screen) was a race in the game itself: the main thread records
@@ -98,6 +118,10 @@ geometry corruption at 1440p (scenes above 1080p now use live resolution changes
 
 ### What's next
 
+- **0.5.0: a full native Metal renderer.** The game's GPU commands go straight to Metal
+  instead of through Vulkan and MoltenVK. It is in development on a separate branch, where it
+  already matches or beats MoltenVK (96 vs 94 FPS at 1080p native) with MetalFX and FSR 3.1
+  working; 0.5.0 makes it complete and the default.
 - **Fewer Metal render passes.** Profiling found ~408 Metal encoders per frame (190 render
   passes). Each extra render pass costs ~13–16 µs of GPU time on Apple GPUs regardless of
   resolution — about 3 ms per frame — and leaves the GPU idle in periodic gaps. Merging passes
@@ -149,13 +173,15 @@ game files are included.
 
    or open it once, then go to **System Settings → Privacy & Security** and click
    **Open Anyway** next to the Bloodborne message.
-3. Open it. On first launch it asks for your game folder (the `CUSA03173` folder containing
-   `eboot.bin`) and checks it; if Rosetta 2 is missing it offers to install it.
+3. Open it. The launcher window opens: under **Locations**, choose your game folder (the
+   `CUSA03173` folder containing `eboot.bin`); it is checked, and **Play** is enabled once it
+   passes. Pick your settings and press Play. If Rosetta 2 is missing, it offers to install it.
 
 The app contains everything else (the game process, the native GPU process, the libraries and
 a small Python for the launch scripts). Saves and settings go to
-`~/Library/Application Support/Bloodborne`, the log to `~/Library/Logs/Bloodborne/game.log`.
-To choose a different game folder, delete `launch.conf` in the save folder.
+`~/Library/Application Support/Bloodborne` (another save folder can be chosen in the launcher),
+the log to `~/Library/Logs/Bloodborne/game.log`. To change the game folder, use the launcher's
+**Locations** (hold ⌥ while opening the app if the launcher is set not to show).
 
 **Preparing the game folder from PKG files.** The app needs an unpacked folder, not `.pkg`
 files. If you already play on shadPS4 you have one: use that folder, but first copy the
@@ -218,11 +244,11 @@ bash scripts/macos/make_app.sh
 
 This creates **`Bloodborne.app`** in the repository folder, with the game's own icon (taken from
 your game folder, so the app is made on your Mac and never uploaded). Double-click it, or drag
-it to the Dock. It uses the same settings as `Bloodborne.command` below (including the game
-folder question on first launch), runs without a Terminal window, and writes the game's log to
-`~/Library/Logs/Bloodborne/game.log` (the session before in `game.previous.log`). If the game
-stops with an error, a dialog offers to show the log. Run the script again if you move the
-repository folder.
+it to the Dock. It opens the same launcher window as the downloadable app (settings, game and
+save folders; see "New in 0.4.0" above), runs the game from this checkout without a Terminal
+window, and writes the game's log to `~/Library/Logs/Bloodborne/game.log` (the session before
+in `game.previous.log`). If the game stops with an error, the launcher offers the log. Run the
+script again if you move the repository folder.
 
 ### From Finder with a Terminal window
 
@@ -275,7 +301,8 @@ launcher.
 ### In the game
 
 - **Settings overlay:** `⌘,` (or L3 + R3 on a controller): FPS, resolution, upscaler (MetalFX,
-  FSR 3.1 or off), shader compile mode. Some changes need a restart.
+  FSR 3.1 or off), shader compile mode. Some changes need a restart. The launcher shows the
+  same settings before the game starts.
 - **Full screen:** ⌃⌘F or the green window button.
 - **Input:** game controllers (through SDL) and the keyboard.
 - **First launch and new areas** compile shaders, so the first minutes stutter a little; later
@@ -295,7 +322,7 @@ launcher.
 | `scripts/macos/make_app.sh` | Builds `Bloodborne.app`, a launcher without a Terminal window (local, not committed) |
 | `scripts/macos/package_app.sh` | Builds the self-contained `dist/Bloodborne.app` and its zip for releases (CI: `.github/workflows/macos-release.yml`) |
 | `Saves` | Shortcut to the save folder (created on first launch, not committed) |
-| `launcher/` | GTK launcher from the Linux port (Linux reference path) |
+| `launcher/` | The macOS launcher window (Swift: `Model/` with tests, `App/`; built by `scripts/macos/build_launcher.sh`), plus the Linux port's GTK launcher (reference) |
 | `tools/` | Developer utilities, including `pkg_extract` (fpkg unpacker) |
 | `docs/` | macOS plan and backlog, plus technical notes inherited from upstream |
 

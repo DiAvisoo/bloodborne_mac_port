@@ -348,6 +348,20 @@ static void rw_timeouts(void) {
     assert(rw_unlock(&f.lock)==0);
     fixture_destroy(&f);
 }
+static void save_dir(void) {
+    char dir[700];
+    unsetenv("BB_SAVE_DIR");
+    runtime_savedata_dir(dir,sizeof(dir));
+    const size_t n=strlen(dir);
+    assert(n>=9 && !strcmp(dir+n-9,"/savedata"));
+    setenv("BB_SAVE_DIR","/tmp/bb saves/it's mine",1);
+    runtime_savedata_dir(dir,sizeof(dir));
+    assert(!strcmp(dir,"/tmp/bb saves/it's mine"));
+    setenv("BB_SAVE_DIR","",1); /* empty: the default */
+    runtime_savedata_dir(dir,sizeof(dir));
+    assert(strlen(dir)>=9 && !strcmp(dir+strlen(dir)-9,"/savedata"));
+    unsetenv("BB_SAVE_DIR");
+}
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#q#q",0)==0);
     runtime_start(1);
@@ -374,7 +388,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
     libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
-    rw_lifecycle(); rw_concurrency(); rw_timeouts();
-    puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
+    rw_lifecycle(); rw_concurrency(); rw_timeouts(); save_dir();
+    puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope, save folder");
     return 0;
 }

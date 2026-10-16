@@ -199,6 +199,14 @@ Each item: what was done for now, what the refinement is, and where it lives.
   0x263b246) instead of a clean exit. Only test runs with a timeout are affected; normal play
   has none. *Refinement:* find why the dump signal derails the interrupted guest thread
   (signal delivery under Rosetta with the guest stack/TLS) and exit cleanly.
+- **Dog cage drawn as a see-through ghost (user, 2026-10-16, Central Yharnam).** Not the
+  geometry-shader skip first suspected: at the nearest lamp the cages render fully on MoltenVK
+  (camera sweep, `BB_FRAME_STATS`, 0 "Geometry shader stage unsupported" lines), so they are
+  ordinary draws. In the user's screenshot (camera squeezed against the character) the cage is
+  drawn, but dissolved: the game's screen-door fade, which MetalFX's temporal upscaling smooths
+  into translucency. Open: whether the fade ever gets stuck (needs a repro with the camera
+  pulled back), and which draws the 3457 geometry-shader skips that session were (MoltenVK has
+  no geometry stage; the Metal renderer, 0.5.0, emulates it).
 - **Character half-rendered after reloading a save (user report, 2026-10-11).** Repro: quit to the
   main menu, reload the save point; the character loads with the top half drawn and the bottom
   half missing. Suspects: pipelines skipped on Metal (`Graphics pipeline … rejected`, geometry
@@ -366,7 +374,7 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 3. Mac GUI
 
-- **Native launcher app (user, 2026-10-15).** A SwiftUI launcher (game folder with the check,
+- **Native launcher app (user, 2026-10-15). Done 2026-10-16 (mac-v0.4.0, `launcher/`).** A SwiftUI launcher (game folder with the check,
   settings, log, play/stop), designed so other games can be added later. bmy/bbport-mac has one
   (`launcher-macos/`, GPL-2.0) for reference.
 
