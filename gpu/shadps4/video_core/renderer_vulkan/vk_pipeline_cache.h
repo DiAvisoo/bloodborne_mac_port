@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <shared_mutex>
@@ -107,10 +109,31 @@ public:
     /// `sparse_page_shift`: the buffer cache's page size (the shaders' page table lookups).
     explicit PipelineCache(Metal::Device& device, Scheduler& scheduler,
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
+    /// bbport (`bbgpu-host --msl-check`): no guest GPU and nothing loaded at construction;
+    /// LoadStored loads the stored pipelines. `metal_cache_dir`: the MSL disk cache and the binary
+    /// archive (empty: Metal::ShaderCompiler::DefaultCacheDir()).
+    PipelineCache(Metal::Device& device, Scheduler& scheduler, u32 sparse_page_shift,
+                  std::filesystem::path metal_cache_dir);
     ~PipelineCache();
 
     void WarmUp();
     void Sync();
+
+    /// bbport: what LoadStored found.
+    struct StoredReport {
+        u32 keys = 0;       ///< PipelineKey blobs
+        u32 loaded = 0;     ///< pipelines created (they build on the creation pool)
+        u32 legacy = 0;     ///< of those, from the previous key version (0.4.0, MoltenVK)
+        u32 old_format = 0; ///< blobs of an older key version, not read
+        u32 duplicates = 0; ///< keys stored more than once (loaded once)
+        u32 not_loaded = 0; ///< metadata or SPIR-V missing, or a binding/permutation conflict
+    };
+    /// bbport (`--msl-check`): loads every pipeline stored in the open cache database as WarmUp
+    /// does, without the profile check and without writing or clearing anything. Also reads the
+    /// previous key version: its Vulkan vertex input state gives the vertex attributes.
+    StoredReport LoadStored();
+    /// Every pipeline of the cache, compute ones first, once its build has finished.
+    void ForEachPipeline(const std::function<void(const Pipeline&)>& func);
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
@@ -192,6 +215,9 @@ private:
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    /// bbport: LoadStored is reading a blob of the previous key version (0.4.0's vertex input
+    /// state and shader binary version).
+    bool loading_legacy = false;
 };
 
 } // namespace Vulkan

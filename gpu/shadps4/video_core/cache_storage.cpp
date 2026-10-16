@@ -120,8 +120,23 @@ void DataBase::Open() {
     opened = true;
 }
 
+void DataBase::OpenReadOnly(const std::filesystem::path& dir) {
+    if (opened) {
+        return;
+    }
+    ASSERT_MSG(!EmulatorSettings.IsPipelineCacheArchived(), "read-only caches are directories");
+    cache_path = dir;
+    read_only = true;
+    opened = true;
+}
+
 void DataBase::Close() {
     if (!IsOpened()) {
+        return;
+    }
+    if (read_only) {
+        read_only = false;
+        opened = false;
         return;
     }
 
@@ -189,7 +204,7 @@ void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v) {
 }
 
 bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& data) {
-    if (!opened) {
+    if (!opened || read_only) {
         return false;
     }
 
@@ -199,7 +214,7 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& da
 }
 
 bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& data) {
-    if (!opened) {
+    if (!opened || read_only) {
         return false;
     }
 
@@ -270,7 +285,7 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
 }
 
 void DataBase::Clear() {
-    if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
+    if (!opened || read_only || EmulatorSettings.IsPipelineCacheArchived()) {
         return;
     }
     std::error_code ec;

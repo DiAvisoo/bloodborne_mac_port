@@ -3,6 +3,12 @@
 
 #pragma once
 
+#if BB_METAL_NATIVE_STAGE < 4
+// Not converted to Metal yet (M4): gpu/CMakeLists.txt leaves the source out and this stand-in
+// takes its place.
+#include "stubs_m3.h"
+#else
+
 #include <deque>
 #include <thread>
 
@@ -164,3 +170,5 @@ private:
 };
 
 } // namespace Vulkan
+
+#endif // BB_METAL_NATIVE_STAGE < 4

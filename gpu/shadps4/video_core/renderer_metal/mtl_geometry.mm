@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: from Huax-1839/bloodborne-macos (ee3120a, GPL-2.0-or-later), renderer_metal/;
-// the draw steps that need their RenderList (EncodeDraw, EncodeIndirectDraw) are in mtl_frame.mm.
+// the geometry draws themselves are in mtl_draw.mm (Runs::DrawGeometry, DrawGeometryIndirect).
 
 #import <Metal/Metal.h>
 

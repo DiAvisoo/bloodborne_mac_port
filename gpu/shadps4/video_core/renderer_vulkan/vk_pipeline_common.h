@@ -49,6 +49,11 @@ public:
     bool Failed() const noexcept {
         return failed.load(std::memory_order_acquire);
     }
+    /// Why the build failed (the reason Failed() logged); empty while building or when built.
+    const std::string& FailureReason() const noexcept {
+        static const std::string none;
+        return Failed() ? failure : none;
+    }
 
     auto GetStages() const {
         static_assert(static_cast<u32>(Shader::SwStage::Compute) == Shader::MaxStageTypes - 1);
@@ -67,8 +72,10 @@ public:
         return is_compute;
     }
 
-protected:
+    /// The stages' names and hashes, for messages.
     [[nodiscard]] std::string GetDebugString() const;
+
+protected:
 
     /// bbport: runs `build` (the Metal shader compiles and pipeline-state creation) on the
     /// pipeline creation pool, or right here when the pool is off.
@@ -83,6 +90,7 @@ protected:
     bool is_compute;
     mutable std::atomic<u32> building{0};
     std::atomic<bool> failed{false};
+    std::string failure; ///< written before `failed` is set
 };
 
 /// bbport: background pipeline creation. Shader translation stays on the GPU command thread;

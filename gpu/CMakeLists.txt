@@ -139,8 +139,24 @@ add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
 file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
 file(GLOB_RECURSE RECOMPILER CONFIGURE_DEPENDS shadps4/shader_recompiler/*.cpp)
 list(FILTER VIDEO_CORE EXCLUDE REGEX "renderdoc\\.cpp$")
-# Native Metal back end (docs/DESIGN_METAL_BACKEND.md): the arm64 GPU host only, below.
+# The Metal renderer (renderer_metal/) is added in the APPLE block below.
 list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_metal/")
+# Metal-native renderer (docs/superpowers/plans/2026-10-16-metal-native-roadmap.md): the milestone
+# the renderer sources are converted to. Files of later milestones leave the build; their headers
+# include gpu/shim/stubs_m3.h instead (stand-ins with the same API, compiled in shim/stubs_m3.cpp).
+set(BB_METAL_NATIVE_STAGE 3 CACHE STRING "Metal-native renderer milestone the sources are converted to (3-7)")
+set(BB_UNCONVERTED_4 vk_presenter vk_swapchain host_passes/pp_pass)
+set(BB_UNCONVERTED_5 vk_temporal_upscaler vk_camera_motion vk_object_motion vk_gpu_profiler
+    vk_breadcrumbs vk_fsr4 fsr411/fsr411)
+set(BB_UNCONVERTED_6 host_passes/fsr_pass)
+set(BB_UNCONVERTED_7 vk_instance vk_platform)
+foreach(stage 4 5 6 7)
+    if (BB_METAL_NATIVE_STAGE LESS ${stage})
+        foreach(source IN LISTS BB_UNCONVERTED_${stage})
+            list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_vulkan/${source}\\.cpp$")
+        endforeach()
+    endif()
+endforeach()
 set(BB_DECODER "")
 if (NOT BB_ARM64)
     set(BB_DECODER shadps4/common/decoder.cpp)
@@ -154,6 +170,12 @@ set(COMMON
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
+if (BB_METAL_NATIVE_STAGE LESS 5)
+    # The settings overlay draws through Vulkan until M5; stubs_m3.cpp answers for it.
+    list(FILTER SHIM_SOURCES EXCLUDE REGEX "shim/bbport_overlay\\.cpp$")
+else()
+    list(FILTER SHIM_SOURCES EXCLUDE REGEX "shim/stubs_m3\\.cpp$")
+endif()
 add_library(bbgpu SHARED ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
@@ -163,8 +185,12 @@ add_dependencies(bbgpu host_shaders)
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
-    third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
-    third_party/imgui/backends/imgui_impl_vulkan.cpp)
+    third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp)
+if (NOT BB_METAL_NATIVE_STAGE LESS 5)
+    target_sources(bbgpu PRIVATE third_party/imgui/backends/imgui_impl_vulkan.cpp)
+endif()
+# PUBLIC: the gated headers (stubs_m3.h) must see the same stage in the tests that include them.
+target_compile_definitions(bbgpu PUBLIC BB_METAL_NATIVE_STAGE=${BB_METAL_NATIVE_STAGE})
 target_include_directories(bbgpu PRIVATE third_party/imgui third_party/imgui/backends)
 target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
     BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
@@ -176,65 +202,87 @@ target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-f
 if (APPLE)
     # bbport: one-frame Metal GPU capture (shim/bbport_gpu_capture.h).
     enable_language(OBJCXX)
-    # MetalFX temporal upscaling (shim/bbport_metalfx.h).
-    target_sources(bbgpu PRIVATE shim/bbport_gpu_capture.mm shim/bbport_metalfx.mm)
+    target_sources(bbgpu PRIVATE shim/bbport_gpu_capture.mm)
+    if (NOT BB_METAL_NATIVE_STAGE LESS 5)
+        # MetalFX temporal upscaling (shim/bbport_metalfx.h), used by the upscaler (M5).
+        target_sources(bbgpu PRIVATE shim/bbport_metalfx.mm)
+    endif()
     set_source_files_properties(shim/bbport_gpu_capture.mm shim/bbport_metalfx.mm
                                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-    # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe at load time.
-    target_link_options(bbgpu PRIVATE -Wl,-undefined,dynamic_lookup)
     target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_METAL_EXT)
-    if (BB_ARM64)
-        # Native Metal back end: SPIR-V -> MSL through SPIRV-Cross (deps/arm64, bootstrap_deps.sh).
-        find_package(spirv_cross_core CONFIG REQUIRED)
-        find_package(spirv_cross_glsl CONFIG REQUIRED)
-        find_package(spirv_cross_msl CONFIG REQUIRED)
-        # Metal-native core (docs/superpowers/plans/2026-10-16-metal-native-m2-scheduler-caches.md):
-        # device, encoder and helpers with no renderer dependencies; unit tests link it alone.
-        set(METAL_CORE_SOURCES
-            shadps4/video_core/renderer_metal/mtl_object.cpp
-            shadps4/video_core/renderer_metal/mtl_buffer.mm
-            shadps4/video_core/renderer_metal/mtl_compiled_shader.mm
-            shadps4/video_core/renderer_metal/mtl_device.mm
-            shadps4/video_core/renderer_metal/mtl_draw_core.mm
-            shadps4/video_core/renderer_metal/mtl_encoder.mm
-            shadps4/video_core/renderer_metal/mtl_depth_stencil.mm
-            shadps4/video_core/renderer_metal/mtl_render_pipeline.mm
-            shadps4/video_core/renderer_metal/mtl_specialize.cpp
-            shadps4/video_core/renderer_metal/mtl_texture.mm
-            shadps4/video_core/renderer_metal/mtl_timeline.cpp
-            shadps4/video_core/renderer_metal/vk_to_mtl.mm)
-        add_library(bbmetal_core STATIC ${METAL_CORE_SOURCES})
-        target_include_directories(bbmetal_core PRIVATE shim shadps4 ${SHADER_INCLUDE})
-        target_compile_features(bbmetal_core PRIVATE cxx_std_20)
-        target_link_libraries(bbmetal_core PRIVATE fmt::fmt)
-        set_target_properties(bbmetal_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
-        foreach(source IN LISTS METAL_CORE_SOURCES)
-            if (source MATCHES "\\.mm$")
-                set_source_files_properties(${source} TARGET_DIRECTORY bbmetal_core PROPERTIES
-                    COMPILE_OPTIONS "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
-            endif()
-        endforeach()
-        file(GLOB METAL_SOURCES CONFIGURE_DEPENDS shadps4/video_core/renderer_metal/*.cpp
-             shadps4/video_core/renderer_metal/*.mm)
-        list(REMOVE_ITEM METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_object.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_buffer.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_compiled_shader.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_device.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_draw_core.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_encoder.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_depth_stencil.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_render_pipeline.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_specialize.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_texture.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_timeline.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/vk_to_mtl.mm)
-        target_sources(bbgpu PRIVATE ${METAL_SOURCES})
-        target_link_libraries(bbgpu PRIVATE bbmetal_core "-framework Metal" "-framework Foundation")
-        foreach(source IN LISTS METAL_SOURCES)
-            if (source MATCHES "\\.mm$")
-                # No Vulkan Metal-surface types here: under ARC their CAMetalLayer pointer breaks
-                # vulkan.hpp's constexpr templates.
-                set_source_files_properties(${source} PROPERTIES COMPILE_OPTIONS
-                    "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
-            endif()
-        endforeach()
-        target_link_libraries(bbgpu PRIVATE spirv-cross-msl spirv-cross-glsl spirv-cross-core)
-        target_compile_definitions(bbgpu PRIVATE BB_METAL_BACKEND=1)
-    endif()
+    # The runtime's symbols resolve against the executable at load time (bb-probe, src/runtime*.c;
+    # bbgpu-host, host/host_runtime.c); anything else left undefined is a link error (ld's
+    # default: it warns that an explicit -undefined error is deprecated).
+    set(BB_HOST_RUNTIME_SYMBOLS
+        runtime_disabled_optimizations runtime_errno runtime_fault_recover
+        runtime_file_translate runtime_game_cpu_since_last runtime_memory_clamp
+        runtime_memory_gpu_protect runtime_memory_read_backing runtime_memory_region
+        runtime_memory_set_gpu_hooks runtime_memory_write_backing
+        runtime_process_time_counter runtime_process_time_us runtime_restart
+        runtime_thread_attach_host runtime_thread_clear_blocked runtime_thread_cpu_ns
+        runtime_thread_set_blocked runtime_tsc_frequency)
+    foreach(symbol IN LISTS BB_HOST_RUNTIME_SYMBOLS)
+        target_link_options(bbgpu PRIVATE -Wl,-U,_${symbol})
+    endforeach()
+    # Classic lazy binding, as with -undefined dynamic_lookup before: a runtime function binds at
+    # its first call, so test programs that define only the ones they use still load (chained
+    # fixups bind every symbol at load time).
+    target_link_options(bbgpu PRIVATE -Wl,-no_fixup_chains)
+    # The Metal renderer: SPIR-V -> MSL through SPIRV-Cross (deps/<arch>, bootstrap_deps.sh). The
+    # x86-64 library compiles it too (split mode never runs it there) until M7 trims that library
+    # to the remote shim.
+    find_package(spirv_cross_core CONFIG REQUIRED)
+    find_package(spirv_cross_glsl CONFIG REQUIRED)
+    find_package(spirv_cross_msl CONFIG REQUIRED)
+    # Metal-native core (docs/superpowers/plans/2026-10-16-metal-native-m2-scheduler-caches.md):
+    # device, encoder and helpers with no renderer dependencies; unit tests link it alone.
+    set(METAL_CORE_SOURCES
+        shadps4/video_core/renderer_metal/mtl_object.cpp
+        shadps4/video_core/renderer_metal/mtl_buffer.mm
+        shadps4/video_core/renderer_metal/mtl_compiled_shader.mm
+        shadps4/video_core/renderer_metal/mtl_device.mm
+        shadps4/video_core/renderer_metal/mtl_draw_core.mm
+        shadps4/video_core/renderer_metal/mtl_encoder.mm
+        shadps4/video_core/renderer_metal/mtl_depth_stencil.mm
+        shadps4/video_core/renderer_metal/mtl_render_pipeline.mm
+        shadps4/video_core/renderer_metal/mtl_specialize.cpp
+        shadps4/video_core/renderer_metal/mtl_texture.mm
+        shadps4/video_core/renderer_metal/mtl_timeline.cpp
+        shadps4/video_core/renderer_metal/vk_to_mtl.mm)
+    add_library(bbmetal_core STATIC ${METAL_CORE_SOURCES})
+    target_include_directories(bbmetal_core PRIVATE shim shadps4 ${SHADER_INCLUDE})
+    target_compile_features(bbmetal_core PRIVATE cxx_std_20)
+    target_link_libraries(bbmetal_core PRIVATE fmt::fmt)
+    set_target_properties(bbmetal_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    foreach(source IN LISTS METAL_CORE_SOURCES)
+        if (source MATCHES "\\.mm$")
+            set_source_files_properties(${source} TARGET_DIRECTORY bbmetal_core PROPERTIES
+                COMPILE_OPTIONS "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
+        endif()
+    endforeach()
+    file(GLOB METAL_SOURCES CONFIGURE_DEPENDS shadps4/video_core/renderer_metal/*.cpp
+         shadps4/video_core/renderer_metal/*.mm)
+    list(REMOVE_ITEM METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_object.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_buffer.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_compiled_shader.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_device.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_draw_core.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_encoder.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_depth_stencil.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_render_pipeline.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_specialize.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_texture.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_timeline.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/vk_to_mtl.mm)
+    target_sources(bbgpu PRIVATE ${METAL_SOURCES})
+    target_link_libraries(bbgpu PRIVATE bbmetal_core "-framework Metal" "-framework Foundation")
+    foreach(source IN LISTS METAL_SOURCES)
+        if (source MATCHES "\\.mm$")
+            # No Vulkan Metal-surface types here: under ARC their CAMetalLayer pointer breaks
+            # vulkan.hpp's constexpr templates.
+            set_source_files_properties(${source} PROPERTIES COMPILE_OPTIONS
+                "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
+        endif()
+    endforeach()
+    target_link_libraries(bbgpu PRIVATE spirv-cross-msl spirv-cross-glsl spirv-cross-core)
+    target_compile_definitions(bbgpu PRIVATE BB_METAL_BACKEND=1)
 else()
     # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
-target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
+if (NOT BB_METAL_NATIVE_STAGE LESS 5)
+    # FSR 3.1 and FSR 4 (the temporal upscaler, M5; FSR 3.1 on Metal in M6).
+    target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
+endif()
 if (APPLE)
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
         tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz ${BB_ZYDIS} sirit
@@ -263,19 +311,27 @@ target_compile_options(scene-resolution-test PRIVATE -UNDEBUG -fPIC)
 set_source_files_properties(../tests/test_scene_resolution.cpp PROPERTIES
     COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
 target_link_libraries(scene-resolution-test PRIVATE bbgpu)
-add_executable(taa-shader-test EXCLUDE_FROM_ALL ../tests/test_taa_shader.cpp ../tests/test_gpu_runtime_stubs.cpp)
-target_include_directories(taa-shader-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
-target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)
-set_source_files_properties(../tests/test_taa_shader.cpp PROPERTIES
-    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
-target_link_libraries(taa-shader-test PRIVATE bbgpu)
-add_dependencies(taa-shader-test host_shaders)
+# The library finds the runtime stand-ins (tests/test_gpu_runtime_stubs.cpp) in the executable:
+# keep LTO from internalizing them.
+target_link_options(scene-resolution-test PRIVATE -Wl,-export_dynamic)
+target_link_options(motion-shader-test PRIVATE -Wl,-export_dynamic)
+# These two create a Vulkan instance (vk_instance.cpp leaves the build below stage 7); the
+# upscaler milestone (M5) ports them to Metal.
+if (NOT BB_METAL_NATIVE_STAGE LESS 7)
+    add_executable(taa-shader-test EXCLUDE_FROM_ALL ../tests/test_taa_shader.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(taa-shader-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
+    target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)
+    set_source_files_properties(../tests/test_taa_shader.cpp PROPERTIES
+        COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+    target_link_libraries(taa-shader-test PRIVATE bbgpu)
+    add_dependencies(taa-shader-test host_shaders)
 
-add_executable(camera-motion-test EXCLUDE_FROM_ALL ../tests/test_camera_motion.cpp ../tests/test_gpu_runtime_stubs.cpp)
-target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
-target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
-target_link_libraries(camera-motion-test PRIVATE bbgpu)
-add_dependencies(camera-motion-test host_shaders)
+    add_executable(camera-motion-test EXCLUDE_FROM_ALL ../tests/test_camera_motion.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
+    target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
+    target_link_libraries(camera-motion-test PRIVATE bbgpu)
+    add_dependencies(camera-motion-test host_shaders)
+endif()
 
 # bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp

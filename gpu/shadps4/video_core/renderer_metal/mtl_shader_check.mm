@@ -1,112 +1,139 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: Metal back end M1 check (docs/DESIGN_METAL_BACKEND.md): every SPIR-V module of a shader
-// cache directory (<user>/cache/<title>/*.spv) through SPIRV-Cross -> MSL -> MTLFunction.
-// `bbgpu-host --msl-check <dir> [msl-cache-dir]`.
-
-#import <Metal/Metal.h>
+// bbport: the pipeline check of the Metal-native renderer: every pipeline of a stored pipeline
+// cache (<user>/cache/<title>/: PipelineKey, shader metadata and SPIR-V blobs) built through the
+// pipeline cache the renderer uses (Vulkan::PipelineCache -> Metal::PipelineFactory), graphics and
+// compute. Reads the cache only; the MSL cache and binary archive go to a scratch directory.
+// `bbgpu-host --msl-check <cache dir> [msl-cache-dir]`.
 
 #include <algorithm>
-#include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
-#include <vector>
+#include "shader_recompiler/profile.h"
+#include "video_core/cache_storage.h"
 #include "video_core/renderer_metal/mtl_device.h"
-#include "video_core/renderer_metal/mtl_shader.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace {
 
-struct Totals {
-    std::atomic<unsigned> ok[7]{}, failed[7]{}, skipped[7]{};
+/// Pipelines Metal cannot build by design: their draws are skipped, with one logged error each
+/// (the reasons PipelineFactory::BuildGraphics gives, mtl_pipeline_build.mm).
+constexpr std::array<std::string_view, 3> kUnsupported{
+    "quad lists have no Metal pipeline",
+    "the clip-distance emulation fragment shader has no Metal form",
+    "tessellation with a geometry shader has no Metal path", // LsHsEsGs
 };
+
+enum Kind : u32 { Compute, Plain, RectList, Tessellation, Geometry, NumKinds };
+constexpr std::array<const char*, NumKinds> kKindNames{"compute", "graphics", "rect list",
+                                                       "tessellation", "geometry"};
+
+Kind KindOf(const Vulkan::Pipeline& pipeline) {
+    using Shader::SwStage;
+    if (pipeline.IsCompute()) {
+        return Compute;
+    }
+    const auto& key = static_cast<const Vulkan::GraphicsPipeline&>(pipeline).GetKey();
+    if (key.stage_hashes[u32(SwStage::TessellationControl)] ||
+        key.stage_hashes[u32(SwStage::TessellationEval)]) {
+        return Tessellation;
+    }
+    if (key.stage_hashes[u32(SwStage::Geometry)]) {
+        return Geometry;
+    }
+    return key.prim_type == AmdGpu::PrimitiveType::RectList ? RectList : Plain;
+}
+
+/// The buffer cache's page shift in the stored profile (the stored SPIR-V was translated with it;
+/// it is not translated again here), else the game's 16 KiB.
+u32 StoredPageShift(const std::filesystem::path& dir) {
+    Shader::Profile stored{};
+    std::ifstream in(dir / "profile.bin", std::ios::binary | std::ios::ate);
+    if (in && in.tellg() == std::streamoff(sizeof(stored))) {
+        in.seekg(0);
+        if (in.read(reinterpret_cast<char*>(&stored), sizeof(stored))) {
+            return stored.sparse_page_shift;
+        }
+    }
+    return 14;
+}
 
 } // namespace
 
-extern "C" int bbgpu_msl_check(const char* spv_dir, const char* msl_cache_dir) {
+extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir) {
     namespace fs = std::filesystem;
-    std::vector<fs::path> files;
     std::error_code ec;
-    for (const auto& entry : fs::directory_iterator(spv_dir, ec)) {
-        if (entry.path().extension() == ".spv") {
-            files.push_back(entry.path());
-        }
-    }
-    if (ec || files.empty()) {
-        std::printf("MSL check: no .spv files in %s\n", spv_dir);
+    if (!fs::is_directory(cache_dir, ec)) {
+        std::printf("MSL check: %s is not a pipeline cache directory\n", cache_dir);
         return 2;
     }
-    std::sort(files.begin(), files.end());
+    // As many creation threads as the module check used (the game uses 4).
+    const unsigned threads = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 16u);
+    setenv("BB_PIPELINE_THREADS", std::to_string(threads).c_str(), 0);
+
     Metal::Device device;
-    fs::path cache = msl_cache_dir && *msl_cache_dir ? fs::path{msl_cache_dir}
-                                                      : fs::temp_directory_path() / "bb-msl-check";
-    fs::remove_all(cache, ec); // measure real compiles, not cache hits
-    fs::create_directories(cache, ec);
-    Metal::ShaderCompiler compiler{device, cache};
-    Totals totals;
-    std::atomic<size_t> next{0};
-    std::mutex print_mutex;
+    const fs::path scratch = msl_cache_dir && *msl_cache_dir
+                                 ? fs::path{msl_cache_dir}
+                                 : fs::temp_directory_path() / "bb-msl-check";
+    fs::remove_all(scratch, ec); // measure real compiles, not cache hits
+    fs::create_directories(scratch, ec);
+
+    Storage::DataBase::Instance().OpenReadOnly(cache_dir);
+    std::array<unsigned, NumKinds> built{}, failed{}, unsupported{};
+    Vulkan::PipelineCache::StoredReport report{};
     unsigned printed = 0;
     const auto start = std::chrono::steady_clock::now();
-    auto worker = [&] {
-        for (size_t i; (i = next.fetch_add(1)) < files.size();) {
-            std::ifstream in(files[i], std::ios::binary);
-            std::vector<char> bytes((std::istreambuf_iterator<char>(in)), {});
-            std::vector<u32> words(bytes.size() / 4);
-            std::memcpy(words.data(), bytes.data(), words.size() * 4);
-            const auto stage = Metal::ReadShaderStage(words);
-            const unsigned s = unsigned(stage);
-            // Tessellation stages and geometry shaders compile as variants of a draw (M4); the
-            // plain vertex, fragment and compute stages are what M1/M2 need first.
-            if (stage == Metal::ShaderStage::TessellationControl ||
-                stage == Metal::ShaderStage::TessellationEval ||
-                stage == Metal::ShaderStage::Geometry) {
-                ++totals.skipped[s];
-                continue;
+    {
+        Vulkan::Scheduler scheduler{device, false};
+        Vulkan::PipelineCache pipelines{device, scheduler, StoredPageShift(cache_dir), scratch};
+        report = pipelines.LoadStored();
+        pipelines.ForEachPipeline([&](const Vulkan::Pipeline& pipeline) {
+            const Kind kind = KindOf(pipeline);
+            if (!pipeline.Failed()) {
+                ++built[kind];
+                return;
             }
-            const std::string name = files[i].stem().string();
-            const u64 hash = std::strtoull(name.c_str(), nullptr, 16);
-            const auto result = compiler.Compile(words, hash, name);
-            if (result.status == Metal::CompileStatus::Ok) {
-                ++totals.ok[s];
-            } else {
-                ++totals.failed[s];
-                std::scoped_lock lock{print_mutex};
-                if (printed++ < 20) {
-                    std::printf("MSL check: FAILED %s (%s): %s\n", name.c_str(),
-                                Metal::ShaderStageName(stage), result.error.c_str());
-                }
+            const std::string& why = pipeline.FailureReason();
+            if (std::ranges::find(kUnsupported, std::string_view{why}) != kUnsupported.end()) {
+                ++unsupported[kind];
+                return;
             }
-        }
-    };
-    std::vector<std::thread> threads;
-    const unsigned n = std::max(1u, std::thread::hardware_concurrency() / 2);
-    for (unsigned t = 0; t < n; ++t) {
-        threads.emplace_back(worker);
-    }
-    for (auto& t : threads) {
-        t.join();
-    }
-    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    unsigned ok = 0, failed = 0, skipped = 0;
-    std::printf("MSL check on %s: %zu modules, %.1f s on %u threads\n", device.Name().c_str(),
-                files.size(), seconds, n);
-    for (unsigned s = 0; s < 7; ++s) {
-        if (totals.ok[s] + totals.failed[s] + totals.skipped[s] == 0) {
+            ++failed[kind];
+            if (printed++ < 20) {
+                std::printf("MSL check: FAILED %s pipeline %s: %s\n", kKindNames[kind],
+                            pipeline.GetDebugString().c_str(), why.c_str());
+            }
+        });
+    } // the factory writes its binary archive into the scratch directory
+    Storage::DataBase::Instance().Close();
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    std::printf("MSL check on %s: %u pipeline keys in %s: %u loaded (%u in 0.4.0's format), "
+                "%u not loadable, %u of an older format, %u duplicates; %.1f s on %u threads\n",
+                device.Name().c_str(), report.keys, cache_dir, report.loaded, report.legacy,
+                report.not_loaded, report.old_format, report.duplicates, seconds, threads);
+    unsigned total_built = 0, total_failed = 0, total_unsupported = 0;
+    for (u32 k = 0; k < NumKinds; ++k) {
+        if (built[k] + failed[k] + unsupported[k] == 0) {
             continue;
         }
-        std::printf("  %-12s compiled %4u, failed %4u, not yet (variants) %4u\n",
-                    Metal::ShaderStageName(Metal::ShaderStage(s)), totals.ok[s].load(),
-                    totals.failed[s].load(), totals.skipped[s].load());
-        ok += totals.ok[s];
-        failed += totals.failed[s];
-        skipped += totals.skipped[s];
+        std::printf("  %-12s built %4u, failed %4u, unsupported in Metal (logged, skipped) %4u\n",
+                    kKindNames[k], built[k], failed[k], unsupported[k]);
+        total_built += built[k];
+        total_failed += failed[k];
+        total_unsupported += unsupported[k];
     }
-    std::printf("%s: MSL check, %u compiled, %u failed, %u left for tessellation/geometry variants\n",
-                failed ? "FAIL" : "PASS", ok, failed, skipped);
-    return failed ? 1 : 0;
+    const bool pass = total_failed == 0 && report.loaded > 0;
+    std::printf("%s: MSL check, %u pipelines built, %u failed, %u unsupported in Metal (logged)\n",
+                pass ? "PASS" : "FAIL", total_built, total_failed, total_unsupported);
+    return pass ? 0 : 1;
 }

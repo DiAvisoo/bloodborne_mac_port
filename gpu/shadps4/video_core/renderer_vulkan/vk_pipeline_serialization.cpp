@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include "common/hash.h"
 #include "common/serdes.h"
@@ -16,6 +17,9 @@ namespace Serialization {
 static constexpr u32 ShaderBinaryVersion = 8u; // bbport: Metal shader profile (native Metal)
 static constexpr u32 ShaderMetaVersion = 9u; // bbport: no NoContraction in FS/CS
 static constexpr u32 PipelineKeyVersion = 7u; // bbport: Metal vertex attributes (native Metal)
+// bbport: the previous versions (0.4.0, MoltenVK), read by PipelineCache::LoadStored only.
+static constexpr u32 LegacyShaderBinaryVersion = 7u;
+static constexpr u32 LegacyPipelineKeyVersion = 6u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -94,7 +98,7 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
                     std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
-                    Shader::StageSpecialization& spec, size_t& perm_idx) {
+                    Shader::StageSpecialization& spec, size_t& perm_idx, bool legacy) {
     Serialization::Reader meta{ar};
 
     u32 meta_version{};
@@ -105,7 +109,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion) {
+    if (binary_version != (legacy ? Serialization::LegacyShaderBinaryVersion
+                                  : Serialization::ShaderBinaryVersion)) {
         return false;
     }
 
@@ -224,11 +229,47 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     return true;
 }
 
+namespace {
+/// bbport: the vertex attributes of a previous-version blob: 0.4.0 stored its Vulkan vertex input
+/// state raw (GetVertexInputs: one binding per attribute, binding = location, in fetch order).
+bool ReadLegacyVertexAttributes(Serialization::Archive& ar,
+                                VertexInputs<VertexAttribute>& out_attributes) {
+    VertexInputs<vk::VertexInputAttributeDescription> attributes;
+    VertexInputs<vk::VertexInputBindingDescription> bindings;
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    Serialization::Reader sdata{ar};
+    sdata.Read(&attributes, sizeof(attributes));
+    sdata.Read(&bindings, sizeof(bindings));
+    sdata.Read(&divisors, sizeof(divisors));
+    // The multisample state and auxiliary tessellation shaders that follow are not needed.
+    if (attributes.size() > MaxVertexBufferCount || bindings.size() > MaxVertexBufferCount ||
+        divisors.size() > MaxVertexBufferCount) {
+        return false;
+    }
+    out_attributes.clear();
+    for (const auto& attribute : attributes) {
+        const auto binding = std::ranges::find(bindings, attribute.binding,
+                                               &vk::VertexInputBindingDescription::binding);
+        const auto divisor =
+            std::ranges::find(divisors, attribute.binding,
+                              &vk::VertexInputBindingDivisorDescriptionEXT::binding);
+        out_attributes.push_back(VertexAttribute{
+            .location = attribute.location,
+            .per_instance = binding != bindings.end() &&
+                            binding->inputRate == vk::VertexInputRate::eInstance,
+            .divisor = divisor != divisors.end() ? divisor->divisor : 1,
+        });
+    }
+    return true;
+}
+} // namespace
+
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     sel.graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
-    if (!sdata.Deserialize(ar)) {
+    if (loading_legacy ? !ReadLegacyVertexAttributes(ar, sdata.vertex_attributes)
+                       : !sdata.Deserialize(ar)) {
         return false;
     }
 
@@ -275,7 +316,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, sel.fetch_shader, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, program->info, sel.fetch_shader, spec, perm_idx, loading_legacy)) {
         return false;
     }
     // bbport: a permutation's SPIR-V numbers its resources from the bindings of the stages before
@@ -441,6 +482,65 @@ void PipelineCache::WarmUp() {
     }
 
     Storage::DataBase::Instance().FinishPreload();
+}
+
+PipelineCache::StoredReport PipelineCache::LoadStored() {
+    StoredReport report{};
+    Storage::DataBase::Instance().ForEachBlob(
+        Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+            ++report.keys;
+            Serialization::Archive ar{std::move(data)};
+            Serialization::Reader pldata{ar};
+            u32 version{};
+            pldata.Read(version);
+            if (version != Serialization::PipelineKeyVersion &&
+                version != Serialization::LegacyPipelineKeyVersion) {
+                ++report.old_format;
+                return;
+            }
+            loading_legacy = version == Serialization::LegacyPipelineKeyVersion;
+            u32 is_compute{};
+            pldata.Read(is_compute);
+            // A key stored twice (a blob of each version) is loaded once.
+            Serialization::Archive peek = ar;
+            bool duplicate;
+            if (is_compute) {
+                ComputePipelineKey key{};
+                key.Deserialize(peek);
+                duplicate = compute_pipelines.contains(key);
+            } else {
+                GraphicsPipelineKey key{};
+                key.Deserialize(peek);
+                duplicate = graphics_pipelines.contains(key);
+            }
+            if (duplicate) {
+                ++report.duplicates;
+                return;
+            }
+            if (is_compute ? LoadComputePipeline(ar) : LoadGraphicsPipeline(ar)) {
+                ++report.loaded;
+                report.legacy += loading_legacy ? 1 : 0;
+            } else {
+                ++report.not_loaded;
+            }
+            // A failed load leaves stages selected: the next pipeline starts clean.
+            sel.infos.fill(nullptr);
+            sel.modules.fill(nullptr);
+            sel.fetch_shader.reset();
+        });
+    loading_legacy = false;
+    return report;
+}
+
+void PipelineCache::ForEachPipeline(const std::function<void(const Pipeline&)>& func) {
+    for (const auto& [key, pipeline] : compute_pipelines) {
+        pipeline->WaitReady();
+        func(*pipeline);
+    }
+    for (const auto& [key, pipeline] : graphics_pipelines) {
+        pipeline->WaitReady();
+        func(*pipeline);
+    }
 }
 
 void PipelineCache::Sync() {

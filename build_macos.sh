@@ -14,6 +14,9 @@ export MACOSX_DEPLOYMENT_TARGET=15.0
 if [[ ! -f $PREFIX/.built-MoltenVK ]]; then
     echo 'x86-64 dependencies missing: run bash scripts/macos/bootstrap_deps.sh' >&2; exit 1
 fi
+if [[ ! -f $PREFIX/.built-SPIRV-Cross ]]; then # the Metal renderer, in both libraries since M3
+    echo 'x86-64 SPIRV-Cross missing: run bash scripts/macos/bootstrap_deps.sh again' >&2; exit 1
+fi
 for tool in cmake ninja glslang pkg-config; do
     command -v $tool >/dev/null || { echo "Missing $tool (brew install cmake ninja glslang pkgconf)" >&2; exit 1; }
 done
@@ -138,8 +141,15 @@ if [[ ${1:-} == --test ]]; then
         out/mtl-draw-test
         MTL_DEBUG_LAYER=1 out/mtl-draw-test
     fi
-    # Metal back end M1: every cached game shader through SPIRV-Cross -> MSL -> MTLFunction (needs
-    # a shader cache from a game run; BB_MSL_CHECK_DIR picks another one).
+    # Metal-native M3: scene targets (scaled copies, depth resample, stencil export) through the
+    # linked arm64 library; again writing stencil one bit at a time.
+    if [[ -f out/gpu-arm64/libbbgpu.dylib ]]; then
+        ninja -C out/gpu-arm64 scene-resolution-test >/dev/null
+        out/gpu-arm64/scene-resolution-test 2>&1 | grep -E 'PASS|FAIL'
+        BB_SCENE_STENCIL_BITS=1 out/gpu-arm64/scene-resolution-test 2>&1 | grep -E 'PASS|FAIL'
+    fi
+    # Metal-native M3: every pipeline of a stored pipeline cache built through the renderer's
+    # pipeline cache (needs a cache from a game run; BB_MSL_CHECK_DIR picks another one).
     msl_dir=${BB_MSL_CHECK_DIR:-out/macdata/user/cache/CUSA03173}
     if [[ -x out/bbgpu-host && -d $msl_dir ]]; then
         out/bbgpu-host --msl-check "$msl_dir" 2>&1 | grep -E '^(PASS|FAIL|MSL check: FAILED)'

@@ -27,6 +27,9 @@ public:
     }
 
     void Open();
+    /// bbport (`--msl-check`): the unarchived cache in `dir`, for reading only: Save and Clear do
+    /// nothing until Close.
+    void OpenReadOnly(const std::filesystem::path& dir);
     void Close();
     [[nodiscard]] bool IsOpened() const {
         return opened;
@@ -50,6 +53,7 @@ private:
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
     bool opened{};
+    bool read_only{};
 };
 
 } // namespace Storage

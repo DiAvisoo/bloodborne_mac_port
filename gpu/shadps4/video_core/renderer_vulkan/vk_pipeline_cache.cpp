@@ -325,6 +325,11 @@ PipelineCache::PipelineCache(Metal::Device& device, Scheduler& scheduler_,
     WarmUp();
 }
 
+PipelineCache::PipelineCache(Metal::Device& device, Scheduler& scheduler_, u32 sparse_page_shift,
+                             std::filesystem::path metal_cache_dir)
+    : scheduler{scheduler_}, liverpool{nullptr}, profile{MetalProfile(device, sparse_page_shift)},
+      factory{std::make_unique<Metal::PipelineFactory>(device, std::move(metal_cache_dir))} {}
+
 PipelineCache::~PipelineCache() {
     PipelineBuilder::Drain(); // builds still running use the factory and the pipelines
 }

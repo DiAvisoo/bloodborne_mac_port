@@ -31,7 +31,7 @@ on `master`, 0.4.0, which the user plays). The branch is allowed to be broken fr
 |---|---|---|---|---|
 | M1 | `…-m1-device-encoder.md` | `Metal::Object`, Device with ticks (`MTLSharedEvent`) and limits, `Metal::Encoder` (native-typed, from `mtl_frame`'s state machine) | `renderer_metal/mtl_object.*`, `mtl_device.*`, `mtl_encoder.*`, `tests/test_mtl_encoder.mm` | Unit test passes; old path still builds and runs — **done** (2026-10-16) |
 | M2 | `…-m2-scheduler-caches.md` | Scheduler on the Encoder (`Record(lambda(Metal::Encoder&))`, recorder thread, host copies, hoisting); caches on Metal: `Buffer`/`UniqueBuffer`, guest arena (private `MTLBuffer`), staging, `Image`/`ImageView`/`Sampler`, `mtl_runtime` transfers, detile kernels, fault parser, blit helper; layouts/barriers deleted; sparse code deleted | `vk_scheduler.*`→`mtl_scheduler.*`, `buffer_cache/`, `texture_cache/`, `vk_runtime`→`mtl_runtime`, `vk_staging_buffer_pool` | Builds (library may not link the old rasterizer); staging/copy unit test; detile kernels equal the CPU detiler on sample tiles — **done** (2026-10-16; vk_runtime.cpp compiles except the M3 header vk_scene_resolution.h) |
-| M3 | written after M2 | Pipelines (`mtl_pso_cache`, `mtl_shader`, binary archive, background compiles, `shader_compile` modes); rasterizer, draw prep, shader HLE, scene resolution on the Encoder; tessellation runs and geometry emulation moved from `mtl_frame`; `mtl_vk_layer`, `mtl_shadow`, `mtl_frame` deleted | `vk_pipeline_cache`, `vk_graphics_pipeline`, `vk_compute_pipeline`, `vk_pipeline_serialization`, `vk_rasterizer`, `vk_draw_prep`, `vk_shader_hle`, `vk_scene_resolution` | `bbgpu-host --msl-check` builds every cached pipeline through the new cache |
+| M3 | written after M2 | Pipelines (`mtl_pso_cache`, `mtl_shader`, binary archive, background compiles, `shader_compile` modes); rasterizer, draw prep, shader HLE, scene resolution on the Encoder; tessellation runs and geometry emulation moved from `mtl_frame`; `mtl_vk_layer`, `mtl_shadow`, `mtl_frame` deleted | `vk_pipeline_cache`, `vk_graphics_pipeline`, `vk_compute_pipeline`, `vk_pipeline_serialization`, `vk_rasterizer`, `vk_draw_prep`, `vk_shader_hle`, `vk_scene_resolution` | `bbgpu-host --msl-check` builds every cached pipeline through the new cache — **done** (2026-10-16; 644 of 645 stored pipelines built, 0 failures; the library links with undefined-symbol errors, M4–M7 files stand in through `gpu/shim/stubs_m3.*`) |
 | M4 | written after M3 | Presenter on `CAMetalLayer` (2 drawables, `displaySyncEnabled`, fps cap, Retina), post-process pass; first light | `vk_presenter`, `vk_swapchain`, `host_passes/pp_pass`, `gpu/shim/bbgpu.cpp` | Title screen correct at 60 FPS; a save loads |
 | M5 | written after M4 | ImGui on Metal, MetalFX direct, TAA, camera/object motion, frame capture, GPU time stats; gameplay parity | `gpu/shim/bbport_overlay.cpp`, `bbport_metalfx.mm`, `vk_temporal_upscaler`, `vk_camera_motion`, `vk_object_motion`, `vk_frame_capture` | Three test scenes match 0.4.0; 15-min walks; `MTL_DEBUG_LAYER=1` clean |
 | M6 | written after M5 | FSR 3.1 through a Metal `FfxInterface` back end (AMD's SPIR-V → MSL) | `gpu/shim/ffx_metal/`, `host_passes/fsr_pass` | FSR picture matches 0.4.0; ≥ 107 FPS at 1080p Quality |
@@ -79,30 +79,62 @@ For M5 (fidelity/performance):
 - `BlitHelper` is owned by `Runtime` only; `TextureCache` no longer has one.
 - `Image` no longer has `aspect_mask`; buffer_cache/texture_cache derive it from `props.is_depth`.
 
-For the M3 plan, external consumers still on the old API:
-- Rasterizer: `Handle()` x13, `image_view` x5 (2483, 2491, 2901, 2964, 3035), `GetSampler` (2582,
-  now returns `void*`), `Transit` x8 -> `AccessImage(image, write)`, `AccessBuffer` x8;
-  `IsBufferAccessed` callers 1249, 1255, 1411, 1844, 1907, 2097, 2192; `backing` (2491).
-- Shader HLE: `IsBufferAccessed` 107-108.
-- `Runtime::CopyBuffer`/`FillBuffer` take `const Buffer&` (callers pass pointers today).
-- Scene resolution: `vk_scene_resolution.h` uses `VideoCore::UniqueImage` (does not exist);
-  `GetImage` 161-162, `Transit` x2, `aspect_mask` x10, `usage_flags`/`supported_samples` x3,
-  `backing` x6. This is the only error left in `vk_runtime.cpp`.
-- Upscaler: `GetImage` x5, `Transit` x9, `usage_flags`/`supported_samples` x7, `backing` x2.
-- Camera motion: `Transit` 290-292, usage/samples, `backing` x2. Object motion `image_view` 204;
-  post-process pass `image_view` 199; presenter `image_view` 416, `Transit` 418.
-- `Runtime` uses `GetImage` x10 and `aspect_mask` x10 internally (done) and buffer_cache 726.
-- `RenderAttachment` gained `clear_stencil` and dropped `num_layers`; viewports go through
-  `RasterUtil::ToMetalViewport`.
-- `GetWorkSemaphore` residue in pipeline_cache, constant_ring, presenter. The presenter's three
-  schedulers share one device with per-scheduler timelines.
+Resolved in M3: the rasterizer, shader HLE and scene resolution consumers moved to the new API
+(`Handle()`, `image_view`, `GetSampler`, `Transit` -> `AccessImage`, `IsBufferAccessed`,
+`Runtime::CopyBuffer`/`FillBuffer`, `VideoCore::UniqueImage`, `RenderAttachment`,
+`RasterUtil::ToMetalViewport`); `FrontAndBack` cull skips the draw (`DrawState::cull_all`);
+`RenderAttachment::clear_value` is value-initialised; every rasterizer image path calls
+`Runtime::AccessImage`.
 
-For the M3 plan, from the M2 final review:
-- The presenter and other consumers of the draw scheduler's frame must order after it on the
-  GPU: `Timeline::DeviceTickOf(logical)` + `Encoder::WaitForDeviceTick(tick)`, or `Flush` the
-  draw scheduler first. The tick must already be committed (one queue starts command buffers in
-  commit order: a wait for a later commit never ends; `WaitForDeviceTick` asserts it).
-- `FrontAndBack` cull must discard the draw (Metal has no such cull mode).
-- Value-initialise `RenderAttachment::clear_value`.
-- Every rasterizer image path must call `Runtime::AccessImage`: `FlushBarriers` no longer runs
-  `BeforeImageAccess`.
+Still open, for the milestones that convert these files:
+- Upscaler (M5): `GetImage` x5, `Transit` x9, `usage_flags`/`supported_samples` x7, `backing` x2;
+  `SceneTargets::Read(id, info)` lost its Vulkan stage/access parameters (vk_temporal_upscaler.cpp
+  ~856).
+- Camera motion (M5): `Transit` 290-292, usage/samples, `backing` x2. Object motion (M5)
+  `image_view` 204. Post-process pass (M4) `image_view` 199; presenter (M4) `image_view` 416,
+  `Transit` 418; `GetWorkSemaphore` residue in the presenter.
+
+## Open items carried from M3 (2026-10-16)
+
+M4 inputs (the presenter):
+- **Replace the presenter stand-in**: `gpu/shim/stubs_m3.{h,cpp}` (its `BB_METAL_NATIVE_STAGE < 4`
+  part), the `< 4` gate in `vk_presenter.h`, and `BB_UNCONVERTED_4` in `gpu/CMakeLists.txt`
+  (vk_presenter, vk_swapchain, host_passes/pp_pass come back); then `BB_METAL_NATIVE_STAGE` 4.
+  The stand-in is headless: it owns `Metal::Device`, the draw `Scheduler` (threaded), `Runtime`
+  and the `Rasterizer`; `PrepareFrame` flushes the draw scheduler, `Present` does nothing.
+- **`Present` contract**: `PrepareFrame` runs on the thread recording into the draw scheduler (it
+  ends the frame there: flush); `Present` may run on the swap thread (`bb:Present`,
+  `separate_swap`), which must not record into or flush the draw scheduler. The presenter's own
+  command buffer orders after the frame through `Timeline::DeviceTickOf` +
+  `Encoder::WaitForDeviceTick` (the tick committed first) or by flushing the draw scheduler.
+- **`DirectEncoder`** (`Scheduler::DirectEncoder()`) for the presenter's blit/post pass on the
+  recording thread; the frame texture comes from the texture cache (`RegisterVideoOutSurface`
+  keeps its body in the stand-in).
+- **`CAMetalLayer`**: 2 drawables, `displaySyncEnabled`, fps cap, Retina (`BB_HIGH_DPI`);
+  `shim/window.cpp` already creates the SDL Metal view and hands its layer over as
+  `window_info.render_surface`. `bbgpu.cpp` still sets the `MVK_CONFIG_*` variables (harmless; M7
+  removes them).
+- **First light**: title screen at 60 FPS, a save loads (roadmap gate). The rasterizer's draw
+  path (draw helper, tessellation runs, indirect counts, prepared vertex inputs) and the
+  persistent pipeline-cache warm-up run for the first time in game then.
+
+Found by the M3 gate:
+- **Binary archive never written**: `PsoCache::Flush` fails to serialize the archive of the game's
+  pipelines ("expecting 'fragment' stage" / "missing 'vertex' stage in pipeline no. N", also with
+  one creation thread; leaving fragment-less pipelines out did not fix it). PSOs then always
+  compile from MSL (the MSL disk cache still works). Investigate in M4 (pipeline warm-up).
+- **0.4.0 caches**: the stored pipeline cache is key version 6 / shader binary version 7 (MoltenVK).
+  `--msl-check` reads it (vertex attributes from 0.4.0's Vulkan vertex input state); the game's
+  `WarmUp` treats it as an older format and clears it on the first M4 run (one full rebuild).
+- **Preloaded pipelines get no runtime info**: `LoadGraphicsPipeline` leaves
+  `sel.runtime_infos` unset, so the clip-distance-emulation check is skipped on warm-up (the
+  Metal profile never asks for the emulation, so nothing is lost today).
+- **Both libraries compile the Metal renderer** (the x86-64 one never runs it in split mode;
+  `bootstrap_deps.sh` builds SPIRV-Cross for x86-64 too). M7 trims the x86-64 library.
+- Vulkan-instance tests (`taa-shader-test`, `camera-motion-test`) are gated off below stage 7;
+  M5 ports them to Metal. `scene-resolution-test` and `motion-shader-test` build and pass.
+- Deferred minors from the M3 tasks (SDD ledger): debug labels across encoder breaks; one clamp
+  encoder per `DrawIndirectCount`; single viewport/scissor; hard-coded 16384 framebuffer and
+  restart constants (move to `Metal::Limits`); SPIR-V host shaders nothing includes any more
+  (`depth_resample*`, `ms_image_blit*`; `fs_tri_vert` goes with the post-process pass in M4);
+  `BlitShaders::Source` compiled twice (blit helper and scene targets).

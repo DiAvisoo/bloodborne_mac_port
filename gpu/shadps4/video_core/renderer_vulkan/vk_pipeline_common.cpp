@@ -55,6 +55,7 @@ void Pipeline::Fail(std::string_view kind, const std::string& debug_str, std::st
     // Each pipeline is built once: this is its only message.
     LOG_ERROR(Render_Vulkan, "{} pipeline {} not built ({}): its {} are skipped", kind, debug_str,
               why, is_compute ? "dispatches" : "draws");
+    failure = why;
     failed.store(true, std::memory_order_release);
 }
 
