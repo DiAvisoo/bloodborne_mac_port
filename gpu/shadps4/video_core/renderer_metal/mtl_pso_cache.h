@@ -12,8 +12,7 @@
 
 #include "common/types.h"
 #include "video_core/renderer_metal/mtl_shader.h"
-#include "video_core/renderer_vulkan/vk_compute_pipeline.h"
-#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_key.h"
 
 namespace Metal {
 
@@ -199,29 +198,6 @@ struct ComputePipeline {
     const CompiledShader* shader{};
 };
 
-/// The depth/stencil part that Vulkan sets dynamically (vk_rasterizer.cpp UpdateDepthStencilState):
-/// not in GraphicsPipelineKey, a separate MTLDepthStencilState. The stencil references are encoder
-/// state (setStencilFrontReferenceValue:backReferenceValue:), the depth bounds test does not exist
-/// in Metal. With the test disabled the compare op / ops are ignored (and zeroed by Normalize).
-struct DepthStencilKey {
-    struct Face {
-        vk::StencilOp fail_op{};
-        vk::StencilOp pass_op{};
-        vk::StencilOp depth_fail_op{};
-        vk::CompareOp compare_op{};
-        u8 compare_mask{0xff}; ///< the Vulkan compare mask (stencil is 8 bits)
-        u8 write_mask{0xff};
-        bool operator==(const Face&) const = default;
-    };
-    bool depth_test{};
-    bool depth_write{};
-    vk::CompareOp depth_compare{vk::CompareOp::eAlways};
-    bool stencil_test{};
-    Face front;
-    Face back;
-    bool operator==(const DepthStencilKey&) const = default;
-};
-
 /// The PSO builder (P3.2): Metal render/compute pipeline states from the pipeline cache core's
 /// keys (D2, D5, D7). Metal::PipelineCache (mtl_pipeline_cache.h) is the core's cache and owns one.
 /// Thread-safe: lookups take a shared lock; a miss builds the pipeline outside the lock (two
@@ -261,9 +237,6 @@ public:
                                                 const GeometryPipelineInput& input,
                                                 const CompiledShader* fs);
 
-    /// id<MTLDepthStencilState> (owned by the cache), nullptr on failure.
-    void* GetDepthStencilState(const DepthStencilKey& key);
-
     /// Writes the binary archive when pipelines were added since the last write (atomically:
     /// temp file + rename). Cheap to call when nothing changed; call it every few new pipelines
     /// and at shutdown (the destructor does).
@@ -275,7 +248,6 @@ public:
         std::atomic<u64> tessellation_pipelines{}; ///< distinct tessellation pipelines built (incl. failed)
         std::atomic<u64> geometry_pipelines{};     ///< distinct geometry pipelines built (incl. failed)
         std::atomic<u64> failures{};           ///< render + compute builds that failed
-        std::atomic<u64> depth_stencil_states{};
         std::atomic<u64> archive_hits{};       ///< pipelines taken from the binary archive
         std::atomic<u64> archive_adds{};
         /// Microseconds spent in the Metal pipeline-state calls.

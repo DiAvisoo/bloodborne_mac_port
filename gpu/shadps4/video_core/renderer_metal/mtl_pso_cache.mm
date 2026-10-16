@@ -131,20 +131,6 @@ struct ComputeMapHash {
     }
 };
 
-struct DepthStencilHash {
-    size_t operator()(const DepthStencilKey& k) const noexcept {
-        const auto face = [](const DepthStencilKey::Face& f) {
-            return (u64(f.fail_op) << 0) | (u64(f.pass_op) << 4) | (u64(f.depth_fail_op) << 8) |
-                   (u64(f.compare_op) << 12) | (u64(f.compare_mask) << 16) |
-                   (u64(f.write_mask) << 24);
-        };
-        const u64 data[3] = {u64(k.depth_test) | (u64(k.depth_write) << 1) |
-                                 (u64(k.depth_compare) << 2) | (u64(k.stencil_test) << 6),
-                             face(k.front), face(k.back)};
-        return XXH3_64bits(data, sizeof(data));
-    }
-};
-
 std::string StageHashes(const Vulkan::GraphicsPipelineKey& key) {
     return fmt::format("vs {:#x} fs {:#x}", key.stage_hashes[u32(Shader::SwStage::Vertex)],
                        key.stage_hashes[u32(Shader::SwStage::Fragment)]);
@@ -160,7 +146,6 @@ struct PsoCache::Impl {
     std::unordered_map<ComputeMapKey, std::unique_ptr<ComputePipeline>, ComputeMapHash> compute;
     std::unordered_map<TessMapKey, std::unique_ptr<TessellationPipeline>, TessMapHash> tessellation;
     std::unordered_map<GeometryMapKey, std::unique_ptr<GeometryPipeline>, GeometryMapHash> geometry;
-    std::unordered_map<DepthStencilKey, id<MTLDepthStencilState>, DepthStencilHash> depth_stencil;
 
     std::mutex debug_mutex; ///< BB_GS_DEBUG: the magenta fragment functions by source
     std::map<std::string, std::unique_ptr<CompiledShader>> debug_fragments;
@@ -1083,62 +1068,6 @@ const GeometryPipeline* PsoCache::GetGeometryPipeline(const Vulkan::GraphicsPipe
         }
     }
     return it->second->render ? it->second.get() : nullptr;
-}
-
-void* PsoCache::GetDepthStencilState(const DepthStencilKey& requested) {
-    // Ignored parts are zeroed so that equal states share one object.
-    DepthStencilKey key = requested;
-    if (!key.depth_test) {
-        key.depth_write = false;
-        key.depth_compare = vk::CompareOp::eAlways;
-    }
-    if (!key.stencil_test) {
-        key.front = {};
-        key.back = {};
-    }
-    {
-        std::shared_lock lock{impl->mutex};
-        const auto it = impl->depth_stencil.find(key);
-        if (it != impl->depth_stencil.end()) {
-            return (__bridge void*)it->second;
-        }
-    }
-    @autoreleasepool {
-        MTLDepthStencilDescriptor* desc = [MTLDepthStencilDescriptor new];
-        desc.depthCompareFunction = static_cast<MTLCompareFunction>(
-            key.depth_test ? VkToMtl::CompareFunction(key.depth_compare) : MTLCompareFunctionAlways);
-        desc.depthWriteEnabled = key.depth_test && key.depth_write;
-        if (key.stencil_test) {
-            const auto make = [](const DepthStencilKey::Face& f) {
-                MTLStencilDescriptor* s = [MTLStencilDescriptor new];
-                s.stencilCompareFunction =
-                    static_cast<MTLCompareFunction>(VkToMtl::CompareFunction(f.compare_op));
-                s.stencilFailureOperation =
-                    static_cast<MTLStencilOperation>(VkToMtl::StencilOp(f.fail_op));
-                s.depthFailureOperation =
-                    static_cast<MTLStencilOperation>(VkToMtl::StencilOp(f.depth_fail_op));
-                s.depthStencilPassOperation =
-                    static_cast<MTLStencilOperation>(VkToMtl::StencilOp(f.pass_op));
-                s.readMask = f.compare_mask;
-                s.writeMask = f.write_mask;
-                return s;
-            };
-            desc.frontFaceStencil = make(key.front);
-            desc.backFaceStencil = make(key.back);
-        }
-        id<MTLDepthStencilState> state = [impl->mtl_device newDepthStencilStateWithDescriptor:desc];
-        if (!state) {
-            LOG_ERROR(Render, "Metal depth-stencil state could not be created");
-            ++counters.failures;
-            return nullptr;
-        }
-        std::unique_lock lock{impl->mutex};
-        const auto [it, inserted] = impl->depth_stencil.try_emplace(key, state);
-        if (inserted) {
-            ++counters.depth_stencil_states;
-        }
-        return (__bridge void*)it->second;
-    }
 }
 
 } // namespace Metal

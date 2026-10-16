@@ -16,6 +16,7 @@
 #include "common/path_util.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_depth_stencil.h"
 #include "video_core/renderer_metal/mtl_pso_cache.h"
 #include "video_core/renderer_metal/mtl_shader.h"
 #include "video_core/renderer_metal/mtl_specialize.h"
@@ -48,6 +49,7 @@ struct State {
     std::filesystem::path dir;
     Metal::ShaderCompiler compiler;
     Metal::PsoCache pso;
+    Metal::DepthStencilCache depth_stencil{device};
     Metal::Geometry::PassThroughCache pass_through{device};
     std::mutex mutex;
     std::unordered_map<u64, std::shared_ptr<std::vector<u32>>> spirv; ///< by VkShaderModule
@@ -214,7 +216,7 @@ const Metal::ComputePipeline* FindCompute(VkPipeline pipeline) {
 }
 
 void* DepthStencil(const Metal::DepthStencilKey& key) {
-    return Get().pso.GetDepthStencilState(key);
+    return Get().depth_stencil.Get(key);
 }
 
 const Metal::Geometry::IndirectKernels* GeometryIndirectKernels() {

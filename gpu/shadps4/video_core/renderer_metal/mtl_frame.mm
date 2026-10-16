@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include "video_core/renderer_metal/mtl_frame.h"
 #include <vulkan/vulkan_metal.h>
+#include "video_core/renderer_metal/mtl_depth_stencil.h"
 #include "video_core/renderer_metal/mtl_pso_cache.h"
 #include "video_core/renderer_metal/mtl_raster_util.h"
 #include "video_core/renderer_metal/mtl_shader.h"
@@ -470,23 +471,29 @@ bool PrepareDraw(Owned& o) {
     }
 
     // Depth and stencil.
+    // (mtl_depth_stencil.h's key: u8 Vulkan enum values. Ignored parts are zeroed so equal
+    // states share one object, as the removed PsoCache::GetDepthStencilState did.)
     Metal::DepthStencilKey ds;
     ds.depth_test = depth_test && p.depth_pixel_format;
-    ds.depth_write = depth_write && p.depth_pixel_format;
-    ds.depth_compare = vk::CompareOp(depth_compare);
+    if (ds.depth_test) {
+        ds.depth_write = depth_write;
+        ds.depth_compare = u8(depth_compare);
+    }
     ds.stencil_test = stencil_test && p.stencil_pixel_format;
-    const auto face = [](const Owned::Face& f) {
-        Metal::DepthStencilKey::Face out;
-        out.fail_op = vk::StencilOp(f.fail);
-        out.pass_op = vk::StencilOp(f.pass);
-        out.depth_fail_op = vk::StencilOp(f.depth_fail);
-        out.compare_op = vk::CompareOp(f.compare);
-        out.compare_mask = u8(f.compare_mask);
-        out.write_mask = u8(f.write_mask);
-        return out;
-    };
-    ds.front = face(o.front);
-    ds.back = face(o.back);
+    if (ds.stencil_test) {
+        const auto face = [](const Owned::Face& f) {
+            Metal::StencilFace out;
+            out.fail = u8(f.fail);
+            out.pass = u8(f.pass);
+            out.depth_fail = u8(f.depth_fail);
+            out.compare = u8(f.compare);
+            out.read_mask = u8(f.compare_mask);
+            out.write_mask = u8(f.write_mask);
+            return out;
+        };
+        ds.front = face(o.front);
+        ds.back = face(o.back);
+    }
     if (void* state = MetalShadow::DepthStencil(ds); state && c.depth_stencil != state) {
         c.depth_stencil = state;
         [enc setDepthStencilState:(__bridge id<MTLDepthStencilState>)state];
