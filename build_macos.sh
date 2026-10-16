@@ -123,6 +123,15 @@ if [[ ${1:-} == --test ]]; then
         out/metal-interop-test
         MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=2 out/metal-interop-test
     fi
+    # Metal-native M1: Metal::Object, Device ticks and limits, Metal::Encoder (arm64, no window);
+    # again under Metal's validation layer.
+    if [[ -f out/gpu-arm64/libbbgpu.dylib ]]; then
+        /usr/bin/clang++ -arch arm64 -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -std=c++20 -fobjc-arc -O2 -g \
+            -Wall -Wextra -Werror -Igpu/shadps4 tests/test_mtl_encoder.mm -Lout/gpu-arm64 -lbbgpu \
+            -Wl,-rpath,"$ROOT/out/gpu-arm64" -framework Metal -framework Foundation -o out/mtl-encoder-test
+        out/mtl-encoder-test
+        MTL_DEBUG_LAYER=1 out/mtl-encoder-test
+    fi
     # Metal back end M1: every cached game shader through SPIRV-Cross -> MSL -> MTLFunction (needs
     # a shader cache from a game run; BB_MSL_CHECK_DIR picks another one).
     msl_dir=${BB_MSL_CHECK_DIR:-out/macdata/user/cache/CUSA03173}
