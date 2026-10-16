@@ -908,3 +908,17 @@ show none.
   arena is not counted. 0 images freed.
 - **vblank 480 Hz** in the stats is by design (`BB_VBLANK_HZ=0` for the uncapped preset; the
   frame limit stays 60 here) and is the same on 0.4.0.
+
+### M4 final-review fixes (2026-10-16 late, M4 Max, split mode)
+
+- **Minimise:** the bbgpu-host window minimised (System Events `AXMinimized`) for 20 s in the city
+  (`cages-20261016` save) and restored. With the fix (presents skipped while SDL reports the window
+  minimised, hidden or occluded) Frame stats kept printing at **60.0 FPS while minimised** and
+  60.0 FPS (worst 16.7 ms) after restore; the picture after restore is correct
+  (scratchpad `res/fix-min-a.png`). One ~1 s hitch at the moment of minimising (spike log:
+  present 1011.9 ms): the present already inside `nextDrawable` when the Dock animation began.
+- **Exit flush of the binary archive:** archive deleted, the window closed 5 s after the renderer
+  started (before the writer's first 10 s write): `Metal binary archive: wrote 258 pipelines in
+  575 ms` then `Exit: pipeline archive flushed in 575 ms`; the file exists after the exit. The next
+  run: **234 from the binary archive, 0 compiled**. Before the fix the host's `_exit` skipped
+  this write. Archive writes of 258 pipelines take 575–1009 ms here.
