@@ -384,6 +384,10 @@ bool Runs::DrawIndirect(Encoder& e, const DrawPipeline& p, const DrawState& s, c
 
 void Runs::QueuePatchDraw(const DrawPipeline& p, const DrawState& s, const Resources& r,
                           const PatchDraw& patch) {
+    // The tessellation render pipeline is built without vertex attributes (PsoCache::
+    // GetTessellationPipeline: the evaluation function reads the kernels' scratch), so the
+    // deferred draw binds no vertex streams.
+    ASSERT_MSG(p.vertex_slots.empty(), "a patch draw pipeline with vertex attributes");
     Pending entry;
     entry.pipeline = p;
     entry.state = s;
@@ -397,6 +401,9 @@ void Runs::Flush(Encoder& e) {
     if (pending.empty()) {
         return;
     }
+    // Outside a pass every patch draw would be skipped (lost): the caller ended the pass or
+    // submitted without Runs::EndRenderPass / Runs::Submit.
+    ASSERT_MSG(e.InRenderPass(), "tessellated draws pending outside a render pass");
     std::vector<Pending> run = std::move(pending);
     pending.clear();
     for (const Pending& d : run) {
@@ -410,6 +417,20 @@ void Runs::Flush(Encoder& e) {
         e.SetBuffer(Stage::Vertex, kTessFactorBuffer, d.patch.factors);
         e.DrawPatches(d.patch.output_control_points, 0, d.patch.patches, {}, 1, 0);
     }
+}
+
+void Runs::EndRenderPass(Encoder& e) {
+    EndRun(e);
+    e.EndRenderPass();
+}
+
+u64 Runs::Submit(Encoder& e) {
+    if (e.InRenderPass()) {
+        EndRun(e);
+    }
+    const u64 tick = e.Submit();
+    Submitted(tick);
+    return tick;
 }
 
 bool Runs::Dispatch(Encoder& e, const ComputeView& c, std::span<const Bound> bound,

@@ -599,6 +599,56 @@ void TestTessellationFlushOrder() {
     Expect(device.ErrorCount() == 0, "tessellation runs ran without errors");
 }
 
+void TestRunWrappers() {
+    Device device;
+    Encoder encoder{device};
+    NullResources null_resources{device};
+    Runs runs{device, null_resources.Get()};
+    Shaders shaders;
+    id<MTLLibrary> library = Library(device);
+    id<MTLRenderPipelineState> patch_state = PatchPipeline(device, library); // (kept alive)
+    DrawPipeline patch_pipeline = View(patch_state, nullptr, &shaders.bound);
+    patch_pipeline.tessellation = true;
+    id<MTLBuffer> blue = ColorBuffer(device, kBlue);
+    const std::array<Bound, 1> blue_bound{Bound{Ref(blue), 16}};
+
+    // The patch's factors live in Runs scratch (as the kernels' output would).
+    const BufferRef scratch = runs.Scratch(encoder, 256);
+    id<MTLBuffer> factors = SharedBuffer(device, 16);
+    u16* f = static_cast<u16*>(factors.contents);
+    for (u32 i = 0; i < 6; ++i) {
+        f[i] = 0x3c00;
+    }
+    encoder.CopyBuffer(Ref(factors), {scratch.buffer, scratch.offset + 128}, 16);
+    PatchDraw patch;
+    patch.control = scratch;
+    patch.patch = {scratch.buffer, scratch.offset + 64};
+    patch.factors = {scratch.buffer, scratch.offset + 128};
+    patch.patches = 1;
+    patch.output_control_points = 4;
+
+    id<MTLTexture> target = Target(device);
+    encoder.BeginRenderPass(Pass(target));
+    runs.QueuePatchDraw(patch_pipeline, FullState(),
+                        Resources{blue_bound, {}, {}, {}, IndexType::U16}, patch);
+    runs.EndRenderPass(encoder); // flushes the run into this pass, then ends it
+    Expect(!runs.HasPending() && !encoder.InRenderPass(), "EndRenderPass flushed and ended");
+    id<MTLBuffer> out = Readback(device, encoder, target);
+    const u64 tick = runs.Submit(encoder);
+    Expect(tick != 0, "Submit returns the tick");
+    device.Wait(tick);
+    for (int i = 0; i < 1000 && !device.IsFree(tick); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Expect(Pixel(out, 10, 32) == kBlue && Pixel(out, 50, 32) == kBlack,
+           "the run's patch is drawn in the pass EndRenderPass ended");
+    const BufferRef again = runs.Scratch(encoder, 64);
+    Expect(again.buffer == scratch.buffer && again.offset == 0,
+           "Submit handed the patch scratch to its tick; it is recycled after completion");
+    device.Wait(encoder.Submit());
+    Expect(device.ErrorCount() == 0, "run wrappers ran without errors");
+}
+
 void TestScratchPool() {
     Device device;
     Encoder encoder{device};
@@ -651,6 +701,7 @@ int main() {
         TestSkippedDraws();
         TestIndirectDraws();
         TestTessellationFlushOrder();
+        TestRunWrappers();
         TestScratchPool();
         TestMaskDepthStencil();
     }

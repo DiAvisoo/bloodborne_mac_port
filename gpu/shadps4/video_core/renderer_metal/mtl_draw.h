@@ -211,8 +211,8 @@ struct PatchDraw {
 /// the end of the run of tessellated draws, so the kernels of a run share one compute pass and
 /// the patch draws one reopened render pass; each deferred draw keeps a copy of its state and
 /// bound slots. Every non-tessellated draw and dispatch here draws the waiting patches first;
-/// callers must call Flush() before anything else that needs them ordered: EndRenderPass,
-/// copies, clears, Submit.
+/// callers end passes and submit through EndRenderPass() / Submit() here (which flush first)
+/// and call Flush() before anything else that needs the run ordered (copies, clears).
 class Runs {
 public:
     Runs(Device& device, const Nulls& nulls);
@@ -227,10 +227,17 @@ public:
     bool DrawIndirect(Encoder& e, const DrawPipeline& p, const DrawState& s, const Resources& r,
                       const IndirectArgs& a);
     /// Queues a patch draw (whose kernels ran) for the end of the run: `s` and `r` are copied.
+    /// The pipeline must have no vertex slots (post-tessellation functions take no attributes;
+    /// asserted), so the vertex streams are not part of the copy.
     void QueuePatchDraw(const DrawPipeline& p, const DrawState& s, const Resources& r,
                         const PatchDraw& patch);
-    /// Encodes the waiting patch draws, in order, each with its own state and slots.
+    /// Encodes the waiting patch draws, in order, each with its own state and slots. Asserts that
+    /// a render pass is in progress when any are waiting.
     void Flush(Encoder& e);
+    /// Flush, then Encoder::EndRenderPass.
+    void EndRenderPass(Encoder& e);
+    /// Flush (inside a pass), Encoder::Submit, then Submitted() with its tick; returns the tick.
+    u64 Submit(Encoder& e);
     [[nodiscard]] bool HasPending() const noexcept {
         return !pending.empty();
     }
@@ -262,8 +269,8 @@ public:
     /// alive by the encoder's command buffer; chunks return to a pool once Submitted()'s tick is
     /// done.
     BufferRef Scratch(Encoder& e, u64 size);
-    /// Call after Encoder::Submit with its tick: the chunks used so far belong to it. Asserts
-    /// that no patch draw is pending.
+    /// Call after Encoder::Submit with its tick (Submit() does): the chunks used so far belong to
+    /// it. Asserts that no patch draw is pending.
     void Submitted(u64 device_tick);
 
     struct Counters {
