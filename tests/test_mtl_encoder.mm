@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include "video_core/renderer_metal/mtl_encoder.h"
 #include "video_core/renderer_metal/mtl_depth_stencil.h"
 #include "video_core/renderer_metal/mtl_specialize.h"
+#include "video_core/renderer_metal/mtl_timeline.h"
 
 namespace {
 
@@ -725,6 +727,85 @@ void TestDepthAspectCopy() {
 
 } // namespace
 
+/// Two schedulers' timelines on one device: each counts its own commits 1, 2, ... and a tick of
+/// one timeline means that timeline's command buffer, whatever the other committed in between.
+void TestTimelines() {
+    Metal::Device device;
+    Metal::Encoder enc_a{device}, enc_b{device};
+    Metal::Timeline a{device}, b{device};
+    Expect(a.CurrentTick() == 1 && b.CurrentTick() == 1 && a.KnownGpuTick() == 0,
+           "timelines start at 1");
+    Expect(a.IsFree(0), "tick 0 is always free");
+    Expect(!a.IsFree(1), "an uncommitted logical tick is not free");
+
+    id<MTLBuffer> buffer = SharedBuffer(device, 4096);
+    enc_a.FillBuffer(Ref(buffer), 4096, 0x01010101u);
+    const u64 a1 = a.Committed(enc_a.Submit());
+    enc_b.FillBuffer(Ref(buffer), 4096, 0x02020202u);
+    const u64 b1 = b.Committed(enc_b.Submit());
+    enc_b.FillBuffer(Ref(buffer), 4096, 0x03030303u);
+    const u64 b2 = b.Committed(enc_b.Submit());
+
+    // A's second command buffer waits for an event the CPU signals later.
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    id<MTLSharedEvent> gate = [dev newSharedEvent];
+    id<MTLCommandBuffer> gated = (__bridge id<MTLCommandBuffer>)enc_a.CommandBuffer();
+    [gated encodeWaitForEvent:gate value:1];
+    enc_a.FillBuffer(Ref(buffer), 4096, 0x04040404u);
+    const u64 a2 = a.Committed(enc_a.Submit());
+    Expect(a1 == 1 && a2 == 2 && b1 == 1 && b2 == 2, "each timeline numbers its own commits");
+    Expect(a.CurrentTick() == 3 && b.CurrentTick() == 3, "each timeline advances on its own");
+
+    b.Wait(b2);
+    Expect(b.IsFree(2) && b.KnownGpuTick() == 2, "B's tick 2 is its own second command buffer");
+    a.Wait(a1);
+    Expect(a.IsFree(1), "A's tick 1 done");
+    Expect(!a.IsFree(2), "A's tick 2 is A's gated command buffer, not B's completed one");
+    Expect(a.KnownGpuTick() == 1, "A knows only its own completed ticks");
+    Expect(!a.IsFree(3), "A's uncommitted tick is not free");
+
+    std::atomic<bool> waited{false};
+    std::thread waiter([&] {
+        a.Wait(a2);
+        waited.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Expect(!waited.load(), "Wait on A's tick 2 blocks while A's command buffer is gated");
+    gate.signaledValue = 1;
+    waiter.join();
+    Expect(gated.status == MTLCommandBufferStatusCompleted, "Wait returned after A's own buffer");
+    Expect(a.IsFree(2) && a.KnownGpuTick() == 2, "A's tick 2 done after the gate opened");
+
+    // Many commits, waited on out of order: pruning keeps every answer right and the map small.
+    u64 last_known = a.KnownGpuTick();
+    bool monotonic = true;
+    for (int i = 0; i < 300; ++i) {
+        enc_a.FillBuffer(Ref(buffer), 4096, u32(i & 0xff) * 0x01010101u);
+        a.Committed(enc_a.Submit());
+        if (i % 3 == 0) {
+            enc_b.FillBuffer(Ref(buffer), 4096, 0);
+            b.Committed(enc_b.Submit());
+        }
+        const u64 known = a.KnownGpuTick();
+        monotonic = monotonic && known >= last_known;
+        last_known = known;
+    }
+    Expect(monotonic, "KnownGpuTick never goes back");
+    Expect(a.CurrentTick() == 303 && b.CurrentTick() == 103, "ticks after many commits");
+    a.Wait(150);
+    Expect(a.IsFree(150), "a tick in the middle waited for");
+    a.Wait(302);
+    bool all_free = true;
+    for (u64 t = 0; t <= 302; ++t) {
+        all_free = all_free && a.IsFree(t);
+    }
+    Expect(all_free && a.KnownGpuTick() == 302, "every committed tick is free after the last");
+    Expect(!a.IsFree(303), "the next tick is still not free");
+    Expect(a.PendingCount() == 0, "completed mappings are dropped");
+    device.Finish();
+    Expect(b.KnownGpuTick() == 102 && b.PendingCount() == 0, "B's mappings pruned too");
+}
+
 int main() {
     @autoreleasepool {
         TestObject();
@@ -750,6 +831,7 @@ int main() {
         TestDepthAspectCopy();
         TestSpecialize();
         TestDepthStencilCache();
+        TestTimelines();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

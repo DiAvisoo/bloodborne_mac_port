@@ -34,6 +34,7 @@
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
 #include "video_core/renderer_metal/mtl_raster_util.h"
+#include "video_core/renderer_metal/mtl_timeline.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
@@ -812,14 +813,25 @@ public:
     /// DirectEncoder() calls that waited for a recording thread (BB_FRAME_STATS).
     static inline std::atomic<u64> direct_recordings{0};
 
-    /// The tick the next submission signals.
+    /// The tick this scheduler's next submission gets (its own timeline: other schedulers on
+    /// the device do not advance it).
     [[nodiscard]] u64 CurrentTick() const noexcept {
-        return device.CurrentTick();
+        return timeline.CurrentTick();
     }
 
-    /// Returns true when the GPU completed the command buffers up to `tick`.
+    /// Returns true when the GPU completed this scheduler's submissions up to `tick`.
     [[nodiscard]] bool IsFree(u64 tick) const {
-        return device.IsFree(tick);
+        return timeline.IsFree(tick);
+    }
+
+    /// The highest of this scheduler's ticks known complete.
+    [[nodiscard]] u64 KnownGpuTick() const {
+        return timeline.KnownGpuTick();
+    }
+
+    /// This scheduler's ticks, for tick users that are not the scheduler (staging, rings).
+    [[nodiscard]] Metal::Timeline& GetTimeline() noexcept {
+        return timeline;
     }
 
     [[nodiscard]] Metal::Device& GetDevice() noexcept {
@@ -857,12 +869,14 @@ private:
 
     void RecorderThread(std::stop_token stoken);
 
-    void SubmitExecution();
+    /// Returns the tick (of this scheduler's timeline) the submission got.
+    u64 SubmitExecution();
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
     Metal::Device& device;
+    Metal::Timeline timeline{device};
     Metal::Encoder encoder{device};
     /// bbport: this submission's hoisted copies, recorded on the calling thread while the
     /// recorder thread encodes into `encoder`.

@@ -442,10 +442,9 @@ void Scheduler::Flush() {
 
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
-    const u64 presubmit_tick = CurrentTick();
-    Flush();
+    const u64 tick = SubmitExecution();
     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
-    device.Wait(presubmit_tick);
+    timeline.Wait(tick);
 }
 
 void Scheduler::Wait(u64 tick) {
@@ -454,17 +453,17 @@ void Scheduler::Wait(u64 tick) {
         Flush();
     }
     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
-    device.Wait(tick);
+    timeline.Wait(tick);
 }
 
 void Scheduler::PopPendingOperations() {
     if (num_pending_ops.load(std::memory_order_acquire) == 0) {
         return; // every draw comes here
     }
-    // Reading the known GPU tick is an atomic load (Metal completion handlers raise it), so
-    // there is no polling limit.
+    // Checking a tick reads atomics that Metal completion handlers raise (no ioctl), so there is
+    // no polling limit.
     std::unique_lock lk(pending_ops_mutex);
-    while (!pending_ops.empty() && device.IsFree(pending_ops.front().gpu_tick)) {
+    while (!pending_ops.empty() && timeline.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
         num_pending_ops.fetch_sub(1, std::memory_order_release);
@@ -482,7 +481,7 @@ void Scheduler::RecordHoistedCopy(Metal::BufferRef src, Metal::BufferRef dst,
     }
 }
 
-void Scheduler::SubmitExecution() {
+u64 Scheduler::SubmitExecution() {
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = CurrentTick();
 
@@ -510,7 +509,7 @@ void Scheduler::SubmitExecution() {
 
     ImGui::Core::TextureManager::Submit(); // ImGui textures: M5
     const u64 submit_start = bbport::CpuCycles();
-    const u64 tick = encoder.Submit();
+    const u64 tick = timeline.Committed(encoder.Submit());
     BbStats::queue_submit_ns.fetch_add(bbport::CyclesToNs(bbport::CpuCycles() - submit_start),
                                        std::memory_order_relaxed);
     BbStats::queue_submits.fetch_add(1, std::memory_order_relaxed);
@@ -521,8 +520,9 @@ void Scheduler::SubmitExecution() {
     // A new command buffer starts without state (Encoder::Submit clears it): apply it again.
     dynamic_state.Invalidate();
 
-    // The priority-ops thread waits for ticks to be committed before waiting on the GPU; taking
-    // its mutex first means it is either before its check or already waiting (no lost wakeup).
+    // The priority-ops thread waits for its tick to be committed before waiting on the GPU;
+    // taking its mutex first means it is either before its check or already waiting (no lost
+    // wakeup).
     {
         std::scoped_lock ops_lock{priority_pending_ops_mutex};
     }
@@ -530,6 +530,7 @@ void Scheduler::SubmitExecution() {
 
     // Apply pending operations
     PopPendingOperations();
+    return tick;
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
@@ -549,18 +550,17 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             priority_pending_ops.pop();
         }
 
-        // Ticks are deferred before they are committed (Device::Wait needs a committed one);
-        // any scheduler's commit on the device may cover it, hence the timed re-check.
+        // Ticks are deferred before they are committed (Timeline::Wait needs a committed one);
+        // only this scheduler's own submission commits it, and it notifies.
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            while (op.gpu_tick >= device.CurrentTick() && !stoken.stop_requested()) {
-                priority_pending_ops_cv.wait_for(lk, std::chrono::milliseconds(1));
-            }
+            priority_pending_ops_cv.wait(lk, stoken,
+                                         [&] { return op.gpu_tick < timeline.CurrentTick(); });
         }
         if (stoken.stop_requested()) {
             break;
         }
-        device.Wait(op.gpu_tick);
+        timeline.Wait(op.gpu_tick);
         if (stoken.stop_requested()) {
             break;
         }
