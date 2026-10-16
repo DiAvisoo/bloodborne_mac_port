@@ -371,6 +371,12 @@ if (NOT "vk_camera_motion" IN_LIST BB_M5_PENDING)
     add_dependencies(camera-motion-test host_shaders)
 endif()
 
+# The depth attachment rule shared by the render pass and the pipeline key (header only).
+add_executable(depth-attachment-test EXCLUDE_FROM_ALL ../tests/test_depth_attachment.cpp)
+target_include_directories(depth-attachment-test PRIVATE shim shadps4)
+target_compile_options(depth-attachment-test PRIVATE -UNDEBUG)
+target_link_libraries(depth-attachment-test PRIVATE fmt::fmt)
+
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)

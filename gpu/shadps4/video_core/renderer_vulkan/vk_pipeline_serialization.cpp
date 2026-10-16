@@ -16,7 +16,9 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 8u; // bbport: Metal shader profile (native Metal)
 static constexpr u32 ShaderMetaVersion = 9u; // bbport: no NoContraction in FS/CS
-static constexpr u32 PipelineKeyVersion = 7u; // bbport: Metal vertex attributes (native Metal)
+// bbport: 7 Metal vertex attributes; 8 depth/stencil formats only while the pass binds the
+// depth buffer (Metal-native M5; a game's stored cache is rebuilt once).
+static constexpr u32 PipelineKeyVersion = 8u;
 // bbport: the previous versions (0.4.0, MoltenVK), read by PipelineCache::LoadStored only.
 static constexpr u32 LegacyShaderBinaryVersion = 7u;
 static constexpr u32 LegacyPipelineKeyVersion = 6u;

@@ -22,18 +22,15 @@ Each item: what was done for now, what the refinement is, and where it lives.
 ## 1. Stability
 
 - **Metal-native (M4 → M5): render pipelines declare a depth/stencil format the pass does not
-  bind.** `PipelineCache::RefreshGraphicsKey` takes `z_format`/`stencil_format` from
-  `DepthValid()`/`StencilValid()`, while the rasterizer binds the depth buffer only when depth or
-  stencil testing is enabled (`db_desc`, vk_rasterizer.cpp ~277). Metal's validation reports it
-  ~600 times a second ("renderPipelineState pixelFormat must be MTLPixelFormatInvalid, as no
-  texture is set"); without the layer it draws correctly. Fix: one rule for both (key the formats
-  on the same condition as the attachment, or bind the depth buffer whenever it is valid), then a
-  clean `MTL_DEBUG_LAYER=1` run (M5 gate). Pipeline keys change: one cache rebuild.
+  bind.** Fixed 2026-10-16 (M5 Task 3): `BoundDepthAttachment` (vk_depth_attachment.h) is the one
+  rule for the pass's depth attachment and the pipeline key's formats; `MTL_DEBUG_LAYER=1` title +
+  city run 96,721 messages → 0. Pipeline key version 8: one cache rebuild.
 - **Metal-native (M4 → M5): the figure in the cage at the Central Yharnam lamp is missing.**
   0.4.0 draws a creature behind the bars of the cage left of the lamp post (`cages-20261016`
   save, +40/+50 s after Cross); the Metal-native renderer shows the cage empty in both captures
   (scratchpad `t4-m-cages-*.png` vs `t4-w-cages-*.png`, 2026-10-16). Nothing is logged (no skipped
-  draw, failed pipeline or error). Start with a frame capture of that view on both.
+  draw, failed pipeline or error). Still missing with the depth-format fix above (2026-10-16), so
+  not that. Start with a frame capture of that view on both.
 - **Metal-native (M4): full-screen switch not checked while presenting.** A window resize
   (1200x900 points via System Events) refits with black bars and no stall (2026-10-16). The
   `BB_FULLSCREEN=1` start and the green-button switch were only tried with the screen locked

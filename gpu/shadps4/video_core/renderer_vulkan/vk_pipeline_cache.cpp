@@ -26,6 +26,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_depth_attachment.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_metal/mtl_device.h"
@@ -504,13 +505,14 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     const auto& regs = (*sel.regs);
     auto& key = sel.graphics_key;
 
-    const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
+    // bbport: the depth/stencil formats of the attachment the pass binds (vk_depth_attachment.h);
+    // a valid depth buffer with both tests off is not attached, and Metal requires the
+    // pipeline's formats to equal the pass's attachments.
+    const DepthAttachment depth_attachment = BoundDepthAttachment(regs);
+    const bool db_enabled = depth_attachment.Bound();
 
-    key.z_format = regs.depth_buffer.DepthValid() ? regs.depth_buffer.z_info.format
-                                                  : AmdGpu::DepthBuffer::ZFormat::Invalid;
-    key.stencil_format = regs.depth_buffer.StencilValid()
-                             ? regs.depth_buffer.stencil_info.format
-                             : AmdGpu::DepthBuffer::StencilFormat::Invalid;
+    key.z_format = depth_attachment.z_format;
+    key.stencil_format = depth_attachment.stencil_format;
     key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
     key.depth_clip_enable = regs.clipper_control.ZclipEnable();
     key.clip_space = regs.clipper_control.clip_space;
@@ -537,7 +539,7 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         }
         motion_possible = Shader::MotionVectors::positions_address != 0 && bound >= 5 &&
                           !regs.color_buffers[Shader::MotionVectors::Output] &&
-                          regs.depth_buffer.DepthValid() &&
+                          depth_attachment.HasDepth() &&
                           regs.depth_buffer.NumSamples() == 1 && !regs.IsClipDisabled() &&
                           regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs;
     }

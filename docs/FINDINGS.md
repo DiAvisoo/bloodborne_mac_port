@@ -922,3 +922,29 @@ show none.
   575 ms` then `Exit: pipeline archive flushed in 575 ms`; the file exists after the exit. The next
   run: **234 from the binary archive, 0 compiled**. Before the fix the host's `_exit` skipped
   this write. Archive writes of 258 pipelines take 575–1009 ms here.
+
+## 2026-10-16 night: Metal-native M5 Task 3, pipeline depth formats follow the bound depth buffer
+
+- **Fix:** `BoundDepthAttachment(regs)` (`renderer_vulkan/vk_depth_attachment.h`) is now the one
+  rule for the render pass's depth attachment (`Rasterizer::PrepareRenderState` binds the depth
+  buffer only while a depth or stencil test uses it; `RenderState` binds each valid aspect) and
+  the pipeline key's `z_format`/`stencil_format` (`RefreshGraphicsKey`, which also uses it for
+  `motion_possible` and the depth sample count). Every render pipeline, including the
+  geometry-shader and tessellation ones, is built from the key in one place
+  (`PsoCache`, mtl_pso_cache.mm), so they follow too. `depth-attachment-test` (11 cases) in
+  `build_macos.sh --test`.
+- **Validation (`MTL_DEBUG_LAYER=1`, nslog, `shot.sh`: title, Cross twice, cages save, 93 s):**
+  before **96,721** messages (~1,040/s; "For depth/stencil attachment, the renderPipelineState
+  pixelFormat must be MTLPixelFormatInvalid, as no texture is set", depth+stencil 94,963x, depth
+  only 1,668x); after **0** (only "Metal API Validation Enabled"). City 36 FPS under the layer in
+  both runs.
+- **Pipeline key version 7 → 8:** the stored pipeline cache is cleared once at the first start
+  (`227 pipelines of an older cache format: clearing the cache`, 846 files; 361 compiles at the
+  save load, worst frame 106 ms, then 60 FPS). The Metal binary archive (`<cache>/metal/`) is not
+  in the cleared directory and stays: that run took 173 pipelines from it and compiled 17 (the
+  pipelines that lost their depth format); the next run preloaded 183 of 184 with no archive
+  writes. msl-check is unaffected: the stored corpus (`$SP/archive-cache`) is in 0.4.0's v6
+  format, which it still reads (645 keys, 644 built, PASS).
+- **Caged figure (Central Yharnam lamp):** still missing after the fix (crop 950,1000 300x300 of
+  the +40/+50 s snapshots, scratchpad `res/t3-cmp2.png`, 0.4.0 vs M4 vs this). The depth-format
+  mismatch was not the cause; the diagnostics continue (M5 Task 11).

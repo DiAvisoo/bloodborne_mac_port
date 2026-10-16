@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_depth_attachment.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -274,8 +275,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         image.binding.is_target = 1u;
     }
 
-    if ((regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
-        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid())) {
+    // bbport: the pipeline key uses the same rule for its depth/stencil formats.
+    if (BoundDepthAttachment(regs).Bound()) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = DbExtent();
         auto& [image_id, desc] = db_desc;
@@ -2838,14 +2839,15 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
 
-        // The attachments match the pipeline's formats (PipelineCache::RefreshGraphicsKey):
-        // depth when the depth buffer is valid, stencil when its stencil is; a stencil without
-        // depth is bound as the stencil attachment only.
+        // The attachments match the pipeline's formats (PipelineCache::RefreshGraphicsKey): both
+        // come from BoundDepthAttachment (vk_depth_attachment.h). A stencil without depth is
+        // bound as the stencil attachment only.
+        const DepthAttachment bound = BoundDepthAttachment(regs);
         auto& attachment = state.depth;
         attachment = {};
         attachment.texture = image_view.Texture();
-        state.has_depth = regs.depth_buffer.DepthValid();
-        state.has_stencil = regs.depth_buffer.StencilValid();
+        state.has_depth = bound.HasDepth();
+        state.has_stencil = bound.HasStencil();
         state.stencil_only = state.has_stencil && !state.has_depth;
         if (state.has_depth) {
             attachment.clear = is_depth_clear;
