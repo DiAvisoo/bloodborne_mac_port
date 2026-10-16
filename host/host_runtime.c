@@ -276,6 +276,7 @@ static uint32_t protect_seq;
 static void game_alive_or_exit(void) {
     if (g_shared->game_pid > 0 && kill(g_shared->game_pid, 0) != 0) {
         say("bb-probe is gone (protect relay); exiting");
+        bbgpu_flush_caches(BBGPU_EXIT_FLUSH_MS);
         _exit(0);
     }
 }

@@ -410,6 +410,49 @@ extern "C" int bbgpu_init_remote(const BbGpuConfig* config, void* shared_block) 
 static s32 g_window_width, g_window_height;
 #endif
 
+// bbgpu-host (and bb-probe) end through _exit, which runs no destructors: the pipeline archive
+// is written here first. Every caller waits for the same flush (the first starts it on a thread
+// of its own), at most `timeout_ms`; a write cut short by the _exit that follows leaves the old
+// file intact.
+extern "C" int bbgpu_flush_caches(unsigned timeout_ms) {
+    struct State {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done{};
+        bool ok{true};
+    };
+    static State* const state = new State; // never destroyed: the flush thread may outlive exit
+    static std::once_flag once;
+    const auto start = std::chrono::steady_clock::now();
+    std::call_once(once, [] {
+        std::thread([] {
+            Common::SetCurrentThreadName("bb:ExitFlush");
+            const bool ok = presenter ? presenter->FlushPipelineArchive() : true;
+            {
+                std::scoped_lock lock{state->mutex};
+                state->done = true;
+                state->ok = ok;
+            }
+            state->cv.notify_all();
+        }).detach();
+    });
+    std::unique_lock lock{state->mutex};
+    const bool done = state->cv.wait_for(lock, std::chrono::milliseconds{timeout_ms},
+                                         [] { return state->done; });
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (!done) {
+        std::printf("Exit: the pipeline archive write did not finish within %u ms; exiting "
+                    "without it\n",
+                    timeout_ms);
+    } else {
+        std::printf("Exit: pipeline archive flushed in %.0f ms%s\n", ms,
+                    state->ok ? "" : " (the write failed)");
+    }
+    std::fflush(stdout);
+    return done ? (state->ok ? 0 : -1) : 1;
+}
+
 static void OpenWindow(const BbGpuConfig* config) {
     const std::string title = config->title ? config->title : "Bloodborne";
     const s32 width = config->width, height = config->height;
@@ -431,7 +474,7 @@ static void OpenWindow(const BbGpuConfig* config) {
             SDL_Delay(2);
         }
         LOG_INFO(Frontend, "Window closed by user");
-        std::fflush(stdout);
+        bbgpu_flush_caches(BBGPU_EXIT_FLUSH_MS);
         std::_Exit(0);
     };
 #endif
@@ -458,7 +501,7 @@ static void OpenWindow(const BbGpuConfig* config) {
             [](CFRunLoopTimerRef, void* ctx) {
                 if (!static_cast<Frontend::WindowSDL*>(ctx)->PollEvents()) {
                     LOG_INFO(Frontend, "Window closed by user");
-                    std::fflush(stdout);
+                    bbgpu_flush_caches(BBGPU_EXIT_FLUSH_MS);
                     std::_Exit(0);
                 }
             },

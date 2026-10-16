@@ -264,7 +264,8 @@ void PsoCache::WriterLoop() {
         if (impl->stop) {
             return;
         }
-        // Everything compiled until then goes into one write (the destructor writes the rest).
+        // Everything compiled until then goes into one write (the destructor or, in the GPU host,
+        // bbgpu_flush_caches writes the rest).
         const auto due = impl->last_write + kWriteInterval;
         if (impl->writer_cv.wait_until(lock, due, [&] { return impl->stop; })) {
             return;
@@ -294,6 +295,7 @@ bool PsoCache::WriteArchive() {
         descriptors = [impl->recorded copy];
         unwritten = impl->unwritten;
     }
+    const auto write_start = std::chrono::steady_clock::now();
     std::string error, first_add_error;
     u64 add_failures = 0;
     @autoreleasepool {
@@ -359,9 +361,13 @@ bool PsoCache::WriteArchive() {
     impl->unwritten -= unwritten;
     // One line per write (at most every kWriteInterval): whether the archive serves the
     // session (hits) or pipelines still compile.
-    std::printf("Metal binary archive: wrote %llu pipelines; this session %llu from the archive, "
-                "%llu compiled\n",
+    // The duration grows with the session's pipeline count (every write re-adds them all).
+    std::printf("Metal binary archive: wrote %llu pipelines in %.0f ms; this session %llu from the "
+                "archive, %llu compiled\n",
                 static_cast<unsigned long long>(descriptors.count - add_failures),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          write_start)
+                    .count(),
                 static_cast<unsigned long long>(counters.archive_hits.load()),
                 static_cast<unsigned long long>(counters.compiled.load()));
     std::fflush(stdout);

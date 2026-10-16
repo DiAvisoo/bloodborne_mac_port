@@ -16,6 +16,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
+#include "video_core/renderer_metal/mtl_pso_cache.h"
 #include "video_core/renderer_metal/mtl_texture.h"
 #include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -132,6 +133,10 @@ Presenter::~Presenter() {
     if (rasterizer) {
         rasterizer->GetPipelineCache().Sync();
     }
+}
+
+bool Presenter::FlushPipelineArchive() {
+    return rasterizer->GetPipelineCache().Psos().Flush();
 }
 
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {

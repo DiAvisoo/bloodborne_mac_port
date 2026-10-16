@@ -28,6 +28,11 @@ int bbgpu_host_start(const BbGpuConfig *config, void *shared);
 int bbgpu_host_fault(uint64_t address, int write);
 /* GPU host: asks the game to restart (the settings menu's Restart, through runtime_restart). */
 void bbgpu_split_post_restart(void);
+/* Before an _exit (no destructors run): writes the Metal pipeline archive if pipelines are
+ * pending, waiting at most timeout_ms (logged). Any thread, any number of times: every call waits
+ * for the same single flush. 0 written or nothing pending, -1 the write failed, 1 timed out. */
+int bbgpu_flush_caches(unsigned timeout_ms);
+#define BBGPU_EXIT_FLUSH_MS 5000u
 /* Metal back end check (arm64 host): compiles every .spv in spv_dir to Metal; 0 when all did. */
 int bbgpu_msl_check(const char *spv_dir, const char *msl_cache_dir);
 /* GPU host: runs one GnmDriver/VideoOut record from the submit ring (answers requests itself).

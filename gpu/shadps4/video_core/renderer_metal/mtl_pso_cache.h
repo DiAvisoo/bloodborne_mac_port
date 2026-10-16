@@ -236,8 +236,12 @@ public:
     /// left out. A crash loses at most the last ~10 s of compiled pipelines (plus the write in
     /// flight).
     ///
-    /// Flush: waits for a write in flight, then writes now if pipelines are pending (shutdown,
-    /// PipelineCache::Sync; the destructor does). False when the write failed.
+    /// Flush: waits for a write in flight, then writes now if pipelines are pending. False when
+    /// the write failed. The destructor and PipelineCache::Sync flush, but the GPU host
+    /// (bbgpu-host, the default split mode) ends through _exit and runs neither: it calls
+    /// bbgpu_flush_caches (bbgpu.h, Presenter::FlushPipelineArchive) on every exit path, which
+    /// runs Flush with a time bound. A write cut short by _exit leaves the old file intact
+    /// (temp file + rename).
     bool Flush();
 
     struct Counters {

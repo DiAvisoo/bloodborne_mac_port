@@ -55,6 +55,10 @@ public:
     Presenter(Frontend::WindowSDL& window, AmdGpu::Liverpool* liverpool);
     ~Presenter();
 
+    /// bbport: writes the Metal binary archive now if pipelines are pending (waits for a write
+    /// in flight); for exits through _exit, which skip ~Presenter. False when the write failed.
+    bool FlushPipelineArchive();
+
     HostPasses::PostProcessingPass::Settings& GetPPSettingsRef() {
         return pp_settings;
     }

@@ -12,6 +12,7 @@
 #include "host.h"
 #include "gpu/bbgpu.h"
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <execinfo.h>
@@ -53,11 +54,18 @@ static uint64_t entry_size;
 static pid_t parent_pid;
 static int started; /* renderer running (ring thread only) */
 
-/* The host has no state worth saving: once bb-probe is gone it ends at once. */
+/* The host ends through _exit (no destructors): only the pipeline archive is written first,
+ * with a time bound (bbgpu_flush_caches; a no-op before the renderer started). */
 static void finish(int code, const char *why) {
     say("exiting: %s", why);
     fflush(stdout);
+    bbgpu_flush_caches(BBGPU_EXIT_FLUSH_MS);
     _exit(code);
+}
+
+static void on_sigterm(void *unused) {
+    (void)unused;
+    finish(0, "SIGTERM");
 }
 
 /* ---- faults: GPU page tracking first, then recovery points (the SRT walker), else fatal ---- */
@@ -385,6 +393,12 @@ int main(int argc, char **argv) {
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGBUS, &action, NULL);
+    /* SIGTERM (bb-probe's stop_host, kill): exit through finish, off the signal handler. */
+    signal(SIGTERM, SIG_IGN);
+    dispatch_source_t term = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0,
+                                                    dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+    dispatch_source_set_event_handler_f(term, on_sigterm);
+    dispatch_resume(term);
 
     pthread_t thread;
     pthread_create(&thread, NULL, parent_watch, NULL);
