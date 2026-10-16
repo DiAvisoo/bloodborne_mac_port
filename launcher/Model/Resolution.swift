@@ -27,7 +27,7 @@ struct PixelSize: Hashable, CustomStringConvertible {
 enum Resolution {
     /// The in-game menu's output list (gpu/shim/bbport_settings.h OutputWidths / OutputHeights).
     static let outputs = [PixelSize(1280, 720), PixelSize(1920, 1080), PixelSize(2560, 1440),
-                          PixelSize(3840, 2160)]
+                          PixelSize(3456, 1944), PixelSize(3840, 2160)]
     static let defaultOutput = PixelSize(1920, 1080)
     /// Upscaler quality levels (bbport_settings.cpp PresetName / PresetScale).
     static let presetNames = ["Native AA", "Quality", "Balanced", "Performance", "Ultra Performance"]

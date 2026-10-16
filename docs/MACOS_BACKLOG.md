@@ -199,6 +199,11 @@ Each item: what was done for now, what the refinement is, and where it lives.
   0x263b246) instead of a clean exit. Only test runs with a timeout are affected; normal play
   has none. *Refinement:* find why the dump signal derails the interrupted guest thread
   (signal delivery under Rosetta with the guest stack/TLS) and exit cleanly.
+- **Visual glitches on the Metal renderer at 3456x1944 with MetalFX (user, 2026-10-16 morning).**
+  The user called it "very unstable" (visual glitches, kind not recorded). Its logs are clean (no
+  errors, no rejected pipelines, closed by the user); 75-s scripted walks in Central Yharnam on
+  Metal 3456, Metal 1440p and MoltenVK 3456 all looked correct. *Catch during testing:* keep
+  `BB_FRAME_STATS=1` on Metal test sessions and ask for a screenshot when it happens.
 - **Dog cage drawn as a see-through ghost (user, 2026-10-16, Central Yharnam).** Not the
   geometry-shader skip first suspected: at the nearest lamp the cages render fully on MoltenVK
   (camera sweep, `BB_FRAME_STATS`, 0 "Geometry shader stage unsupported" lines), so they are
