@@ -44,6 +44,24 @@ struct Binding {
 
 struct PendingPatch;
 
+/// What the open render encoder already has (set only on change; reset per encoder).
+struct EncoderCache {
+    void* pipeline{};
+    void* depth_stencil{};
+    u32 fill{~0u}, clip{~0u}, cull{~0u}, winding{~0u};
+    u64 viewport_hash{}, scissor_hash{};
+    u32 ref_front{~0u}, ref_back{~0u};
+    float bias[3]{-1.0f, -1.0f, -1.0f};
+    float blend[4]{-1.0f, -1.0f, -1.0f, -1.0f};
+    struct Slot {
+        void* object{};
+        u64 offset{};
+    };
+    std::array<Slot, 31> buffers[2]{};   ///< vertex, fragment
+    std::array<void*, 32> textures[2]{};
+    std::array<void*, 16> samplers[2]{};
+};
+
 /// What the frame encoder keeps for one owned command buffer.
 struct Owned {
     id<MTLCommandBuffer> cmd; ///< unretained references: the Vulkan objects keep resources alive
@@ -52,6 +70,7 @@ struct Owned {
     bool last_draw_tess{}; ///< the previous draw of this pass was tessellated (statistics)
     std::vector<PendingPatch> pending; ///< patch draws of the current tessellation run
     id<MTLRenderCommandEncoder> render;
+    EncoderCache cache; ///< of `render`
     id<MTLComputeCommandEncoder> compute;
     id<MTLBlitCommandEncoder> blit;
     unsigned commands{};

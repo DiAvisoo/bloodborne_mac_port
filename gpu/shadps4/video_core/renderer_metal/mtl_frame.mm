@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <dlfcn.h>
+#include <xxhash.h>
 #include <mach-o/dyld.h>
 #include <algorithm>
 #include <cstdio>
@@ -190,6 +191,7 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
     }
     o.render = [o.cmd renderCommandEncoderWithDescriptor:o.pass_opened ? o.pass : o.pass_first];
     o.pass_opened = true;
+    o.cache = {};
     if (o.render) {
         UseAddressBuffers(o.render, true);
     }
@@ -220,6 +222,23 @@ id<MTLBlitCommandEncoder> BlitEncoder(Owned& o) {
 enum class Stage { Vertex, Fragment, Compute };
 
 void SetBuffer(Owned& o, Stage stage, id<MTLBuffer> buffer, u64 offset, u32 index) {
+    if (stage != Stage::Compute && index < o.cache.buffers[0].size()) {
+        auto& slot = o.cache.buffers[stage == Stage::Fragment][index];
+        const void* object = (__bridge void*)buffer;
+        if (slot.object == object) {
+            if (slot.offset == offset) {
+                return;
+            }
+            slot.offset = offset;
+            if (stage == Stage::Vertex) {
+                [o.render setVertexBufferOffset:offset atIndex:index];
+            } else {
+                [o.render setFragmentBufferOffset:offset atIndex:index];
+            }
+            return;
+        }
+        slot = {(__bridge void*)buffer, offset};
+    }
     switch (stage) {
     case Stage::Vertex:
         [o.render setVertexBuffer:buffer offset:offset atIndex:index];
@@ -234,6 +253,9 @@ void SetBuffer(Owned& o, Stage stage, id<MTLBuffer> buffer, u64 offset, u32 inde
 }
 
 void SetBytes(Owned& o, Stage stage, const void* bytes, u64 length, u32 index) {
+    if (stage != Stage::Compute && index < o.cache.buffers[0].size()) {
+        o.cache.buffers[stage == Stage::Fragment][index] = {}; // bytes replace the buffer
+    }
     switch (stage) {
     case Stage::Vertex:
         [o.render setVertexBytes:bytes length:length atIndex:index];
@@ -248,6 +270,13 @@ void SetBytes(Owned& o, Stage stage, const void* bytes, u64 length, u32 index) {
 }
 
 void SetTexture(Owned& o, Stage stage, id<MTLTexture> texture, u32 index) {
+    if (stage != Stage::Compute && index < o.cache.textures[0].size()) {
+        void*& slot = o.cache.textures[stage == Stage::Fragment][index];
+        if (slot == (__bridge void*)texture) {
+            return;
+        }
+        slot = (__bridge void*)texture;
+    }
     switch (stage) {
     case Stage::Vertex:
         [o.render setVertexTexture:texture atIndex:index];
@@ -262,6 +291,13 @@ void SetTexture(Owned& o, Stage stage, id<MTLTexture> texture, u32 index) {
 }
 
 void SetSampler(Owned& o, Stage stage, id<MTLSamplerState> sampler, u32 index) {
+    if (stage != Stage::Compute && index < o.cache.samplers[0].size()) {
+        void*& slot = o.cache.samplers[stage == Stage::Fragment][index];
+        if (slot == (__bridge void*)sampler) {
+            return;
+        }
+        slot = (__bridge void*)sampler;
+    }
     switch (stage) {
     case Stage::Vertex:
         [o.render setVertexSamplerState:sampler atIndex:index];
@@ -372,12 +408,28 @@ bool PrepareDraw(Owned& o) {
         return false;
     }
     id<MTLRenderCommandEncoder> enc = o.render;
-    [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)p.state];
-    [enc setTriangleFillMode:MTLTriangleFillMode(p.fill_mode)];
-    [enc setDepthClipMode:p.depth_clip ? MTLDepthClipModeClip : MTLDepthClipModeClamp];
-    [enc setCullMode:MTLCullMode(cull.mode)];
-    [enc setFrontFacingWinding:MTLWinding(
-                                   Metal::RasterUtil::FrontWinding(vk::FrontFace(front_face)))];
+    auto& c = o.cache;
+    if (c.pipeline != p.state) {
+        c.pipeline = p.state;
+        [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)p.state];
+    }
+    if (c.fill != p.fill_mode) {
+        c.fill = p.fill_mode;
+        [enc setTriangleFillMode:MTLTriangleFillMode(p.fill_mode)];
+    }
+    if (c.clip != u32(p.depth_clip)) {
+        c.clip = u32(p.depth_clip);
+        [enc setDepthClipMode:p.depth_clip ? MTLDepthClipModeClip : MTLDepthClipModeClamp];
+    }
+    if (c.cull != cull.mode) {
+        c.cull = cull.mode;
+        [enc setCullMode:MTLCullMode(cull.mode)];
+    }
+    const u32 winding = Metal::RasterUtil::FrontWinding(vk::FrontFace(front_face));
+    if (c.winding != winding) {
+        c.winding = winding;
+        [enc setFrontFacingWinding:MTLWinding(winding)];
+    }
 
     // Viewports and scissors (Metal: negative-height viewports keep Vulkan's y; scissors clamped).
     std::array<MTLViewport, 16> viewports;
@@ -389,7 +441,11 @@ bool PrepareDraw(Owned& o) {
         viewports[i] = {m.origin_x, m.origin_y, m.width, m.height, m.znear, m.zfar};
     }
     if (nv) {
-        [enc setViewports:viewports.data() count:nv];
+        const u64 hash = XXH3_64bits(viewports.data(), sizeof(MTLViewport) * nv) ^ nv;
+        if (c.viewport_hash != hash) {
+            c.viewport_hash = hash;
+            [enc setViewports:viewports.data() count:nv];
+        }
     }
     std::array<MTLScissorRect, 16> scissors;
     const u32 ns = u32(std::min<size_t>(o.scissors.size(), scissors.size()));
@@ -405,7 +461,11 @@ bool PrepareDraw(Owned& o) {
         scissors[i] = {r.x, r.y, r.width, r.height};
     }
     if (ns) {
-        [enc setScissorRects:scissors.data() count:ns];
+        const u64 hash = XXH3_64bits(scissors.data(), sizeof(MTLScissorRect) * ns) ^ ns;
+        if (c.scissor_hash != hash) {
+            c.scissor_hash = hash;
+            [enc setScissorRects:scissors.data() count:ns];
+        }
     }
 
     // Depth and stencil.
@@ -426,21 +486,29 @@ bool PrepareDraw(Owned& o) {
     };
     ds.front = face(o.front);
     ds.back = face(o.back);
-    if (void* state = MetalShadow::DepthStencil(ds)) {
+    if (void* state = MetalShadow::DepthStencil(ds); state && c.depth_stencil != state) {
+        c.depth_stencil = state;
         [enc setDepthStencilState:(__bridge id<MTLDepthStencilState>)state];
     }
-    if (ds.stencil_test) {
+    if (ds.stencil_test && (c.ref_front != o.front.reference || c.ref_back != o.back.reference)) {
+        c.ref_front = o.front.reference;
+        c.ref_back = o.back.reference;
         [enc setStencilFrontReferenceValue:o.front.reference backReferenceValue:o.back.reference];
     }
-    if (depth_bias_enable) {
-        [enc setDepthBias:o.depth_bias[0] slopeScale:o.depth_bias[2] clamp:o.depth_bias[1]];
-    } else {
-        [enc setDepthBias:0 slopeScale:0 clamp:0];
+    const float bias[3] = {depth_bias_enable ? o.depth_bias[0] : 0.0f,
+                           depth_bias_enable ? o.depth_bias[1] : 0.0f,
+                           depth_bias_enable ? o.depth_bias[2] : 0.0f};
+    if (std::memcmp(c.bias, bias, sizeof bias) != 0) {
+        std::memcpy(c.bias, bias, sizeof bias);
+        [enc setDepthBias:bias[0] slopeScale:bias[2] clamp:bias[1]];
     }
-    [enc setBlendColorRed:o.blend_constants[0]
-                    green:o.blend_constants[1]
-                     blue:o.blend_constants[2]
-                    alpha:o.blend_constants[3]];
+    if (std::memcmp(c.blend, o.blend_constants, sizeof c.blend) != 0) {
+        std::memcpy(c.blend, o.blend_constants, sizeof c.blend);
+        [enc setBlendColorRed:o.blend_constants[0]
+                        green:o.blend_constants[1]
+                         blue:o.blend_constants[2]
+                        alpha:o.blend_constants[3]];
+    }
 
     // Resources and vertex buffers.
     BindStage(o, Stage::Vertex, p.vs, o.graphics_bindings);
@@ -460,6 +528,9 @@ bool PrepareDraw(Owned& o) {
                       offset:vb.buffer ? vb.offset : 0
              attributeStride:stride
                      atIndex:slot.slot];
+        if (slot.slot < c.buffers[0].size()) {
+            c.buffers[0][slot.slot] = {}; // set with a stride: not a plain cached binding
+        }
     }
     return true;
 }
@@ -1234,9 +1305,7 @@ void GeometryDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 vertex
     }
     for (const Chunk& chunk : chunks) {
         // The pass-through function reads the records at its buffer 0.
-        [o.render setVertexBuffer:chunk.buffer
-                           offset:chunk.offset + chunk.plan.record_offset
-                          atIndex:0];
+        SetBuffer(o, Stage::Vertex, chunk.buffer, chunk.offset + chunk.plan.record_offset, 0);
         [o.render drawIndexedPrimitives:MTLPrimitiveType(geo.render->primitive_type)
                              indexCount:u64(chunk.plan.prims) * geo.info.IndexSlots()
                               indexType:MTLIndexTypeUInt32
@@ -1264,9 +1333,9 @@ void FlushPending(Owned& o) {
             continue;
         }
         [o.render setTessellationFactorBuffer:p.scratch offset:p.factor_offset instanceStride:0];
-        [o.render setVertexBuffer:p.scratch offset:p.control_offset atIndex:Metal::kTessInputBuffer];
-        [o.render setVertexBuffer:p.scratch offset:p.patch_offset atIndex:Metal::kTessPatchBuffer];
-        [o.render setVertexBuffer:p.scratch offset:p.factor_offset atIndex:Metal::kTessFactorBuffer];
+        SetBuffer(o, Stage::Vertex, p.scratch, p.control_offset, Metal::kTessInputBuffer);
+        SetBuffer(o, Stage::Vertex, p.scratch, p.patch_offset, Metal::kTessPatchBuffer);
+        SetBuffer(o, Stage::Vertex, p.scratch, p.factor_offset, Metal::kTessFactorBuffer);
         [o.render drawPatches:p.output_control_points
                    patchStart:0
                    patchCount:p.patches
