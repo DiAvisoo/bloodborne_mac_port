@@ -66,6 +66,7 @@ struct Owned {
     // Scratch memory for tessellation (bump-allocated, kept until the GPU is done).
     id<MTLBuffer> scratch;
     u64 scratch_used{};
+    std::vector<id<MTLBuffer>> scratch_used_buffers; ///< back to the pool when the GPU is done
     u32 target_width{}, target_height{};
 
     // Bound state.
@@ -144,6 +145,10 @@ void EndEncoders(Owned& o);
 /// order): the GPU starts on the frame while the rest is recorded. Also hands `keep` to the
 /// committed one.
 void CommitChunk(Owned& o);
+
+/// Hands the command buffer's scratch buffers back to the pool once the GPU is done with it
+/// (before commit).
+void ReturnScratchWhenDone(Owned& o);
 
 // Resource bookkeeping from the device functions the layer sees.
 void SamplerCreated(VkSampler sampler, const VkSamplerCreateInfo* info);

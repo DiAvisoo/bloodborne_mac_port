@@ -35,6 +35,9 @@ id<MTLBuffer> null_buffer;
 id<MTLTexture> null_texture;
 id<MTLSamplerState> null_sampler;
 
+std::mutex scratch_pool_mutex;
+std::vector<id<MTLBuffer>> scratch_pool; ///< 8 MiB scratch buffers the GPU is done with
+
 std::mutex maps_mutex;
 std::unordered_map<VkSampler, id<MTLSamplerState>> samplers;
 std::unordered_map<VkImageView, id<MTLTexture>> views;
@@ -623,8 +626,26 @@ void EndEncoders(Owned& o) {
     }
 }
 
+void ReturnScratchWhenDone(Owned& o) {
+    if (o.scratch_used_buffers.empty()) {
+        return;
+    }
+    __block std::vector<id<MTLBuffer>> buffers = std::move(o.scratch_used_buffers);
+    o.scratch_used_buffers.clear();
+    [o.cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      std::scoped_lock lock{scratch_pool_mutex};
+      for (id<MTLBuffer> b : buffers) {
+          if (b.length == (8ull << 20) && scratch_pool.size() < 16) {
+              scratch_pool.push_back(b);
+          }
+      }
+      buffers.clear();
+    }];
+}
+
 void CommitChunk(Owned& o) {
     EndEncoders(o);
+    ReturnScratchWhenDone(o);
     if (!o.keep.empty()) {
         __block std::vector<id<MTLBuffer>> keep = std::move(o.keep);
         o.keep.clear();
@@ -1044,9 +1065,20 @@ std::pair<id<MTLBuffer>, u64> Scratch(Owned& o, u64 size) {
     constexpr u64 kChunk = 8ull << 20;
     size = (size + 15) & ~u64(15);
     if (!o.scratch || o.scratch_used + size > o.scratch.length) {
-        o.scratch = [device newBufferWithLength:std::max(kChunk, size)
-                                        options:MTLResourceStorageModePrivate];
-        o.keep.push_back(o.scratch);
+        // Reused across frames: fresh GPU memory is mapped on first use (a stall).
+        o.scratch = nil;
+        if (size <= kChunk) {
+            std::scoped_lock lock{scratch_pool_mutex};
+            if (!scratch_pool.empty()) {
+                o.scratch = scratch_pool.back();
+                scratch_pool.pop_back();
+            }
+        }
+        if (!o.scratch) {
+            o.scratch = [device newBufferWithLength:std::max(kChunk, size)
+                                            options:MTLResourceStorageModePrivate];
+        }
+        o.scratch_used_buffers.push_back(o.scratch);
         o.scratch_used = 0;
     }
     const u64 at = o.scratch_used;

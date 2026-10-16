@@ -243,6 +243,7 @@ void CommitOwned(uint32_t count, Get&& get) {
             ++owned_generation;
         }
         MetalFrame::EndEncoders(*o);
+        MetalFrame::ReturnScratchWhenDone(*o);
         if (!o->keep.empty()) {
             // Our temporary buffers live until the GPU is done with them.
             __block std::vector<id<MTLBuffer>> keep = std::move(o->keep);
