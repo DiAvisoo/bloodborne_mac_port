@@ -18,6 +18,7 @@
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_metal/mtl_pso_cache.h"
 #include "video_core/renderer_metal/mtl_shader.h"
+#include "video_core/renderer_metal/mtl_specialize.h"
 #include "video_core/renderer_metal/mtl_shadow.h"
 #include "video_core/renderer_metal/mtl_vk_layer.h"
 #include "video_core/renderer_metal/mtl_spirv_rectlist.h"
@@ -448,71 +449,6 @@ void Compute(const Vulkan::ComputePipelineKey& key, vk::ShaderModule module,
 namespace {
 thread_local int game_build_depth = 0;
 
-/// Fixes the SPIR-V specialization constants at the values given (or their defaults) and turns
-/// them into plain constants, so SPIRV-Cross emits no Metal function constants (a pipeline state
-/// would then need a specialized function): OpSpecConstant's literal, OpSpecConstantTrue/False by
-/// opcode, the SpecId decorations dropped. OpSpecConstantOp stays (none in the host shaders).
-std::vector<u32> Specialize(const std::vector<u32>& words, const VkSpecializationInfo* info) {
-    if (words.size() < 5) {
-        return words;
-    }
-    std::unordered_map<u32, u32> spec_ids; // result id -> SpecId
-    for (size_t i = 5; i < words.size();) {
-        const u32 count = words[i] >> 16, op = words[i] & 0xffff;
-        if (!count) {
-            break;
-        }
-        if (op == 71 && count >= 4 && words[i + 2] == 1) { // OpDecorate id SpecId n
-            spec_ids[words[i + 1]] = words[i + 3];
-        }
-        i += count;
-    }
-    std::vector<u32> out(words.begin(), words.begin() + 5);
-    out.reserve(words.size());
-    for (size_t i = 5; i < words.size();) {
-        const u32 count = words[i] >> 16, op = words[i] & 0xffff;
-        if (!count || i + count > words.size()) {
-            break;
-        }
-        if (op == 71 && count >= 4 && words[i + 2] == 1) {
-            i += count; // SpecId on what is now a plain constant
-            continue;
-        }
-        const size_t at = out.size();
-        out.insert(out.end(), words.begin() + i, words.begin() + i + count);
-        if ((op == 48 || op == 49 || op == 50 || op == 51) && count >= 3) {
-            u32 new_op = op == 48 ? 41u : op == 49 ? 42u : op == 50 ? 43u : 44u;
-            auto it = spec_ids.find(words[i + 2]);
-            if (info && it != spec_ids.end()) {
-                for (u32 e = 0; e < info->mapEntryCount; ++e) {
-                    const auto& entry = info->pMapEntries[e];
-                    if (entry.constantID != it->second ||
-                        entry.offset + entry.size > info->dataSize) {
-                        continue;
-                    }
-                    const u8* data = static_cast<const u8*>(info->pData) + entry.offset;
-                    if (op == 50) {
-                        for (u32 w = 0; w < count - 3 && w * 4 < entry.size; ++w) {
-                            u32 v = 0;
-                            std::memcpy(&v, data + w * 4, std::min<size_t>(4, entry.size - w * 4));
-                            out[at + 3 + w] = v;
-                        }
-                    } else if (op == 48 || op == 49) {
-                        bool value = false;
-                        for (size_t b = 0; b < entry.size; ++b) {
-                            value |= data[b] != 0;
-                        }
-                        new_op = value ? 41u : 42u;
-                    }
-                }
-            }
-            out[at] = (count << 16) | new_op;
-        }
-        i += count;
-    }
-    return out;
-}
-
 std::mutex generic_mutex;
 std::vector<std::unique_ptr<Metal::CompiledShader>> generic_shaders;
 std::vector<std::unique_ptr<Metal::RenderPipeline>> generic_pipelines;
@@ -529,7 +465,19 @@ const Metal::CompiledShader* CompileStage(State& s, const VkPipelineShaderStageC
         }
         words = it->second;
     }
-    const std::vector<u32> spec = Specialize(*words, stage.pSpecializationInfo);
+    std::vector<Metal::SpecConstant> constants;
+    if (const VkSpecializationInfo* info = stage.pSpecializationInfo) {
+        for (u32 e = 0; e < info->mapEntryCount; ++e) {
+            const auto& entry = info->pMapEntries[e];
+            if (entry.size != 4 || entry.offset + entry.size > info->dataSize) {
+                continue;
+            }
+            u32 value;
+            std::memcpy(&value, static_cast<const u8*>(info->pData) + entry.offset, 4);
+            constants.push_back({entry.constantID, value});
+        }
+    }
+    const std::vector<u32> spec = Metal::Specialize(*words, constants);
     const u64 hash = XXH3_64bits(spec.data(), spec.size() * 4);
     auto result = s.compiler.Compile(spec, hash, what);
     if (result.status != Metal::CompileStatus::Ok) {

@@ -10,11 +10,14 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <thread>
 #include <vector>
 #include "video_core/renderer_metal/mtl_object.h"
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
+#include "video_core/renderer_metal/mtl_depth_stencil.h"
+#include "video_core/renderer_metal/mtl_specialize.h"
 
 namespace {
 
@@ -28,6 +31,54 @@ void Expect(bool ok, const char* what) {
 }
 
 std::atomic<int> probes_alive{0};
+
+std::vector<u32> ReadWords(const char* path) {
+    FILE* f = std::fopen(path, "rb");
+    std::vector<u32> words;
+    if (!f) return words;
+    u32 w;
+    while (std::fread(&w, 4, 1, f) == 1) words.push_back(w);
+    std::fclose(f);
+    return words;
+}
+
+/// OpConstant (43) result values of the module, by result id.
+std::map<u32, u32> Constants(const std::vector<u32>& w) {
+    std::map<u32, u32> out;
+    for (size_t i = 5; i < w.size();) {
+        const u32 count = w[i] >> 16, op = w[i] & 0xffff;
+        if (op == 43 && count == 4) out[w[i + 2]] = w[i + 3];
+        Expect(op != 50, "no OpSpecConstant left after Specialize");
+        i += count ? count : 1;
+    }
+    return out;
+}
+
+void TestSpecialize() {
+    const std::vector<u32> spirv = ReadWords("out/spec_const.spv");
+    Expect(!spirv.empty(), "out/spec_const.spv exists");
+    const Metal::SpecConstant constants[] = {{3, 77}};
+    const std::vector<u32> out = Metal::Specialize(spirv, constants);
+    bool has77 = false, has1 = false;
+    for (const auto& [id, value] : Constants(out)) {
+        has77 |= value == 77;
+        has1 |= value == 1;
+    }
+    Expect(has77 && has1, "SpecId 3 takes the given value, SpecId 0 keeps its default");
+}
+
+void TestDepthStencilCache() {
+    Metal::Device device;
+    Metal::DepthStencilCache cache{device};
+    Metal::DepthStencilKey a;
+    a.depth_test = a.depth_write = true;
+    a.depth_compare = 1; // Less
+    Metal::DepthStencilKey b = a;
+    b.depth_write = false;
+    void* sa = cache.Get(a);
+    Expect(sa && cache.Get(a) == sa, "same key, same state");
+    Expect(cache.Get(b) && cache.Get(b) != sa, "different key, different state");
+}
 
 } // namespace
 
@@ -697,6 +748,8 @@ int main() {
         TestUntrackedRunsFirst();
         TestIndirectResidency();
         TestDepthAspectCopy();
+        TestSpecialize();
+        TestDepthStencilCache();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);
