@@ -18,7 +18,6 @@
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
-#include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
@@ -29,10 +28,8 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
 
@@ -41,14 +38,6 @@ using Shader::Output;
 using Shader::SwStage;
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
-
-constexpr static std::array DescriptorHeapSizes = {
-    vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 512},
-    vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 8192},
-    vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
-    vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
-};
 
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
     u32 num_outputs = 0;
@@ -172,8 +161,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         BuildCommon(regs.vs_program);
         info.hw.vs.user_clip_plane_mask = regs.clipper_control.user_clip_plane_enable;
         info.hw.vs.num_outputs = MapOutputs(info.hw.vs.outputs, regs.vs_output_control);
+        // Metal's clip space depth is [0, w] and it has no depth clip control: the vertex stage
+        // converts a [-w, w] depth itself (geometry draws: the pass-through function does).
         info.hw.vs.emulate_depth_negative_one_to_one =
-            !instance.IsDepthClipControlSupported() &&
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
         info.hw.vs.motion_vectors = sel.motion;
@@ -282,84 +272,69 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     return info;
 }
 
-PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
-                             AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
-    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
-    sel.regs = &liverpool->regs;
-    const auto& vk12_props = instance.GetVk12Properties();
-    profile = Shader::Profile{
-        .max_viewport_width = instance.GetMaxViewportWidth(),
-        .max_viewport_height = instance.GetMaxViewportHeight(),
-        .max_shared_memory_size = instance.MaxComputeSharedMemorySize(),
+namespace {
+/// The shader profile of the Metal pipelines (Apple GPUs, macOS 15+). The values MoltenVK reported
+/// on Apple silicon (the profile the metal-backend pipeline cache stored), so the recompiler emits
+/// the SPIR-V the Metal path was proven with; SPIRV-Cross turns it into MSL.
+Shader::Profile MetalProfile(const Metal::Device& device, u32 sparse_page_shift) {
+    return Shader::Profile{
+        .max_viewport_width = 16384,
+        .max_viewport_height = 16384,
+        .max_shared_memory_size = 32768, // MTLDevice.maxThreadgroupMemoryLength
         .supported_spirv = SpirvVersion1_6,
-        .subgroup_size = instance.SubgroupSize(),
+        .subgroup_size = 32, // the SIMD-group width
         .sparse_page_shift = sparse_page_shift,
-        .support_int8 = instance.IsShaderInt8Supported(),
-        .support_int16 = instance.IsShaderInt16Supported(),
-        .support_int64 = instance.IsShaderInt64Supported(),
-        .support_float16 = instance.IsShaderFloat16Supported(),
-        .support_float64 = instance.IsShaderFloat64Supported(),
-        .supports_denorm_behavior_independence =
-            vk12_props.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone,
-        .supports_rounding_mode_independence =
-            vk12_props.roundingModeIndependence != vk::ShaderFloatControlsIndependence::eNone,
-        .support_fp16_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat16),
-        .support_fp16_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat16),
-        .support_fp16_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat16),
-        .support_fp32_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat32),
-        .support_fp32_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat32),
-        .support_fp32_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat32),
-        .support_fp64_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat64),
-        .support_fp64_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat64),
-        .support_fp64_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat64),
-        .support_fp16_signed_zero_inf_nan_preserve =
-            bool(vk12_props.shaderSignedZeroInfNanPreserveFloat16),
-        .support_fp32_signed_zero_inf_nan_preserve =
-            bool(vk12_props.shaderSignedZeroInfNanPreserveFloat32),
-        .support_fp64_signed_zero_inf_nan_preserve =
-            bool(vk12_props.shaderSignedZeroInfNanPreserveFloat64),
-        .supports_image_load_store_lod = instance_.IsImageLoadStoreLodSupported(),
-        .supports_native_cube_calc = instance_.IsAmdGcnShaderSupported(),
-        .supports_trinary_minmax = instance_.IsAmdShaderTrinaryMinMaxSupported(),
-        .supports_buffer_fp32_atomic_min_max =
-            instance_.IsShaderAtomicFloatBuffer32MinMaxSupported(),
-        .supports_image_fp32_atomic_min_max = instance_.IsShaderAtomicFloatImage32MinMaxSupported(),
-        .supports_buffer_int64_atomics = instance_.IsBufferInt64AtomicsSupported(),
-        .supports_shared_int64_atomics = instance_.IsSharedInt64AtomicsSupported(),
-        .supports_workgroup_explicit_memory_layout =
-            instance_.IsWorkgroupMemoryExplicitLayoutSupported(),
-        .supports_amd_shader_explicit_vertex_parameter =
-            instance_.IsAmdShaderExplicitVertexParameterSupported(),
-        .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
-        .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
-        .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
-                                      instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
-        // bbport: older NVIDIA (Pascal) has no barycentrics; BB_INTERP_INT_FIX=0/1 overrides.
-        .needs_integer_interpolation_fix = [&] {
-            if (const char* env = std::getenv("BB_INTERP_INT_FIX")) {
-                return env[0] == '1';
-            }
-            return !instance.IsFragmentShaderBarycentricSupported() &&
-                   instance.GetDriverID() == vk::DriverId::eNvidiaProprietary;
-        }(),
-        .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
-                              instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
-        .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
-        .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
-        .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
-        .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .support_int8 = true,
+        .support_int16 = true,
+        .support_int64 = true,
+        .support_float16 = true,
+        .support_float64 = false,
+        .supports_denorm_behavior_independence = false,
+        .supports_rounding_mode_independence = false,
+        // No denorm or rounding mode controls; signed zero/inf/NaN kept where the shader asks.
+        .support_fp16_signed_zero_inf_nan_preserve = true,
+        .support_fp32_signed_zero_inf_nan_preserve = true,
+        .supports_image_load_store_lod = true,
+        .supports_native_cube_calc = false,
+        .supports_trinary_minmax = true,
+        .supports_buffer_fp32_atomic_min_max = false,
+        .supports_image_fp32_atomic_min_max = false,
+        .supports_buffer_int64_atomics = false,
+        .supports_shared_int64_atomics = false,
+        .supports_workgroup_explicit_memory_layout = false,
+        .supports_amd_shader_explicit_vertex_parameter = false,
+        .supports_fragment_shader_barycentric = true,
+        .supports_shader_subgroup_clock = false,
+        .needs_manual_interpolation = false,
+        .needs_integer_interpolation_fix = false,
+        .needs_lds_barriers = false,
+        .needs_buffer_offsets = device.GetLimits().storage_alignment > 4,
+        .needs_unorm_fixup = false,
+        .needs_clip_distance_emulation = false,
+        .supports_shader_stencil_export = true,
     };
-    WarmUp();
+}
+} // namespace
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
-    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
-               vk::to_string(cache_result));
-    pipeline_cache = std::move(cache);
+PipelineCache::PipelineCache(Metal::Device& device, Scheduler& scheduler_,
+                             AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
+    : scheduler{scheduler_}, liverpool{liverpool_},
+      profile{MetalProfile(device, sparse_page_shift)},
+      factory{std::make_unique<Metal::PipelineFactory>(device)} {
+    sel.regs = &liverpool->regs;
+    WarmUp();
 }
 
 PipelineCache::~PipelineCache() {
-    PipelineBuilder::Drain(); // builds still running use the Vulkan pipeline cache
+    PipelineBuilder::Drain(); // builds still running use the factory and the pipelines
+}
+
+Metal::ShaderCompiler& PipelineCache::Compiler() {
+    return factory->Compiler();
+}
+
+Metal::PsoCache& PipelineCache::Psos() {
+    return factory->Psos();
 }
 
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
@@ -447,10 +422,10 @@ private:
 };
 } // namespace
 
-// bbport: the pipeline a draw may use: null when the driver rejected it, or while it is still
-// compiling on the creation pool and shader_compile is skip, or balanced with the wait budget
-// spent. Otherwise a pipeline still compiling is returned and the recording thread waits for it
-// (Rasterizer::Draw).
+// bbport: the pipeline a draw may use: null when its build produced no Metal pipeline state, or
+// while it is still compiling on the creation pool and shader_compile is skip, or balanced with
+// the wait budget spent. Otherwise a pipeline still compiling is returned and the recording
+// thread waits for it (Rasterizer::Draw: WaitReady, then Failed).
 const GraphicsPipeline* PipelineCache::Drawable(const GraphicsPipeline* pipeline) {
     if (!pipeline->IsReady()) {
         const int mode = BbSettings::Get().shader_compile.load(std::memory_order_relaxed);
@@ -466,7 +441,7 @@ const GraphicsPipeline* PipelineCache::Drawable(const GraphicsPipeline* pipeline
             return pipeline;
         }
     }
-    return pipeline->Handle() ? pipeline : nullptr;
+    return pipeline->Failed() ? nullptr : pipeline;
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
@@ -490,20 +465,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-            sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+            *factory, profile, sel.graphics_key, sel.infos, sel.runtime_infos, sel.fetch_shader,
+            sel.modules, sdata, false);
 
         RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
-
-        if (EmulatorSettings.IsShaderCollect()) {
-            for (auto stage = 0; stage < MaxShaderStages; ++stage) {
-                if (sel.infos[stage]) {
-                    auto& m = sel.modules[stage];
-                    module_related_pipelines[m].emplace_back(sel.graphics_key);
-                }
-            }
-        }
         sel.fetch_shader.reset();
     }
     return Drawable(it->second.get());
@@ -520,16 +486,10 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         CompileTimer timer;
 
         ComputePipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *sel.infos[0],
-                                                       sel.modules[0], sdata, false);
+        it.value() = std::make_unique<ComputePipeline>(*factory, profile, compute_key,
+                                                       *sel.infos[0], sel.modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
-
-        if (EmulatorSettings.IsShaderCollect()) {
-            auto& m = sel.modules[0];
-            module_related_pipelines[m].emplace_back(compute_key);
-        }
     }
     return it->second.get();
 }
@@ -703,10 +663,10 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     }
 
     // Force all color samples to match depth samples to avoid unsupported MSAA configuration
+    // (Metal: every attachment of a pass has the pipeline's sample count).
     if (color_samples != 0) {
         const bool depth_mismatch = db_enabled && color_samples != key.depth_samples;
-        if (!all_color_samples_same && !instance.IsMixedAnySamplesSupported() ||
-            all_color_samples_same && depth_mismatch && !instance.IsMixedDepthSamplesSupported()) {
+        if (!all_color_samples_same || depth_mismatch) {
             key.color_samples.fill(key.depth_samples);
             key.num_samples = key.depth_samples;
         }
@@ -759,10 +719,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
 
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
-        if (!instance.IsGeometryStageSupported()) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
-            return false;
-        }
+        // Metal has no geometry stage: the pipeline emulates it with compute kernels.
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
@@ -775,9 +732,6 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         }
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::LsHs:
-        if (!instance.IsTessellationSupported()) {
-            return false;
-        }
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
             return false;
         }
@@ -789,13 +743,6 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         }
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::LsHsEsGs:
-        if (!instance.IsTessellationSupported()) {
-            return false;
-        }
-        if (!instance.IsGeometryStageSupported()) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
-            return false;
-        }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
@@ -822,9 +769,9 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     }
 
     const auto* vs_info = sel.infos[static_cast<u32>(SwStage::Vertex)];
-    if (vs_info && sel.fetch_shader && !instance.IsVertexInputDynamicState()) {
-        // Without vertex input dynamic state, the pipeline needs to specialize on format.
-        // Stride will still be handled outside the pipeline using dynamic state.
+    if (vs_info && sel.fetch_shader) {
+        // The Metal vertex descriptor holds the formats (the PSO cache reads them from here);
+        // strides are set per draw (MTLBufferLayoutStrideDynamic).
         u32 vertex_binding = 0;
         for (const auto& attrib : sel.fetch_shader->attributes) {
             const auto& buffer = attrib.GetSharp(*vs_info);
@@ -848,9 +795,9 @@ bool PipelineCache::RefreshComputeKey() {
     return true;
 }
 
-vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
-                                              const std::span<const u32>& code, size_t perm_idx,
-                                              Shader::Backend::Bindings& binding) {
+std::unique_ptr<Metal::ShaderModule> PipelineCache::CompileModule(
+    Shader::Info& info, Shader::RuntimeInfo& runtime_info, const std::span<const u32>& code,
+    size_t perm_idx, Shader::Backend::Bindings& binding) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
@@ -860,25 +807,16 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
-    vk::ShaderModule module;
-
+    // The SPIR-V is kept; its Metal forms compile when a pipeline is built (MSL disk cache).
+    const u64 perm_hash = HashCombine(info.pgm_hash, perm_idx);
     auto patch = GetShaderPatch(info.pgm_hash, info.hw_stage, perm_idx, "spv");
     const bool is_patched = patch && EmulatorSettings.IsPatchShaders();
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.hw_stage, info.pgm_hash);
-        module = CompileSPV(*patch, instance.GetDevice());
-    } else {
-        module = CompileSPV(spv, instance.GetDevice());
     }
-
+    auto module = std::make_unique<Metal::ShaderModule>(is_patched ? std::move(*patch) : spv,
+                                                        perm_hash);
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
-
-    const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
-    Vulkan::SetObjectName(instance.GetDevice(), module, name);
-    if (EmulatorSettings.IsShaderCollect()) {
-        DebugState.CollectShader(name, info.sw_stage, module, spv, code,
-                                 patch ? *patch : std::span<const u32>{}, is_patched);
-    }
     return module;
 }
 
@@ -923,7 +861,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         const size_t perm_idx = std::distance(program->modules.begin(), it);
         worker.stages.push_back(
             {program, params.hash, hw_stage, info.pgm_base, &info.flattened_ud_buf});
-        return std::make_tuple(&info, it->module, it->spec.fetch_shader_data,
+        return std::make_tuple(&info, it->module.get(), it->spec.fetch_shader_data,
                                HashCombine(params.hash, perm_idx));
     }
 
@@ -932,20 +870,21 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         auto new_program = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto start = binding;
         const size_t perm_idx = FreePermIndex(params.hash, 0);
-        const auto module =
+        auto module =
             CompileModule(new_program->info, runtime_info, params.code, perm_idx, binding);
+        const Metal::ShaderModule* module_ptr = module.get();
         auto spec = Shader::StageSpecialization(new_program->info, runtime_info, profile, start);
         const auto perm_hash = HashCombine(params.hash, perm_idx);
 
         RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        new_program->InsertPermut(module, std::move(spec), perm_idx);
+        new_program->InsertPermut(std::move(module), std::move(spec), perm_idx);
         new_program->info_template = std::make_unique<Shader::Info>(new_program->info);
         Program* program = new_program.get();
         {
             std::unique_lock lk{programs_mutex};
             program_cache.emplace(params.hash, std::move(new_program));
         }
-        return std::make_tuple(&program->info, module,
+        return std::make_tuple(&program->info, module_ptr,
                                program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
     }
 
@@ -963,7 +902,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
 
     size_t perm_idx{};
     u64 perm_hash{};
-    vk::ShaderModule module{};
+    const Metal::ShaderModule* module{};
 
     // bbport: consecutive draws of a program almost always use the same permutation.
     auto it = program->last_used < program->modules.size() &&
@@ -978,14 +917,15 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         perm_idx = FreePermIndex(params.hash, program->modules.size());
         perm_hash = HashCombine(params.hash, perm_idx);
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        auto new_module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        module = new_module.get();
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         std::unique_lock lk{programs_mutex};
-        program->InsertPermut(module, std::move(spec), perm_idx);
+        program->InsertPermut(std::move(new_module), std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
-        module = it->module;
+        module = it->module.get();
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
     }
@@ -1006,34 +946,6 @@ size_t PipelineCache::FreePermIndex(u64 pgm_hash, size_t from) const {
         ++from;
     }
     return from;
-}
-
-std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
-                                                             std::span<const u32> spv_code) {
-    std::optional<vk::ShaderModule> new_module{};
-    for (const auto& [_, program] : program_cache) {
-        for (auto& m : program->modules) {
-            if (m.module == module) {
-                const auto& d = instance.GetDevice();
-                d.destroyShaderModule(m.module);
-                m.module = CompileSPV(spv_code, d);
-                new_module = m.module;
-            }
-        }
-    }
-    if (module_related_pipelines.contains(module)) {
-        auto& pipeline_keys = module_related_pipelines[module];
-        for (auto& key : pipeline_keys) {
-            if (std::holds_alternative<GraphicsPipelineKey>(key)) {
-                auto& graphics_key = std::get<GraphicsPipelineKey>(key);
-                graphics_pipelines.erase(graphics_key);
-            } else if (std::holds_alternative<ComputePipelineKey>(key)) {
-                auto& compute_key = std::get<ComputePipelineKey>(key);
-                compute_pipelines.erase(compute_key);
-            }
-        }
-    }
-    return new_module;
 }
 
 std::string PipelineCache::GetShaderName(Shader::HwStage stage, u64 hash,

@@ -14,7 +14,6 @@
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {

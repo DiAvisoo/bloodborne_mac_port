@@ -15,16 +15,11 @@
 #include <pthread/qos.h>
 #endif
 
-#include <boost/container/small_vector.hpp>
-#include <boost/container/static_vector.hpp>
-
 #include "bbport_toggles.h"
+#include "common/logging/log.h"
 #include "common/thread.h"
-#include "shader_recompiler/resource.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
 
@@ -37,20 +32,16 @@ u64 ElapsedNs(std::chrono::steady_clock::time_point start) {
 }
 } // namespace
 
-Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
-                   const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
+Pipeline::Pipeline(Metal::PipelineFactory& factory_, const Shader::Profile& profile_,
                    bool is_compute_ /*= false*/)
-    : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
-      is_compute{is_compute_} {}
+    : factory{factory_}, profile{profile_}, is_compute{is_compute_} {}
 
 Pipeline::~Pipeline() {
     // A pipeline still in the creation pool must finish before its state goes away.
-    if (!IsReady()) {
-        WaitHandle();
-    }
+    WaitReady();
 }
 
-vk::Pipeline Pipeline::WaitHandle() const {
+void Pipeline::WaitReady() const {
     if (building.load(std::memory_order_acquire) != 0) {
         const auto start = std::chrono::steady_clock::now();
         while (building.load(std::memory_order_acquire) != 0) {
@@ -58,7 +49,13 @@ vk::Pipeline Pipeline::WaitHandle() const {
         }
         BbStats::compile_wait_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
     }
-    return *pipeline;
+}
+
+void Pipeline::Fail(std::string_view kind, const std::string& debug_str, std::string_view why) {
+    // Each pipeline is built once: this is its only message.
+    LOG_ERROR(Render_Vulkan, "{} pipeline {} not built ({}): its {} are skipped", kind, debug_str,
+              why, is_compute ? "dispatches" : "draws");
+    failed.store(true, std::memory_order_release);
 }
 
 bool Pipeline::WaitReady(u64 max_ns) const {
@@ -183,71 +180,6 @@ void Drain() {
     pool.idle_cv.wait(lk, [&] { return pool.jobs.empty() && pool.running == 0; });
 }
 } // namespace PipelineBuilder
-
-
-void Pipeline::BindResources(DescriptorWrites& set_writes,
-                             const Shader::PushData& push_data) const {
-    const auto bind_point =
-        IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
-    const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    const vk::PipelineLayout layout = *pipeline_layout;
-    scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
-        cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
-    });
-
-    // Bind descriptor set.
-    if (set_writes.empty()) {
-        return;
-    }
-
-    if (uses_push_descriptors) {
-        if (!scheduler.IsRecordingDeferred()) {
-            scheduler.Record([&](vk::CommandBuffer cmdbuf) {
-                cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
-            });
-            return;
-        }
-        // Writes and the infos they point to are laid out in the recording chunk, with the
-        // pointers already aimed at those copies: the command only carries a span.
-        size_t bytes = set_writes.size() * sizeof(vk::WriteDescriptorSet) + 64;
-        for (const auto& write : set_writes) {
-            bytes += write.descriptorCount *
-                         (sizeof(vk::DescriptorBufferInfo) + sizeof(vk::DescriptorImageInfo) +
-                          sizeof(vk::BufferView)) +
-                     32;
-        }
-        scheduler.ReserveRecordData(bytes);
-        const auto writes = scheduler.RecordData(std::span<const vk::WriteDescriptorSet>{set_writes});
-        auto* patched = const_cast<vk::WriteDescriptorSet*>(writes.data());
-        for (size_t i = 0; i < writes.size(); ++i) {
-            auto& write = patched[i];
-            if (write.pBufferInfo) {
-                write.pBufferInfo = scheduler.RecordData(std::span{write.pBufferInfo, write.descriptorCount}).data();
-            }
-            if (write.pImageInfo) {
-                write.pImageInfo = scheduler.RecordData(std::span{write.pImageInfo, write.descriptorCount}).data();
-            }
-            if (write.pTexelBufferView) {
-                write.pTexelBufferView =
-                    scheduler.RecordData(std::span{write.pTexelBufferView, write.descriptorCount}).data();
-            }
-        }
-        scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
-            cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
-        });
-        return;
-    }
-
-    // Descriptor set updates are device calls: they stay on this thread.
-    const auto desc_set = desc_heap.Commit(*desc_layout);
-    for (auto& set_write : set_writes) {
-        set_write.dstSet = desc_set;
-    }
-    instance.GetDevice().updateDescriptorSets(set_writes, {});
-    scheduler.Record([bind_point, layout, desc_set](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
-    });
-}
 
 std::string Pipeline::GetDebugString() const {
     std::string stage_desc;

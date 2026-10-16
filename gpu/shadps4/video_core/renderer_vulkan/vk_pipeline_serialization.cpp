@@ -2,20 +2,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include "common/hash.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_metal/mtl_pso_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
-#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 7u; // bbport: interpolated integer fix (Pascal)
+static constexpr u32 ShaderBinaryVersion = 8u; // bbport: Metal shader profile (native Metal)
 static constexpr u32 ShaderMetaVersion = 9u; // bbport: no NoContraction in FS/CS
-static constexpr u32 PipelineKeyVersion = 6u; // bbport: Info layout (portable SRT walker)
+static constexpr u32 PipelineKeyVersion = 7u; // bbport: Metal vertex attributes (native Metal)
 } // namespace Serialization
 
 namespace Vulkan {
@@ -170,9 +170,8 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
-    it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *sel.infos[0], sel.modules[0], sdata, true);
+    it.value() = std::make_unique<ComputePipeline>(*factory, profile, compute_key, *sel.infos[0],
+                                                   sel.modules[0], sdata, true);
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
@@ -196,23 +195,32 @@ bool GraphicsPipelineKey::Deserialize(Serialization::Archive& ar) {
 void GraphicsPipeline::SerializationSupport::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer sdata{ar};
 
-    sdata.Write(&vertex_attributes, sizeof(vertex_attributes));
-    sdata.Write(&vertex_bindings, sizeof(vertex_bindings));
-    sdata.Write(&divisors, sizeof(divisors));
-    sdata.Write(multisampling);
-    sdata.Write(tcs);
-    sdata.Write(tes);
+    sdata.Write(static_cast<u32>(vertex_attributes.size()));
+    for (const auto& attribute : vertex_attributes) {
+        sdata.Write(attribute.location);
+        sdata.Write(static_cast<u32>(attribute.per_instance));
+        sdata.Write(attribute.divisor);
+    }
 }
 
 bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive& ar) {
     Serialization::Reader sdata{ar};
 
-    sdata.Read(&vertex_attributes, sizeof(vertex_attributes));
-    sdata.Read(&vertex_bindings, sizeof(vertex_bindings));
-    sdata.Read(&divisors, sizeof(divisors));
-    sdata.Read(multisampling);
-    sdata.Read(tcs);
-    sdata.Read(tes);
+    u32 count{};
+    sdata.Read(count);
+    if (count > MaxVertexBufferCount) {
+        return false;
+    }
+    vertex_attributes.clear();
+    for (u32 i = 0; i < count; ++i) {
+        VertexAttribute attribute{};
+        u32 per_instance{};
+        sdata.Read(attribute.location);
+        sdata.Read(per_instance);
+        sdata.Read(attribute.divisor);
+        attribute.per_instance = per_instance != 0;
+        vertex_attributes.push_back(attribute);
+    }
     return true;
 }
 
@@ -220,7 +228,9 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     sel.graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
-    sdata.Deserialize(ar);
+    if (!sdata.Deserialize(ar)) {
+        return false;
+    }
 
     // Stages in the order the runtime binds them (RefreshGraphicsStages: fragment first), so
     // each one's first binding can be checked against the stages before it.
@@ -248,9 +258,9 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
     ASSERT(is_new);
 
-    it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-        sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, true);
+    it.value() = std::make_unique<GraphicsPipeline>(*factory, profile, sel.graphics_key, sel.infos,
+                                                    sel.runtime_infos, sel.fetch_shader,
+                                                    sel.modules, sdata, true);
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
@@ -294,11 +304,12 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     // Permutation hash depends on shader variation index. To prevent collisions, we need insert it
     // at the exact position rather than append
 
-    vk::ShaderModule module{};
+    // The SPIR-V is kept; its Metal forms compile when the pipeline builds (on the creation pool).
+    const u64 perm_hash = HashCombine(program->info.pgm_hash, perm_idx);
+    const Metal::ShaderModule* module{};
 
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
     if (new_program) {
-        module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
     } else {
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
@@ -314,12 +325,14 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
                             perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
                 return false;
             }
-            module = it->module;
-        } else {
-            module = CompileSPV(spv, instance.GetDevice());
+            module = it->module.get();
         }
     }
-    it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
+    if (!module) {
+        auto new_module = std::make_unique<Metal::ShaderModule>(std::move(spv), perm_hash);
+        module = new_module.get();
+        it_pgm.value()->InsertPermut(std::move(new_module), std::move(spec), perm_idx);
+    }
 
     sel.infos[stage] = &it_pgm.value()->info;
     sel.modules[stage] = module;
@@ -431,6 +444,7 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    factory->Psos().Flush();
     Storage::DataBase::Instance().Close();
 }
 

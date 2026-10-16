@@ -9,7 +9,6 @@
 #include "video_core/host_shaders/post_process_frag.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
-#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <boost/container/static_vector.hpp>
 

@@ -5,7 +5,6 @@
 
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
-#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
 

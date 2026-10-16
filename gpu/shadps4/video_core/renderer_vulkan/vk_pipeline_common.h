@@ -5,54 +5,49 @@
 
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
-#include "video_core/renderer_vulkan/vk_common.h"
 
+#include <array>
 #include <atomic>
 #include <functional>
+#include <span>
+#include <string>
+#include <string_view>
 
 #include <boost/container/small_vector.hpp>
 
 namespace Shader {
 struct Info;
-struct PushData;
 } // namespace Shader
+
+namespace Metal {
+class PipelineFactory;
+} // namespace Metal
 
 namespace Vulkan {
 
-static constexpr auto AllGraphicsStageBits =
-    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eTessellationControl |
-    vk::ShaderStageFlagBits::eTessellationEvaluation | vk::ShaderStageFlagBits::eGeometry |
-    vk::ShaderStageFlagBits::eFragment;
-
-class Instance;
-class Scheduler;
-class DescriptorHeap;
-
+/// A game pipeline: its shader stages and the Metal pipeline states the derived class builds on
+/// the pipeline creation pool (BuildAsync).
 class Pipeline {
 public:
-    Pipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
-             const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
+    Pipeline(Metal::PipelineFactory& factory, const Shader::Profile& profile,
              bool is_compute = false);
     virtual ~Pipeline();
-
-    /// Only for a ready pipeline (IsReady, or after WaitHandle).
-    vk::Pipeline Handle() const noexcept {
-        return *pipeline;
-    }
 
     /// bbport: false while the creation pool is still building the pipeline.
     bool IsReady() const noexcept {
         return building.load(std::memory_order_acquire) == 0;
     }
 
-    /// bbport: the handle once the creation pool has built it; null when the driver rejected it.
-    vk::Pipeline WaitHandle() const;
+    /// bbport: waits until the creation pool has built the pipeline.
+    void WaitReady() const;
 
     /// bbport: waits up to `max_ns` for the creation pool; true once the pipeline is ready.
     bool WaitReady(u64 max_ns) const;
 
-    vk::PipelineLayout GetLayout() const noexcept {
-        return *pipeline_layout;
+    /// The build produced no Metal pipeline state (logged once, with the reason, when it
+    /// finished): its draws and dispatches are skipped. False while the pipeline is building.
+    bool Failed() const noexcept {
+        return failed.load(std::memory_order_acquire);
     }
 
     auto GetStages() const {
@@ -72,32 +67,27 @@ public:
         return is_compute;
     }
 
-    using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
-    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
-
 protected:
     [[nodiscard]] std::string GetDebugString() const;
 
-    /// bbport: runs `build` (the vkCreate*Pipelines call, where MoltenVK and Metal compile) on
-    /// the pipeline creation pool, or right here when the pool is off.
+    /// bbport: runs `build` (the Metal shader compiles and pipeline-state creation) on the
+    /// pipeline creation pool, or right here when the pool is off.
     void BuildAsync(std::function<void()> build);
 
-    const Instance& instance;
-    Scheduler& scheduler;
-    DescriptorHeap& desc_heap;
+    /// From the build: no pipeline state; logs `why` with the pipeline's stages.
+    void Fail(std::string_view kind, const std::string& debug_str, std::string_view why);
+
+    Metal::PipelineFactory& factory;
     const Shader::Profile& profile;
-    vk::UniquePipeline pipeline;
-    vk::UniquePipelineLayout pipeline_layout;
-    vk::UniqueDescriptorSetLayout desc_layout;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
-    bool uses_push_descriptors{};
     bool is_compute;
     mutable std::atomic<u32> building{0};
+    std::atomic<bool> failed{false};
 };
 
 /// bbport: background pipeline creation. Shader translation stays on the GPU command thread;
-/// creating the Vulkan pipeline (MoltenVK converts SPIR-V to MSL and Metal compiles it) runs on
-/// a few low-priority threads, so new pipelines compile in parallel and off the render path.
+/// building the Metal pipeline states (SPIR-V to MSL, the Metal compiler) runs on a few
+/// low-priority threads, so new pipelines compile in parallel and off the render path.
 /// BB_PIPELINE_THREADS=n (default 4; 0 creates pipelines where they are needed, as before).
 namespace PipelineBuilder {
 bool Enabled();

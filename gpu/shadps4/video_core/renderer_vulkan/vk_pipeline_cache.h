@@ -3,24 +3,17 @@
 
 #pragma once
 
+#include <memory>
 #include <unordered_map>
 #include <shared_mutex>
-#include <variant>
 #include <boost/container/static_vector.hpp>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
+#include "video_core/renderer_metal/mtl_pipeline_build.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
-#include "video_core/renderer_vulkan/vk_resource_pool.h"
-
-template <>
-struct std::hash<vk::ShaderModule> {
-    std::size_t operator()(const vk::ShaderModule& module) const noexcept {
-        return std::hash<size_t>{}(reinterpret_cast<size_t>((VkShaderModule)module));
-    }
-};
 
 namespace AmdGpu {
 class Liverpool;
@@ -36,13 +29,12 @@ struct Info;
 
 namespace Vulkan {
 
-class Instance;
 class Scheduler;
-class ShaderCache;
 
 struct Program {
     struct Module {
-        vk::ShaderModule module;
+        /// The permutation's SPIR-V; the Metal forms compile when a pipeline first needs them.
+        std::unique_ptr<Metal::ShaderModule> module;
         Shader::StageSpecialization spec;
     };
     static constexpr size_t MaxPermutations = 8;
@@ -59,14 +51,10 @@ struct Program {
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
-    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
-        modules.emplace_back(module, std::move(spec));
-    }
-
-    void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
-                      size_t perm_idx) {
+    void InsertPermut(std::unique_ptr<Metal::ShaderModule> module,
+                      Shader::StageSpecialization&& spec, size_t perm_idx) {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
-        modules[perm_idx] = {module, std::move(spec)};
+        modules[perm_idx] = {std::move(module), std::move(spec)};
     }
 };
 
@@ -89,7 +77,7 @@ struct PipelineSelection {
     const AmdGpu::Regs* regs{};
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
-    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::array<const Metal::ShaderModule*, MaxShaderStages> modules{};
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     bool motion = false;
@@ -116,7 +104,8 @@ struct PreparedDraw;
 
 class PipelineCache {
 public:
-    explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
+    /// `sparse_page_shift`: the buffer cache's page size (the shaders' page table lookups).
+    explicit PipelineCache(Metal::Device& device, Scheduler& scheduler,
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
 
@@ -148,13 +137,10 @@ public:
 
     const ComputePipeline* GetComputePipeline();
 
-    using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
+    using Result = std::tuple<const Shader::Info*, const Metal::ShaderModule*,
                               std::optional<Shader::Gcn::FetchShaderData>, u64>;
     Result GetProgram(PipelineSelection& sel, Shader::HwStage stage, Shader::SwStage l_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
-
-    std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
-                                                  std::span<const u32> spv_code);
 
     static std::string GetShaderName(Shader::HwStage stage, u64 hash,
                                      std::optional<size_t> perm = {});
@@ -162,6 +148,11 @@ public:
     auto& GetProfile() const {
         return profile;
     }
+
+    /// The Metal shader compiler and PSO cache of the pipelines (one per device; their disk
+    /// caches are in ShaderCompiler::DefaultCacheDir()).
+    Metal::ShaderCompiler& Compiler();
+    Metal::PsoCache& Psos();
 
 private:
     bool RefreshGraphicsKey(PipelineSelection& sel);
@@ -172,9 +163,11 @@ private:
                     std::string_view ext);
     std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::HwStage stage, size_t perm_idx,
                                                    std::string_view ext);
-    vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
-                                   const std::span<const u32>& code, size_t perm_idx,
-                                   Shader::Backend::Bindings& binding);
+    std::unique_ptr<Metal::ShaderModule> CompileModule(Shader::Info& info,
+                                                       Shader::RuntimeInfo& runtime_info,
+                                                       const std::span<const u32>& code,
+                                                       size_t perm_idx,
+                                                       Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(PipelineSelection& sel, Shader::HwStage stage,
                                                 Shader::SwStage l_stage);
 
@@ -183,13 +176,11 @@ private:
     }
 
 private:
-    const Instance& instance;
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
-    DescriptorHeap desc_heap;
-    vk::UniquePipelineCache pipeline_cache;
-    vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
+    /// Before the pipelines: their builds use it until they are destroyed.
+    std::unique_ptr<Metal::PipelineFactory> factory;
     Shader::Pools pools;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     /// bbport: exclusive for program/permutation insertions, shared for worker lookups.
@@ -201,11 +192,6 @@ private:
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
-
-    // Only if Config::collectShadersForDebug()
-    tsl::robin_map<vk::ShaderModule,
-                   std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
-        module_related_pipelines;
 };
 
 } // namespace Vulkan

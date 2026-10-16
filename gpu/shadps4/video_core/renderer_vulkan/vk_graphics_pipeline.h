@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <optional>
+#include <span>
+#include <string>
+
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -10,79 +14,97 @@
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_metal/mtl_pso_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_pipeline_key.h"
 
-namespace VideoCore {
-class BufferCache;
-class TextureCache;
-} // namespace VideoCore
+namespace Metal {
+class ShaderModule;
+} // namespace Metal
 
 namespace Vulkan {
-
-class Instance;
-class Scheduler;
-class DescriptorHeap;
 
 template <typename T>
 using VertexInputs = boost::container::static_vector<T, MaxVertexBufferCount>;
 
+/// One vertex attribute of a pipeline (location, step rate), in the fetch shader's order.
+using VertexAttribute = Metal::VertexAttribute;
+
 class GraphicsPipeline : public Pipeline {
 public:
     struct SerializationSupport {
-        VertexInputs<vk::VertexInputAttributeDescription> vertex_attributes{};
-        VertexInputs<vk::VertexInputBindingDescription> vertex_bindings{};
-        VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors{};
-        vk::PipelineMultisampleStateCreateInfo multisampling{};
-        std::vector<u32> tcs{};
-        std::vector<u32> tes{};
-        std::vector<u32> fragment{};
+        /// GetVertexInputs' attributes (the preload has no guest registers to derive them).
+        VertexInputs<VertexAttribute> vertex_attributes{};
 
         void Serialize(Serialization::Archive& ar) const;
         bool Deserialize(Serialization::Archive& ar);
     };
 
-    GraphicsPipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
-                     const Shader::Profile& profile, const GraphicsPipelineKey& key,
-                     vk::PipelineCache pipeline_cache,
+    /// `modules` by Shader::SwStage (null: not used); they outlive the pipeline (the pipeline
+    /// cache's programs own them).
+    GraphicsPipeline(Metal::PipelineFactory& factory, const Shader::Profile& profile,
+                     const GraphicsPipelineKey& key,
                      std::span<const Shader::Info*, MaxShaderStages> stages,
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
-                     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     std::span<const Metal::ShaderModule* const, MaxShaderStages> modules,
+                     SerializationSupport& sdata, bool preloading);
     ~GraphicsPipeline();
 
     const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {
         return fetch_shader;
     }
 
-    const GraphicsPipelineKey& GetGraphicsKey() const {
+    const GraphicsPipelineKey& GetKey() const noexcept {
+        return key;
+    }
+    const GraphicsPipelineKey& GetGraphicsKey() const noexcept {
         return key;
     }
 
-    /// Gets the attributes and bindings for vertex inputs.
-    template <typename Attribute, typename Binding>
-    void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
-                         VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+    // The Metal pipeline states, once ready (IsReady/WaitReady); null when Failed().
+    /// The render pipeline of every kind of draw (for tessellation and geometry draws the
+    /// evaluation / pass-through stage with the fragment shader).
+    const Metal::RenderPipeline* Render() const noexcept {
+        return psos.render;
+    }
+    /// A tessellated draw's kernels (null otherwise).
+    const Metal::TessellationPipeline* Tessellation() const noexcept {
+        return psos.tessellation;
+    }
+    /// A geometry-shader draw's kernels (null otherwise).
+    const Metal::GeometryPipeline* Geometry() const noexcept {
+        return psos.geometry;
+    }
+    /// The vertex function is the RectList rewrite: draws count 6 vertices per rectangle.
+    bool IsRectList() const noexcept {
+        return psos.rect_list;
+    }
+    /// The vertex attributes the pipeline was built with (fetch shader order).
+    std::span<const VertexAttribute> Attributes() const noexcept {
+        return attributes;
+    }
+
+    /// The vertex attributes of the fetch shader for the draw's step rates, and the V#s of their
+    /// buffers (same order).
+    void GetVertexInputs(VertexInputs<VertexAttribute>& out_attributes,
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
                          u32 step_rate_1) const;
 
 private:
-    /// bbport: what pipeline creation needs, copied so it can run on the creation pool.
-    struct BuildInputs {
-        SerializationSupport sdata;
-        std::array<bool, MaxShaderStages> has_stage{};
-        std::array<vk::ShaderModule, MaxShaderStages> modules{};
-        bool clip_emulation{};
-        vk::PipelineCache pipeline_cache;
-        std::string debug_str;
+    struct Psos {
+        const Metal::RenderPipeline* render{};
+        const Metal::TessellationPipeline* tessellation{};
+        const Metal::GeometryPipeline* geometry{};
+        bool rect_list{};
     };
-    void Build(const BuildInputs& in);
-    void BuildDescSetLayout(bool preloading);
+    void Build(bool clip_emulation_fragment, const std::string& debug_str);
 
-private:
     GraphicsPipelineKey key;
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
+    std::array<const Metal::ShaderModule*, MaxShaderStages> modules{};
+    VertexInputs<VertexAttribute> attributes;
+    Psos psos; ///< written by the build, read once ready
 };
 
 struct ClipDistanceShaderKey {

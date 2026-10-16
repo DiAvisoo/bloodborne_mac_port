@@ -3,24 +3,21 @@
 
 #pragma once
 
-#include "video_core/renderer_vulkan/vk_common.h"
+#include <string>
+
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_pipeline_key.h"
-
-namespace VideoCore {
-class BufferCache;
-class TextureCache;
-} // namespace VideoCore
 
 namespace Serialization {
 struct Archive;
 }
 
-namespace Vulkan {
+namespace Metal {
+class ShaderModule;
+struct ComputePipeline;
+} // namespace Metal
 
-class Instance;
-class Scheduler;
-class DescriptorHeap;
+namespace Vulkan {
 
 class ComputePipeline : public Pipeline {
 public:
@@ -31,14 +28,24 @@ public:
         bool Deserialize(Serialization::Archive& ar);
     };
 
-    ComputePipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
-                    const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
+    /// `module` outlives the pipeline (the pipeline cache's program owns it).
+    ComputePipeline(Metal::PipelineFactory& factory, const Shader::Profile& profile,
                     ComputePipelineKey compute_key, const Shader::Info& info,
-                    vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
+                    const Metal::ShaderModule* module, SerializationSupport& sdata,
+                    bool preloading);
     ~ComputePipeline();
 
+    /// The Metal pipeline state, once ready (IsReady/WaitReady); null when Failed().
+    const Metal::ComputePipeline* Compute() const noexcept {
+        return compute;
+    }
+
 private:
+    void Build(const std::string& debug_str);
+
     ComputePipelineKey compute_key;
+    const Metal::ShaderModule* module;
+    const Metal::ComputePipeline* compute{}; ///< written by the build, read once ready
 };
 
 } // namespace Vulkan
