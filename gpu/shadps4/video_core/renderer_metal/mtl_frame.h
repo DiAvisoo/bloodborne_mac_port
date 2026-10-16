@@ -128,6 +128,10 @@ void BindPipeline(Owned& o, VkPipelineBindPoint point, VkPipeline pipeline);
 void PushDescriptorSet(Owned& o, VkPipelineBindPoint point, u32 set, u32 count,
                        const VkWriteDescriptorSet* writes);
 void PushConstants(Owned& o, u32 offset, u32 size, const void* values);
+/// Descriptor sets (the overlay, FSR): vkUpdateDescriptorSets contents, applied at bind.
+void DescriptorSetsUpdated(u32 count, const VkWriteDescriptorSet* writes);
+void BindDescriptorSets(Owned& o, VkPipelineBindPoint point, u32 first_set, u32 count,
+                        const VkDescriptorSet* sets);
 void BindVertexBuffers(Owned& o, u32 first, u32 count, const VkBuffer* buffers,
                        const VkDeviceSize* offsets, const VkDeviceSize* strides);
 void BindIndexBuffer(Owned& o, VkBuffer buffer, VkDeviceSize offset, VkIndexType type);

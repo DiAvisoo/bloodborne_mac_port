@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -59,7 +60,8 @@ using MetalFrame::Owned;
     X(vkCreateSampler) X(vkDestroySampler) X(vkDestroyImageView) X(vkDestroyPipeline)              \
     X(vkGetBufferDeviceAddress) X(vkGetBufferDeviceAddressKHR) X(vkCreateShaderModule)            \
     X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkCreateImageView)               \
-    X(vkSetDebugUtilsObjectNameEXT)
+    X(vkSetDebugUtilsObjectNameEXT) X(vkUpdateDescriptorSets) X(vkGetDeviceProcAddr)             \
+    X(vkGetInstanceProcAddr)
 
 enum Id : unsigned {
 #define BB_ID(name) Id_##name,
@@ -120,6 +122,22 @@ void Report() {
         line += item;
     }
     std::printf("Metal layer: Vulkan calls per second: %s\n", line.c_str());
+}
+
+/// Our entry points by Id (installed ones), for vkGet*ProcAddr: libraries that load their own
+/// function pointers (FSR, the ImGui overlay) then record through the layer too.
+std::array<PFN_vkVoidFunction, Count> hooked{};
+PFN_vkVoidFunction HookedByName(const char* name) {
+    if (!name || !(present_enabled || frame_enabled)) {
+        return nullptr;
+    }
+    for (unsigned i = 0; i < Count; ++i) {
+        if (hooked[i] && i != Id_vkGetDeviceProcAddr && i != Id_vkGetInstanceProcAddr &&
+            std::strcmp(Names[i], name) == 0) {
+            return hooked[i];
+        }
+    }
+    return nullptr;
 }
 
 std::mutex owned_mutex;
@@ -342,6 +360,29 @@ struct Hook<I, R (*)(A...)> {
                 return VK_SUCCESS; // MoltenVK does not know the placeholder
             }
             return original(args...);
+        } else if constexpr (I == Id_vkGetDeviceProcAddr || I == Id_vkGetInstanceProcAddr) {
+            const char* name = std::get<1>(std::tuple{args...});
+            if (PFN_vkVoidFunction ours = HookedByName(name)) {
+                return ours;
+            }
+            if (frame_enabled && name && std::strncmp(name, "vkCmd", 5) == 0) {
+                // A command the layer does not cover: it would reach MoltenVK out of order.
+                static std::mutex logged_mutex;
+                static std::vector<std::string> logged;
+                std::scoped_lock lock{logged_mutex};
+                if (std::find(logged.begin(), logged.end(), name) == logged.end()) {
+                    logged.emplace_back(name);
+                    std::printf("Metal layer: %s requested but not covered by the Metal path\n", name);
+                }
+            }
+            return original(args...);
+        } else if constexpr (I == Id_vkUpdateDescriptorSets) {
+            original(args...);
+            if (frame_enabled) {
+                MetalFrame::DescriptorSetsUpdated(std::get<1>(std::tuple{args...}),
+                                                  std::get<2>(std::tuple{args...}));
+            }
+            return;
         } else if constexpr (I == Id_vkDestroySampler) {
             if (present_enabled || frame_enabled) {
                 MetalFrame::SamplerDestroyed(std::get<1>(std::tuple{args...}));
@@ -402,6 +443,8 @@ struct Hook<I, R (*)(A...)> {
             F::BindPipeline(o, std::get<1>(t), std::get<2>(t));
         } else if constexpr (I == Id_vkCmdPushDescriptorSetKHR) {
             F::PushDescriptorSet(o, std::get<1>(t), std::get<3>(t), std::get<4>(t), std::get<5>(t));
+        } else if constexpr (I == Id_vkCmdBindDescriptorSets) {
+            F::BindDescriptorSets(o, std::get<1>(t), std::get<3>(t), std::get<4>(t), std::get<5>(t));
         } else if constexpr (I == Id_vkCmdPushConstants) {
             F::PushConstants(o, std::get<3>(t), std::get<4>(t), std::get<5>(t));
         } else if constexpr (I == Id_vkCmdBindVertexBuffers) {
@@ -553,9 +596,14 @@ void SetDevice(void* device, void* vkqueue) {
         present_enabled = frame_enabled = false;
         return;
     }
-    // The original (MoltenVK) entry: the hook would record the buffer as device-addressed.
-    auto get_address = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
-        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(vk_device, "vkGetBufferDeviceAddress"));
+    // The original (MoltenVK) entry: through the hooks the lookup would come back to the layer
+    // (vkGetDeviceProcAddr answers with them) and recurse.
+    using AddressHook = Hook<Id_vkGetBufferDeviceAddress,
+                             decltype(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferDeviceAddress)>;
+    auto get_address = AddressHook::original
+                           ? AddressHook::original
+                           : reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
+                                 VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferDeviceAddress);
     MetalFrame::Init(vk_device, queue, export_objects, get_address);
     std::printf("Metal layer: %s encoded in Metal on %s\n",
                 frame_enabled ? "every command buffer is (BB_METAL_FRAME=1)"
@@ -581,7 +629,11 @@ void Install(void* dispatcher_ptr) {
         return;
     }
     auto& d = *static_cast<Dispatcher*>(dispatcher_ptr);
-#define BB_INSTALL(name) Hook<Id_##name, decltype(d.name)>::Install(d.name);
+#define BB_INSTALL(name)                                                                           \
+    Hook<Id_##name, decltype(d.name)>::Install(d.name);                                            \
+    hooked[Id_##name] = Hook<Id_##name, decltype(d.name)>::original                                \
+                            ? reinterpret_cast<PFN_vkVoidFunction>(d.name)                         \
+                            : nullptr;
     BB_LAYER_FUNCTIONS(BB_INSTALL)
 #undef BB_INSTALL
     std::printf("Metal layer: installed over %u Vulkan functions\n", unsigned(Count));

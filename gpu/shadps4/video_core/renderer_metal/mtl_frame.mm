@@ -870,13 +870,48 @@ void BindPipeline(Owned& o, VkPipelineBindPoint point, VkPipeline pipeline) {
     }
 }
 
+namespace {
+/// The Metal objects of one descriptor write, into `elements` (grown as needed).
+void DecodeWrite(const VkWriteDescriptorSet& write, std::vector<Bound>& elements);
+std::mutex sets_mutex;
+std::unordered_map<VkDescriptorSet, std::unordered_map<u32, Binding>> descriptor_sets;
+} // namespace
+
+void DescriptorSetsUpdated(u32 count, const VkWriteDescriptorSet* writes) {
+    std::scoped_lock lock{sets_mutex};
+    for (u32 w = 0; w < count; ++w) {
+        DecodeWrite(writes[w], descriptor_sets[writes[w].dstSet][writes[w].dstBinding].elements);
+    }
+}
+
+void BindDescriptorSets(Owned& o, VkPipelineBindPoint point, u32 first_set, u32 count,
+                        const VkDescriptorSet* sets) {
+    auto& bindings = point == VK_PIPELINE_BIND_POINT_COMPUTE ? o.compute_bindings
+                                                             : o.graphics_bindings;
+    std::scoped_lock lock{sets_mutex};
+    for (u32 i = 0; i < count; ++i) {
+        auto it = descriptor_sets.find(sets[i]);
+        if (it == descriptor_sets.end()) {
+            continue;
+        }
+        for (const auto& [binding, contents] : it->second) {
+            bindings[((first_set + i) << 16) | binding] = contents;
+        }
+    }
+}
+
 void PushDescriptorSet(Owned& o, VkPipelineBindPoint point, u32 set, u32 count,
                        const VkWriteDescriptorSet* writes) {
     auto& bindings = point == VK_PIPELINE_BIND_POINT_COMPUTE ? o.compute_bindings
                                                              : o.graphics_bindings;
     for (u32 w = 0; w < count; ++w) {
-        const VkWriteDescriptorSet& write = writes[w];
-        auto& elements = bindings[(set << 16) | write.dstBinding].elements;
+        DecodeWrite(writes[w], bindings[(set << 16) | writes[w].dstBinding].elements);
+    }
+}
+
+namespace {
+void DecodeWrite(const VkWriteDescriptorSet& write, std::vector<Bound>& elements) {
+    {
         if (elements.size() < write.dstArrayElement + write.descriptorCount) {
             elements.resize(write.dstArrayElement + write.descriptorCount);
         }
@@ -919,6 +954,7 @@ void PushDescriptorSet(Owned& o, VkPipelineBindPoint point, u32 set, u32 count,
         }
     }
 }
+} // namespace
 
 void PushConstants(Owned& o, u32 offset, u32 size, const void* values) {
     if (offset + size <= o.push.size()) {
