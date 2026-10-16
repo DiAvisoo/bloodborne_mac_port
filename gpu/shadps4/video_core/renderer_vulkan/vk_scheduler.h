@@ -72,6 +72,8 @@ struct RenderState {
     RenderAttachment depth{};
     bool has_depth{}, has_stencil{}, stencil_only{};
     u32 width{}, height{};
+    /// Metal::RenderPassDesc::vertex_rw_buffer (passes with object motion pipelines).
+    void* vertex_rw_buffer{};
 
     /// The Metal render pass: colors and depth/stencil stored, loaded unless cleared.
     Metal::RenderPassDesc ToDesc() const;
@@ -80,7 +82,8 @@ struct RenderState {
     bool operator==(const RenderState& other) const noexcept {
         if (num_colors != other.num_colors || has_depth != other.has_depth ||
             has_stencil != other.has_stencil || stencil_only != other.stencil_only ||
-            width != other.width || height != other.height || !(depth == other.depth)) {
+            width != other.width || height != other.height || !(depth == other.depth) ||
+            vertex_rw_buffer != other.vertex_rw_buffer) {
             return false;
         }
         for (u32 i = 0; i < num_colors; ++i) {

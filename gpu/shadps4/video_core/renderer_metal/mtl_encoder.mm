@@ -204,6 +204,7 @@ struct Encoder::Impl {
         IndirectUse use;
     };
     std::vector<Indirect> indirect; ///< declared on every encoder opened (survives Submit)
+    void* pass_vertex_rw{};         ///< RenderPassDesc::vertex_rw_buffer of the open pass
     id<MTLComputePipelineState> fill_u32;
     id<MTLComputePipelineState> clamp_count;
 
@@ -449,6 +450,9 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
             }
             pass_opened = true;
             DeclareOn(render);
+            if (pass_vertex_rw) {
+                Declare(render, Indirect{pass_vertex_rw, IndirectUse::VertexWrite});
+            }
             render_dirty = render_used; // incl. the scissor, clamped to this pass's target
             vertex.Reapply();
             fragment.Reapply();
@@ -945,6 +949,7 @@ void Encoder::BeginRenderPass(const RenderPassDesc& desc) {
     impl->pass_clears = clears;
     impl->pass_resolves = resolves;
     impl->pass_opened = false;
+    impl->pass_vertex_rw = desc.vertex_rw_buffer;
     impl->in_pass = true;
 }
 
@@ -957,6 +962,7 @@ void Encoder::EndRenderPass() {
     impl->in_pass = false;
     impl->pass_first = nil;
     impl->pass_load = nil;
+    impl->pass_vertex_rw = nullptr;
 }
 
 void Encoder::SetRenderPipeline(void* pipeline) {

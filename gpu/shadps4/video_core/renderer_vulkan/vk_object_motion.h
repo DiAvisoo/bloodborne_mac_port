@@ -45,7 +45,8 @@ public:
     }
 
     /// Rendering of a motion pipeline: the motion attachment (render-target size) as colour 7,
-    /// cleared by the first pass of the frame.
+    /// cleared by the first pass of the frame, and the position history as the pass's
+    /// vertex_rw_buffer.
     void Attach(RenderState& state, u32 width, u32 height);
 
     /// Start of a frame (display pass).
@@ -81,7 +82,7 @@ private:
     Motion::IndexRangeCache index_ranges;
     std::array<u64, FrameSlots> params_ticks{};
     // Reached by shaders only through their GPU addresses (Shader::MotionVectors): resident
-    // and declared on the scheduler's encoder (see the constructor for the ordering).
+    // and declared on the encoders that use them (see the constructor for the ordering).
     Metal::Object params_buffer;
     u32* params_mapped{};
     Metal::Object positions_buffer;

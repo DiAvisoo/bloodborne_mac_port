@@ -64,6 +64,10 @@ struct RenderPassDesc {
     std::array<ColorAttachment, MaxColors> colors{};
     DepthAttachment depth{};
     u32 width{}, height{}; ///< render area, used when there are no attachments
+    /// A buffer this pass's vertex shaders read and write by GPU address (object motion
+    /// history): declared on the pass's encoders like DeclareIndirect(VertexWrite), so hazard
+    /// tracking orders only the passes that use it.
+    void* vertex_rw_buffer{};
 };
 
 struct Viewport {

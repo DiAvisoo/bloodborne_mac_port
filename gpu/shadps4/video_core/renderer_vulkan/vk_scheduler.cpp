@@ -73,6 +73,7 @@ Metal::RenderPassDesc RenderState::ToDesc() const {
     }
     desc.width = width;
     desc.height = height;
+    desc.vertex_rw_buffer = vertex_rw_buffer;
     return desc;
 }
 
