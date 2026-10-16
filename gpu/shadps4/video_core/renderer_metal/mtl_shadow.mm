@@ -236,6 +236,7 @@ void RegisterModule(vk::ShaderModule module, std::span<const u32> spirv) {
 void Graphics(const Vulkan::GraphicsPipelineKey& key, std::span<const vk::ShaderModule> modules,
               std::span<const bool> has_stage, std::span<const VertexInput> inputs,
               bool aux_fragment, vk::Pipeline vk_pipeline) {
+    @autoreleasepool { // pipeline-creation threads drain no pool of their own
     using Stage = ::Shader::SwStage;
     auto& s = Get();
     auto has = [&](Stage stage) { return has_stage[u32(stage)]; };
@@ -412,10 +413,12 @@ void Graphics(const Vulkan::GraphicsPipelineKey& key, std::span<const vk::Shader
         }
     }
     s.Report();
+    }
 }
 
 void Compute(const Vulkan::ComputePipelineKey& key, vk::ShaderModule module,
              vk::Pipeline vk_pipeline) {
+    @autoreleasepool { // pipeline-creation threads drain no pool of their own
     auto& s = Get();
     const auto* cs = s.Get(module, key.value, "compute");
     const Metal::ComputePipeline* pipeline = cs ? s.pso.GetComputePipeline(key, cs) : nullptr;
@@ -426,6 +429,7 @@ void Compute(const Vulkan::ComputePipelineKey& key, vk::ShaderModule module,
     }
     ++(ok ? s.compute_ok : s.compute_failed);
     s.Report();
+    }
 }
 
 // ---- Generic pipelines (host passes): built from their Vulkan create infos ----

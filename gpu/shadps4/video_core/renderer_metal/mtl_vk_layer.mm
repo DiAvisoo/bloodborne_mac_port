@@ -171,7 +171,9 @@ Owned* FindOwned(VkCommandBuffer cb) {
 
 void OwnBuffer(VkCommandBuffer cb) {
     auto* o = new Owned;
-    o->cmd = [queue commandBufferWithUnretainedReferences];
+    @autoreleasepool {
+        o->cmd = [queue commandBufferWithUnretainedReferences];
+    }
     o->cmd.label = @"bbport Metal path";
     std::scoped_lock lock{owned_mutex};
     if (auto it = owned.find(cb); it != owned.end()) {
@@ -242,6 +244,7 @@ void CommitOwned(uint32_t count, Get&& get) {
             owned_count.store(unsigned(owned.size()), std::memory_order_release);
             ++owned_generation;
         }
+        @autoreleasepool {
         MetalFrame::EndEncoders(*o);
         MetalFrame::ReturnScratchWhenDone(*o);
         if (!o->keep.empty()) {
@@ -252,6 +255,7 @@ void CommitOwned(uint32_t count, Get&& get) {
             }];
         }
         [o->cmd commit];
+        }
         static std::atomic<unsigned long long> committed{0};
         const auto n = ++committed;
         if (n == 1 || n % 1000 == 0) {
@@ -299,14 +303,18 @@ struct Hook<I, R (*)(A...)> {
             return result;
         } else if constexpr (I == Id_vkEndCommandBuffer) {
             if (Owned* o = FindOwned(std::get<0>(std::tuple{args...}))) {
-                MetalFrame::EndEncoders(*o);
+                @autoreleasepool {
+                    MetalFrame::EndEncoders(*o);
+                }
             }
             return original(args...);
         } else if constexpr (I == Id_vkCreateSampler) {
             const auto [dev, info, alloc, out] = std::tuple{args...};
             const R result = original(args...);
             if (result == VK_SUCCESS && (present_enabled || frame_enabled)) {
-                MetalFrame::SamplerCreated(*out, info);
+                @autoreleasepool {
+                    MetalFrame::SamplerCreated(*out, info);
+                }
             }
             return result;
         } else if constexpr (I == Id_vkCreateShaderModule) {
@@ -345,7 +353,9 @@ struct Hook<I, R (*)(A...)> {
             const R result = original(args...);
             if (frame_enabled) {
                 for (uint32_t i = 0; i < count; ++i) {
-                    MetalShadow::ComputeCreated(&infos[i], out[i]);
+                    @autoreleasepool {
+                        MetalShadow::ComputeCreated(&infos[i], out[i]);
+                    }
                 }
             }
             return result;
@@ -413,7 +423,11 @@ struct Hook<I, R (*)(A...)> {
             // vkCmd*: the first argument is the command buffer.
             if (Owned* o = FindOwned(std::get<0>(std::tuple{args...}))) {
                 ++o->commands;
-                Encode(*o, args...);
+                // The recorder threads never drain an autorelease pool of their own: Metal's
+                // autoreleased objects (pass descriptors, encoders) leaked ~17 KB per frame.
+                @autoreleasepool {
+                    Encode(*o, args...);
+                }
                 if constexpr (!std::is_void_v<R>) {
                     return R{};
                 } else {
