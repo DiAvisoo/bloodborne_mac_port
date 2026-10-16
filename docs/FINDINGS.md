@@ -844,3 +844,47 @@ kernels (prep reads the guest's arguments into a control block, then the export 
 kernels and the strip draw take their sizes from it); indirect tessellated draws are skipped (as
 MoltenVK does) until they are emulated the same way. After the fix: 0 of 240 captures with green,
 and in magenta the draw is small motes spread through the room.
+
+## 2026-10-16: Metal-native renderer, first light (M4, branch metal-native)
+
+The game presents through a `CAMetalLayer` with no Vulkan swapchain and no MoltenVK in the frame.
+Runs: split mode, windowed 2992x1672 Retina drawable (1496x836 points), native 1080p, upscaler
+off, `fps_cap=60`, test data in `$MAIN/out/macdata`, saves restored from `save-backups/` before
+and after. The screen was locked during the runs (the window server captures nothing then), so
+pictures come from the presenter's new `BB_SNAPSHOT_TRIGGER` readback of the drawable.
+
+| | Metal-native (this branch) | 0.4.0 (MoltenVK), same ini and save |
+|---|---|---|
+| Title screen | 60.0 FPS, worst 16.7 ms (every 5 s window after the first) | — |
+| Central Yharnam lamp (`cages-20261016`) | 60.0 FPS, worst 16.7 ms; one 90–180 ms frame per run around the load | 60.0 FPS, worst 16.7 ms; one 95 ms frame around the load |
+| Hunter's Dream (`loadcrash-20261014-134937`) | 60.0 FPS, worst 16.7 ms | not run |
+| First window to first `Frame stats` (incl. run.sh's no-op build) | 22 s cold, 20–24 s warm | 23 s |
+| First 5 s window | 55 FPS, worst ~410 ms: the 2nd frame's `PrepareFrame` waits ~344 ms for the preloaded pipelines, which build on the pool in the background | 60.6 FPS, worst 39.8 ms (preload of 644 pipelines, 321 ms, before the first frame) |
+| Draws (city) | ~1,400/frame, 67 tessellated | — |
+
+- **Pictures:** title (logo, hunter, Play Online/Offline, copyright line) with correct colours and
+  gamma; the city save at the lamp (cages, fence, HUD with Oil Urn and blood echoes) and Hunter's
+  Dream at the headstone with its prompt. `BB_HIGH_DPI=0` gives a 1496x836 drawable with the same
+  picture. 0.4.0 pictures of the same saves are still to be taken (locked screen).
+- **Binary archive:** cold cache (empty GPU dir): writes of 21, 28, 29 and 205 pipelines, 0 from
+  the archive; the save load compiled 391 shaders/pipelines (worst frame 399 ms, during the load
+  screen). Warm (same dir): **195 pipelines from the archive, 0 compiled**, save-load worst frame
+  92 ms.
+- **Validation (`MTL_DEBUG_LAYER=1`, nslog, title + city, ~34 FPS under the layer):** two distinct
+  messages. `depthStencilState must not be nil` (once per frame: the post-process pass after the
+  rasterizer's draws) is fixed: `Encoder::SetDepthStencil(nullptr)` now binds a no-test state.
+  Left for M5: "For depth/stencil attachment, the renderPipelineState pixelFormat must be
+  MTLPixelFormatInvalid, as no texture is set" (~600/s): the pipeline key takes the depth and
+  stencil formats from `DepthValid()`/`StencilValid()`, but the pass binds the depth buffer only
+  when depth or stencil testing is enabled. Where both are bound, the formats match the image's
+  (no format-mismatch message). No command-buffer errors.
+- **GC on 16 GB:** `Device::AllocatedSize()` 17.0 GiB at the title, 18.9 GiB in the city;
+  resident buffers (guest arena and guest buffers) 16.5 GiB in both. The collector compares the
+  difference: 0.45 GiB at the title, 2.4 GiB in the city, against a trigger of 26.2 GiB here
+  (70% of the M4 Max's recommended working set). On a 16 GB Mac the trigger is ~7.5 GiB, well
+  above 2.4 GiB: the arena is not counted. 0 images freed.
+- **vblank 480 Hz** in the stats is by design (`BB_VBLANK_HZ=0` for the uncapped preset; the
+  frame limit stays 60 here) and is the same on 0.4.0.
+- **Not checked yet:** a window resize and the full-screen switch while presenting (System
+  Events cannot reach the window while the screen is locked; `BB_FULLSCREEN=1` did not switch on
+  0.4.0 either while locked).

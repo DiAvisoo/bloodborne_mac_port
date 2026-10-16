@@ -21,6 +21,26 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 1. Stability
 
+- **Metal-native (M4 → M5): render pipelines declare a depth/stencil format the pass does not
+  bind.** `PipelineCache::RefreshGraphicsKey` takes `z_format`/`stencil_format` from
+  `DepthValid()`/`StencilValid()`, while the rasterizer binds the depth buffer only when depth or
+  stencil testing is enabled (`db_desc`, vk_rasterizer.cpp ~277). Metal's validation reports it
+  ~600 times a second ("renderPipelineState pixelFormat must be MTLPixelFormatInvalid, as no
+  texture is set"); without the layer it draws correctly. Fix: one rule for both (key the formats
+  on the same condition as the attachment, or bind the depth buffer whenever it is valid), then a
+  clean `MTL_DEBUG_LAYER=1` run (M5 gate). Pipeline keys change: one cache rebuild.
+- **Metal-native (M4): window resize and the full-screen switch not yet checked while
+  presenting** (the screen was locked during the first-light runs). Check: resize a windowed game
+  (System Events `set size of front window` on `bbgpu-host`) and switch to full screen; expect a
+  refit with black bars and no stall (`Present` fits each drawable's own size; 0x0 skips).
+  0.4.0 screenshots of the `cages-20261016` and `loadcrash-20261014-134937` saves for the
+  side-by-side are still to be taken the same way.
+- **Metal-native (M4): presenter parts off until M5/M6.** HDR (`SetHDR` is a no-op, the layer is
+  BGRA8 sRGB; was a MoltenVK HDR10 swapchain), display timing (`IsDisplayTimingSupported` false,
+  `TakePastTimings` empty: the spike log's present-to-display column reads 0), the settings
+  overlay (not drawn; M5 ImGui on Metal) and FSR 1 (`BB_FSR1` logs a warning and presents
+  without it; M6).
+
 - **1440p (live resolution path): the item icon in the HUD is missing** (black square where the
   Oil Urn picture is; present at 1080p). Seen 2026-10-16 night in both MoltenVK and Metal frame
   path screenshots (Hunter's Dream). Not yet investigated.
@@ -282,6 +302,12 @@ Each item: what was done for now, what the refinement is, and where it lives.
   interpreter). *Proper:* zero only for the walk that faulted, if repeated faults are cheap enough.
 
 ## 2. Performance
+
+- **Metal-native (M4): the second frame waits ~344 ms for the preloaded pipelines.** `WarmUp`
+  hands the stored pipelines to the build pool and returns at once, so the first frames' draws
+  wait for them (first 5 s window: 55 FPS, worst ~410 ms; 0.4.0 preloads before the first frame:
+  worst 40 ms). It happens behind the boot logos; later, start the warm-up earlier or let the
+  first frames skip draws whose pipeline is not ready.
 
 - **MoltenVK argument buffers off: done 2026-10-15** (default in `bbgpu_init`; +13–16% FPS
   uncapped at 1080p/1440p, native/FSR/MetalFX; FINDINGS).

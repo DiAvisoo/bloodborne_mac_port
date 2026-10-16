@@ -26,7 +26,9 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "bbport_split.h"
 
@@ -777,13 +779,23 @@ void VideoOutDriver::Flip(const Request& req) {
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
             // Texture-cache collector input: Metal's allocation minus the resident guest
             // buffers (the arena) against the trigger.
+            // And where this session's pipelines came from (binary archive or compiler).
+            u64 archive_hits = 0, compiled = 0;
+            if (presenter) {
+                const auto& psos = presenter->GetRasterizer().GetPipelineCache().Psos().GetCounters();
+                archive_hits = psos.archive_hits.load();
+                compiled = psos.archive_adds.load();
+            }
             std::printf("GPU memory: %.0f MiB allocated, %.0f MiB resident buffers; collector "
-                        "usage %.0f MiB, trigger %.0f MiB, %llu images freed\n",
+                        "usage %.0f MiB, trigger %.0f MiB, %llu images freed; pipelines: %llu "
+                        "from the binary archive, %llu compiled\n",
                         BbStats::gc_allocated_bytes.load() / 1048576.0,
                         BbStats::gc_resident_bytes.load() / 1048576.0,
                         BbStats::gc_used_bytes.load() / 1048576.0,
                         BbStats::gc_trigger_bytes.load() / 1048576.0,
-                        static_cast<unsigned long long>(BbStats::gc_freed_images.load()));
+                        static_cast<unsigned long long>(BbStats::gc_freed_images.load()),
+                        static_cast<unsigned long long>(archive_hits),
+                        static_cast<unsigned long long>(compiled));
             // Frame timeline: where each frame's time goes on the GPU side (ms per frame).
             if (frames) {
                 const auto per_frame = [&](std::atomic<u64>& total) {
