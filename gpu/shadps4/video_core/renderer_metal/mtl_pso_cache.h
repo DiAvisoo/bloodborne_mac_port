@@ -53,16 +53,7 @@ struct RenderPipelineInput {
     // their outputs. The draw recorder skips such draws instead.
 };
 
-/// Where the vertex buffer of one attribute goes. The layout stride is dynamic
-/// (MTLBufferLayoutStrideDynamic): bind with setVertexBuffer:offset:attributeStride:atIndex:
-/// using the V#'s stride. `constant` layouts (per-instance with divisor 0, step function
-/// Constant) are dynamic too (Metal rejects stride 0): pass any non-zero stride, e.g. the
-/// attribute's size; every vertex and instance reads the data at the buffer offset.
-struct VertexBufferSlot {
-    u32 location{};
-    u32 slot{};            ///< Metal buffer index: kVertexBufferBase - index of the attribute
-    bool constant{};       ///< per-instance with divisor 0
-};
+// VertexBufferSlot (where an attribute's vertex buffer goes) is in mtl_shader.h.
 
 struct RenderPipeline {
     RenderPipeline() = default;

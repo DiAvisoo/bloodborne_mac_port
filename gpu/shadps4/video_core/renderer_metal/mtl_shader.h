@@ -69,6 +69,17 @@ constexpr u32 kMaxSamplers = 16;
 constexpr u32 kMslCacheVersion = 4; // 4: 1D textures as 2D (bbport) // 3: stage input / export output layouts in the file (P7.1)
 /// (The variants have their own cache files.)
 
+/// Where the vertex buffer of one attribute goes. The layout stride is dynamic
+/// (MTLBufferLayoutStrideDynamic): bind with setVertexBuffer:offset:attributeStride:atIndex:
+/// using the V#'s stride. `constant` layouts (per-instance with divisor 0, step function
+/// Constant) are dynamic too (Metal rejects stride 0): pass any non-zero stride, e.g. the
+/// attribute's size; every vertex and instance reads the data at the buffer offset.
+struct VertexBufferSlot {
+    u32 location{};
+    u32 slot{};            ///< Metal buffer index: kVertexBufferBase - index of the attribute
+    bool constant{};       ///< per-instance with divisor 0
+};
+
 enum class TessDomain : u8 { Unknown, Triangles, Quads, Isolines };
 enum class TessSpacing : u8 { Equal, FractionalOdd, FractionalEven };
 

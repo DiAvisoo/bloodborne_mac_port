@@ -878,26 +878,7 @@ const char* ShaderStageName(ShaderStage stage) {
     return "unknown";
 }
 
-CompiledShader::~CompiledShader() {
-    // Balance the +1 of __bridge_retained; ARC releases at the end of the scope.
-    if (function) {
-        id<MTLFunction> released = (__bridge_transfer id<MTLFunction>)function;
-        (void)released;
-    }
-    if (library) {
-        id<MTLLibrary> released = (__bridge_transfer id<MTLLibrary>)library;
-        (void)released;
-    }
-}
-
-const ShaderBinding* CompiledShader::Find(u32 set, u32 binding, ShaderBinding::Kind kind) const {
-    for (const ShaderBinding& b : bindings) {
-        if (b.set == set && b.binding == binding && b.kind == kind) {
-            return &b;
-        }
-    }
-    return nullptr;
-}
+// CompiledShader's destructor and Find are in mtl_compiled_shader.mm (bbmetal_core).
 
 std::filesystem::path ShaderCompiler::DefaultCacheDir() {
     using namespace Common::FS;
