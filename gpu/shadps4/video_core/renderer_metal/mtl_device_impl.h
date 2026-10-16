@@ -15,7 +15,7 @@ namespace Metal {
 struct Device::Impl {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
-    id<MTLSharedEvent> event; ///< signalled with each command buffer's tick
+    id<MTLSharedEvent> event; ///< signalled with each command buffer's tick (for GPU-side waits)
 };
 
 } // namespace Metal

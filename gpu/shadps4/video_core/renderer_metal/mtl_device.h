@@ -55,11 +55,12 @@ public:
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return current_tick.load(std::memory_order_acquire);
     }
-    /// The highest tick the GPU is known to have finished.
+    /// The highest tick whose command buffer is known to have completed.
     [[nodiscard]] u64 KnownGpuTick() const noexcept {
         return counters->gpu_tick.load(std::memory_order_acquire);
     }
-    /// True once the GPU finished every command buffer up to `tick`.
+    /// True once every command buffer up to `tick` completed (its completion handlers ran, so
+    /// resources it used may be freed; the event is signalled slightly earlier).
     [[nodiscard]] bool IsFree(u64 tick) const;
     /// Blocks until `tick` is done; also returns for command buffers that failed. `tick` must have
     /// been committed (asserted).
@@ -75,9 +76,6 @@ public:
     }
 
 private:
-    /// Raises the known GPU tick to the shared event's value.
-    void Refresh() const;
-
     std::unique_ptr<Impl> impl;
     std::string name;
     Limits limits;

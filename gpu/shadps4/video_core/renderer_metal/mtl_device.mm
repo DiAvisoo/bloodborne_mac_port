@@ -45,24 +45,15 @@ void* Device::NativeQueue() const noexcept {
     return (__bridge void*)impl->queue;
 }
 
-void Device::Refresh() const {
-    RaiseTo(counters->gpu_tick, impl->event.signaledValue);
-}
-
 bool Device::IsFree(u64 tick) const {
-    if (KnownGpuTick() >= tick) {
-        return true;
-    }
-    Refresh();
     return KnownGpuTick() >= tick;
 }
 
 void Device::Wait(u64 tick) {
     ASSERT_MSG(tick < CurrentTick(), "Waiting for tick {} that was never committed", tick);
-    while (!IsFree(tick)) {
-        // A failed command buffer may never signal the event; its completion handler raises the
-        // known tick instead, so wait in slices and look again.
-        [impl->event waitUntilSignaledValue:tick timeoutMS:100];
+    // Completion handlers raise the known tick and wake waiters (also for failed command buffers).
+    for (u64 known = KnownGpuTick(); known < tick; known = KnownGpuTick()) {
+        counters->gpu_tick.wait(known, std::memory_order_acquire);
     }
 }
 
@@ -85,6 +76,7 @@ u64 Device::Commit(void* command_buffer) {
                       done.error ? done.error.localizedDescription.UTF8String : "unknown error");
         }
         RaiseTo(shared->gpu_tick, tick);
+        shared->gpu_tick.notify_all();
     }];
     [cmd commit];
     return tick;
