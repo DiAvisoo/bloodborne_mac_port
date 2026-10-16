@@ -83,7 +83,7 @@ public:
 
     // Render state: kept across passes, applied at the next draw.
     void SetRenderPipeline(void* pipeline); ///< id<MTLRenderPipelineState>
-    void SetDepthStencil(void* state);      ///< id<MTLDepthStencilState>
+    void SetDepthStencil(void* state);      ///< id<MTLDepthStencilState>; null: no depth/stencil test
     void SetViewport(const Viewport& viewport);
     void SetScissor(const Scissor& scissor);
     void SetCullMode(CullMode mode);

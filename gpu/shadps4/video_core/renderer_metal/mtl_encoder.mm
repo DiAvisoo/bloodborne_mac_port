@@ -483,7 +483,9 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
             [e setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)render_pipeline];
         }
         if (d & BitDepthStencil) {
-            [e setDepthStencilState:(__bridge id<MTLDepthStencilState>)depth_stencil];
+            // Metal takes no nil state: "none" is a state that always passes and writes nothing.
+            [e setDepthStencilState:depth_stencil ? (__bridge id<MTLDepthStencilState>)depth_stencil
+                                                  : NoDepthStencil()];
         }
         if (d & BitViewport) {
             [e setViewport:(MTLViewport){viewport.x, viewport.y, viewport.width, viewport.height,
@@ -530,6 +532,15 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
         ApplyStage(e, vertex, true);
         ApplyStage(e, fragment, false);
     }
+
+    id<MTLDepthStencilState> NoDepthStencil() {
+        if (!no_depth_stencil) {
+            no_depth_stencil =
+                [dev newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
+        }
+        return no_depth_stencil;
+    }
+    id<MTLDepthStencilState> no_depth_stencil; ///< SetDepthStencil(nullptr): no test, no writes
 
     void MarkRender(u32 bit) {
         render_dirty |= bit;
