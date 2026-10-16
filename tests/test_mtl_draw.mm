@@ -448,11 +448,21 @@ void TestSkippedDraws() {
     Expect(Pixel(out, 10, 10) == kBlack && Pixel(out, 50, 50) == kBlack,
            "skipped draws leave the target untouched");
     const auto& c = runs.GetCounters();
-    Expect(c.skipped_discard.load() == 3, "discard, cull-all and empty scissor counted");
+    Expect(c.skipped_no_pass.load() == 1, "a draw outside a pass counted");
+    Expect(c.skipped_discard.load() == 1, "rasterizer discard counted");
+    Expect(c.skipped_cull_all.load() == 1, "front-and-back cull counted");
+    Expect(c.skipped_empty_scissor.load() == 1, "empty scissor counted");
     Expect(c.skipped_emulated.load() == 1, "emulated topology counted");
     Expect(c.skipped_no_pipeline.load() == 1, "failed pipeline counted");
-    Expect(c.unsupported.load() == 3, "no pass, indexed and indirect rect lists counted");
+    Expect(c.unsupported.load() == 2, "indexed and indirect rect lists counted");
     Expect(c.draws.load() == 0, "no draw counted");
+    // The published report: per-reason deltas since the last report, empty when none.
+    SkipTotals last;
+    Expect(DescribeSkips(c, last) ==
+               "no pass 1, no pipeline 1, emulated topology 1, unsupported 2, discard 1, "
+               "cull all 1, empty scissor 1",
+           "the skip report lists every non-zero reason");
+    Expect(DescribeSkips(c, last).empty(), "no new skips: an empty report");
 
     // Drawn: a rect list (3 vertices -> 6), and a scissor with a negative offset (clamped).
     id<MTLTexture> rects = Target(device);
@@ -839,6 +849,102 @@ void TestKernelAndConstantStreamStrides() {
     Expect(device.ErrorCount() == 0, "kernel and constant stream strides ran without errors");
 }
 
+/// Per-vertex layouts under the validation layer: a missing stream over many vertices (the
+/// stand-in at stride 0), a V# stride of 0 indexed far past element 0, and V# strides that are
+/// not a multiple of 4 (2-byte formats at stride 6, as guest vertex data can be packed).
+void TestPerVertexStrideEdgeCases() {
+    Device device;
+    Encoder encoder{device};
+    NullResources null_resources{device};
+    Runs runs{device, null_resources.Get()};
+    Shaders shaders;
+    id<MTLLibrary> library = Library(device);
+    constexpr u32 kSlot = 30;
+    const auto pipeline_for = [&](MTLVertexFormat format) {
+        MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+        MTLVertexDescriptor* vd = [MTLVertexDescriptor new];
+        vd.attributes[0].format = format;
+        vd.attributes[0].bufferIndex = kSlot;
+        vd.layouts[kSlot].stride = MTLBufferLayoutStrideDynamic;
+        vd.layouts[kSlot].stepFunction = MTLVertexStepFunctionPerVertex;
+        desc.vertexDescriptor = vd;
+        return Pipeline(device, library, @"fullscreen_attr", @"attr_color", desc);
+    };
+    const std::array<VertexBufferSlot, 1> slots{VertexBufferSlot{0, kSlot, false}};
+
+    // Missing stream, 30000 vertices (10000 triangles over the target): the 64 KiB stand-in at
+    // stride 0 is read at element 0 only.
+    id<MTLRenderPipelineState> float4_pipeline = pipeline_for(MTLVertexFormatFloat4);
+    DrawPipeline p4 = View(float4_pipeline, &shaders.none, &shaders.none);
+    p4.vertex_slots = slots;
+    id<MTLTexture> missing = Target(device);
+    encoder.BeginRenderPass(Pass(missing));
+    Expect(runs.Draw(encoder, p4, FullState(), Resources{{}, {}, {}, {}, IndexType::U16},
+                     DrawArgs{30000}),
+           "a missing stream over 30000 vertices draws");
+    encoder.EndRenderPass();
+
+    // V# stride 0 on a 16-byte buffer, 30000 vertices: element 0 for all.
+    id<MTLBuffer> one = SharedBuffer(device, 16);
+    const float red[4] = {1, 0, 0, 1};
+    std::memcpy(one.contents, red, sizeof(red));
+    const std::array<VertexStream, 1> zero{VertexStream{Ref(one), 0}};
+    id<MTLTexture> repeated = Target(device);
+    encoder.BeginRenderPass(Pass(repeated));
+    Expect(runs.Draw(encoder, p4, FullState(), Resources{{}, {}, zero, {}, IndexType::U16},
+                     DrawArgs{30000}),
+           "a stride-0 stream over 30000 vertices draws");
+    encoder.EndRenderPass();
+
+    // Stride 6 (not a multiple of 4), UChar2Normalized: vertices at bytes 0, 6, 12 are red
+    // (255, 0); every other 2-byte pair is green (0, 255), so a stride rounded to 4 or 8 shows.
+    id<MTLBuffer> packed = SharedBuffer(device, 64);
+    u8* bytes = static_cast<u8*>(packed.contents);
+    for (u32 i = 0; i < 64; i += 2) {
+        bytes[i] = 0;
+        bytes[i + 1] = 255;
+    }
+    for (u32 v = 0; v < 3; ++v) {
+        bytes[v * 6] = 255;
+        bytes[v * 6 + 1] = 0;
+    }
+    id<MTLRenderPipelineState> uchar2_pipeline = pipeline_for(MTLVertexFormatUChar2Normalized);
+    DrawPipeline p2 = View(uchar2_pipeline, &shaders.none, &shaders.none);
+    p2.vertex_slots = slots;
+    const std::array<VertexStream, 1> six{VertexStream{Ref(packed), 6}};
+    id<MTLTexture> odd = Target(device);
+    encoder.BeginRenderPass(Pass(odd));
+    Expect(runs.Draw(encoder, p2, FullState(), Resources{{}, {}, six, {}, IndexType::U16},
+                     DrawArgs{3}),
+           "a stride-6 stream draws");
+    encoder.EndRenderPass();
+    // Stride 6 at an offset that is not a multiple of 4 (2): the same pattern shifted 2 bytes.
+    id<MTLBuffer> shifted = SharedBuffer(device, 64);
+    std::memcpy(static_cast<u8*>(shifted.contents) + 2, bytes, 62);
+    const std::array<VertexStream, 1> six_at_2{VertexStream{Ref(shifted, 2), 6}};
+    id<MTLTexture> odd_offset = Target(device);
+    encoder.BeginRenderPass(Pass(odd_offset));
+    Expect(runs.Draw(encoder, p2, FullState(), Resources{{}, {}, six_at_2, {}, IndexType::U16},
+                     DrawArgs{3}),
+           "a stride-6 stream at offset 2 draws");
+    encoder.EndRenderPass();
+
+    id<MTLBuffer> out_missing = Readback(device, encoder, missing);
+    id<MTLBuffer> out_repeated = Readback(device, encoder, repeated);
+    id<MTLBuffer> out_odd = Readback(device, encoder, odd);
+    id<MTLBuffer> out_odd_offset = Readback(device, encoder, odd_offset);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out_missing, 10, 10) == 0u && Pixel(out_missing, 40, 20) == 0u,
+           "a missing stream over many vertices reads zero");
+    Expect(Pixel(out_repeated, 10, 10) == kRed && Pixel(out_repeated, 40, 20) == kRed,
+           "a stride-0 stream over many vertices reads element 0");
+    Expect(Pixel(out_odd, 10, 10) == kRed && Pixel(out_odd, 40, 20) == kRed,
+           "a stride-6 stream reads bytes 0, 6 and 12");
+    Expect(Pixel(out_odd_offset, 10, 10) == kRed && Pixel(out_odd_offset, 40, 20) == kRed,
+           "a stride-6 stream at offset 2 reads bytes 2, 8 and 14");
+    Expect(device.ErrorCount() == 0, "per-vertex stride edge cases ran without errors");
+}
+
 void TestMaskDepthStencil() {
     DepthStencilKey key;
     key.depth_test = true;
@@ -869,6 +975,7 @@ int main() {
         TestVertexStreamStrides();
         TestStreamStrideRule();
         TestKernelAndConstantStreamStrides();
+        TestPerVertexStrideEdgeCases();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

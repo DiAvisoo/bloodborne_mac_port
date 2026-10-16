@@ -79,6 +79,9 @@ Metal::RenderPassDesc RenderState::ToDesc() const {
 std::mutex Scheduler::submit_mutex;
 
 Scheduler::Scheduler(Metal::Device& device_, bool threaded) : device{device_} {
+    // The first command buffer starts without state: apply all of it on the first draws rather
+    // than rely on the defaults matching the encoder's.
+    dynamic_state.Invalidate();
     // bbport: BB_VK_RECORD_THREAD=0 records on the calling thread.
     const char* env = std::getenv("BB_VK_RECORD_THREAD");
     if (threaded && !(env && env[0] == '0')) {
@@ -548,6 +551,7 @@ u64 Scheduler::SubmitExecution() {
     draw_run_open = false;
     const u64 tick = timeline.Committed(draw_runs.Submit(encoder));
     debug_groups = 0; // Encoder::Submit closed them
+    draw_runs.ReportSkips(); // dropped draws by reason, every 5 s when there are any
     BbStats::queue_submit_ns.fetch_add(bbport::CyclesToNs(bbport::CpuCycles() - submit_start),
                                        std::memory_order_relaxed);
     BbStats::queue_submits.fetch_add(1, std::memory_order_relaxed);

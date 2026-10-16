@@ -19,8 +19,10 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 #include "common/types.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
@@ -170,8 +172,12 @@ struct Resources {
 /// The attribute stride a vertex slot is bound with, for draws and for the tessellation /
 /// geometry kernels' stage-in streams alike: the V#'s stride (0 repeats element 0, as in
 /// Vulkan); 0 for constant (per-instance, divisor 0) slots and for missing streams (the null
-/// stand-in's element 0, however far the draw indexes). Metal accepts 0 for dynamic-stride
-/// layouts (MTL_DEBUG_LAYER).
+/// stand-in's element 0, however far the draw indexes). Under MTL_DEBUG_LAYER Metal accepts, and
+/// reads correctly, these attribute strides on dynamic-stride per-vertex layouts: 0 (30000
+/// vertices on a 16-byte buffer or on the stand-in), and strides and offsets that are not
+/// multiples of 4 (stride 6 with a 2-byte format, at offset 0 and 2; stride 6 at offset 2 with a
+/// 4-byte float; stride 3 is accepted too). Guest strides are passed through unchanged
+/// (tests/test_mtl_draw.mm TestPerVertexStrideEdgeCases).
 constexpr u32 StreamStride(const VertexBufferSlot& slot, const VertexStream* stream) {
     return stream && stream->buffer.buffer && !slot.constant ? stream->stride : 0;
 }
@@ -213,6 +219,11 @@ struct PatchDraw {
     BufferRef factors{}; ///< tessellation factors (kTessFactorBuffer, factor buffer)
     u32 patches{};
     u32 output_control_points{};
+};
+
+/// The skip counters already reported (DescribeSkips).
+struct SkipTotals {
+    std::array<u64, 8> values{};
 };
 
 /// A draw/dispatch recorder for one Encoder (one thread): counters, scratch memory and the
@@ -283,13 +294,19 @@ public:
     void Submitted(u64 device_tick);
 
     struct Counters {
-        std::atomic<u64> draws{}, dispatches{}, skipped_no_pipeline{}, skipped_tess{},
-            skipped_emulated{}, skipped_discard{}, unsupported{}, tess_draws{},
-            tess_after_tess{}, geometry_draws{};
+        std::atomic<u64> draws{}, dispatches{}, tess_draws{}, tess_after_tess{},
+            geometry_draws{};
+        // Dropped draws and dispatches, by reason (published by ReportSkips).
+        std::atomic<u64> skipped_no_pass{}, skipped_no_pipeline{}, skipped_tess{},
+            skipped_emulated{}, unsupported{}, skipped_discard{}, skipped_cull_all{},
+            skipped_empty_scissor{};
     };
     [[nodiscard]] const Counters& GetCounters() const noexcept {
         return counters;
     }
+    /// Logs the dropped draws by reason since the last report (DescribeSkips), at most every
+    /// 5 seconds and only when there are any. Called after each submission.
+    void ReportSkips();
 
 private:
     struct Pending {
@@ -335,6 +352,13 @@ private:
     /// shared_ptr: deleted where it was made).
     std::shared_ptr<Geometry::IndirectKernels> geometry_kernels;
     bool geometry_kernels_failed{};
+    // ReportSkips.
+    SkipTotals skips_reported;
+    std::chrono::steady_clock::time_point skips_reported_at{std::chrono::steady_clock::now()};
 };
+
+/// The dropped draws per reason since `last` ("no pass 1, discard 2", non-zero reasons only;
+/// empty when nothing new), then `last` = `now`.
+std::string DescribeSkips(const Runs::Counters& now, SkipTotals& last);
 
 } // namespace Metal::Draw

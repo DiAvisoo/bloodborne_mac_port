@@ -9,6 +9,8 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <string>
+#include <utility>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "video_core/renderer_metal/mtl_depth_stencil.h"
@@ -261,7 +263,7 @@ bool Runs::Count(Skip skip) {
     case Skip::None:
         return true;
     case Skip::NoPass:
-        ++counters.unsupported;
+        ++counters.skipped_no_pass;
         BB_DRAW_WARN_ONCE("Metal draw outside a render pass (skipped)");
         return false;
     case Skip::NoPipeline:
@@ -271,12 +273,54 @@ bool Runs::Count(Skip skip) {
         ++counters.skipped_emulated;
         return false;
     case Skip::Discard:
-    case Skip::CullAll:
-    case Skip::EmptyScissor:
         ++counters.skipped_discard;
+        return false;
+    case Skip::CullAll:
+        ++counters.skipped_cull_all;
+        return false;
+    case Skip::EmptyScissor:
+        ++counters.skipped_empty_scissor;
         return false;
     }
     return false;
+}
+
+std::string DescribeSkips(const Runs::Counters& now, SkipTotals& last) {
+    const std::array<std::pair<const char*, const std::atomic<u64>*>, 8> reasons{{
+        {"no pass", &now.skipped_no_pass},
+        {"no pipeline", &now.skipped_no_pipeline},
+        {"tessellation", &now.skipped_tess},
+        {"emulated topology", &now.skipped_emulated},
+        {"unsupported", &now.unsupported},
+        {"discard", &now.skipped_discard},
+        {"cull all", &now.skipped_cull_all},
+        {"empty scissor", &now.skipped_empty_scissor},
+    }};
+    static_assert(std::tuple_size_v<decltype(SkipTotals::values)> == 8);
+    std::string out;
+    for (size_t i = 0; i < reasons.size(); ++i) {
+        const u64 value = reasons[i].second->load(std::memory_order_relaxed);
+        if (const u64 delta = value - last.values[i]) {
+            out += out.empty() ? "" : ", ";
+            out += reasons[i].first;
+            out += ' ';
+            out += std::to_string(delta);
+        }
+        last.values[i] = value;
+    }
+    return out;
+}
+
+void Runs::ReportSkips() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - skips_reported_at < std::chrono::seconds{5}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - skips_reported_at).count();
+    skips_reported_at = now;
+    if (const std::string skips = DescribeSkips(counters, skips_reported); !skips.empty()) {
+        LOG_WARNING(Render, "Metal draws skipped in the last {:.0f} s: {}", seconds, skips);
+    }
 }
 
 bool Runs::Begin(Encoder& e, const DrawPipeline& p, const DrawState& s, const Resources& r) {
