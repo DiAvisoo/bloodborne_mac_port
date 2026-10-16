@@ -111,6 +111,7 @@ struct Encoder::Impl {
 
     // Render pass (Task 5).
     bool in_pass{}, pass_opened{}, pass_clears{};
+    bool pass_resolves{}; ///< a colour attachment resolves at the end of the pass
     MTLRenderPassDescriptor* pass_first; ///< as begun, with its clears
     MTLRenderPassDescriptor* pass_load;  ///< the same with Load actions (reopening)
     u32 target_width{}, target_height{}; ///< of the pass (the scissor is clamped to it)
@@ -632,7 +633,7 @@ void Encoder::BeginRenderPass(const RenderPassDesc& desc) {
     ASSERT_MSG(!impl->in_pass, "BeginRenderPass inside a render pass");
     EndEncoding();
     MTLRenderPassDescriptor* first = [MTLRenderPassDescriptor renderPassDescriptor];
-    bool clears = false, attachments = false;
+    bool clears = false, attachments = false, resolves = false;
     for (u32 i = 0; i < RenderPassDesc::MaxColors; ++i) {
         const ColorAttachment& c = desc.colors[i];
         if (!c.texture) {
@@ -654,6 +655,7 @@ void Encoder::BeginRenderPass(const RenderPassDesc& desc) {
             a.resolveLevel = c.resolve_level;
             a.resolveSlice = c.resolve_slice;
             a.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+            resolves = true;
         }
     }
     const DepthAttachment& d = desc.depth;
@@ -711,14 +713,15 @@ void Encoder::BeginRenderPass(const RenderPassDesc& desc) {
     impl->pass_first = first;
     impl->pass_load = load;
     impl->pass_clears = clears;
+    impl->pass_resolves = resolves;
     impl->pass_opened = false;
     impl->in_pass = true;
 }
 
 void Encoder::EndRenderPass() {
     ASSERT_MSG(impl->in_pass, "EndRenderPass outside a render pass");
-    if (!impl->pass_opened && impl->pass_clears) {
-        impl->Render(); // a pass that only clears still has to clear
+    if (!impl->pass_opened && (impl->pass_clears || impl->pass_resolves)) {
+        impl->Render(); // a pass that only clears or resolves still has to do it
     }
     impl->EndRender();
     impl->in_pass = false;

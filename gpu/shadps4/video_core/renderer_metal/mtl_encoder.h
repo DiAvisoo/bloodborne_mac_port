@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: Metal::Encoder records the renderer's commands into Metal command buffers (Metal-native
 // renderer, spec component 2). It is the state machine of mtl_frame.mm (metal-backend) with
-// native arguments: a render pass opens its Metal encoder at the first draw (a pass with neither
-// draws nor clears costs nothing), blits and dispatches inside a pass end the render encoder and
-// the pass reopens with Load actions, and state reaches the Metal encoder only when it changed.
+// native arguments: a render pass opens its Metal encoder at the first draw (a pass with no draws,
+// clears or resolves costs nothing), blits and dispatches inside a pass end the render encoder
+// and the pass reopens with Load actions, and state reaches the Metal encoder only when it changed.
 // One thread uses an Encoder at a time.
 
 #pragma once

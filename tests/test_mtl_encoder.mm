@@ -727,6 +727,49 @@ void TestDepthAspectCopy() {
     Expect(static_cast<const u8*>(stencil.contents)[5] == 7, "stencil aspect copied");
 }
 
+/// MSAA resolves through a render pass: a pass that clears and resolves, and a resolve-only pass
+/// (no clears, no draws) after a separate clear pass, both into 1x RGBA8 textures.
+void TestResolvePasses() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    MTLTextureDescriptor* d = [MTLTextureDescriptor new];
+    d.textureType = MTLTextureType2DMultisample;
+    d.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    d.width = kSize;
+    d.height = kSize;
+    d.sampleCount = 4;
+    d.usage = MTLTextureUsageRenderTarget;
+    d.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> msaa_a = [dev newTextureWithDescriptor:d];
+    id<MTLTexture> msaa_b = [dev newTextureWithDescriptor:d];
+    id<MTLTexture> resolved_a = Texture(device, kSize, kSize);
+    id<MTLTexture> resolved_b = Texture(device, kSize, kSize);
+    FillTexture(device, encoder, resolved_a, kBlue);
+    FillTexture(device, encoder, resolved_b, kBlue);
+
+    Metal::RenderPassDesc clear_resolve = ColorPass(msaa_a, true, kYellow);
+    clear_resolve.colors[0].resolve_texture = (__bridge void*)resolved_a;
+    encoder.BeginRenderPass(clear_resolve);
+    encoder.EndRenderPass();
+
+    encoder.BeginRenderPass(ColorPass(msaa_b, true, kRed));
+    encoder.EndRenderPass();
+    Metal::RenderPassDesc resolve_only = ColorPass(msaa_b, false, 0);
+    resolve_only.colors[0].resolve_texture = (__bridge void*)resolved_b;
+    encoder.BeginRenderPass(resolve_only);
+    encoder.EndRenderPass();
+
+    id<MTLBuffer> a = Readback(device, encoder, resolved_a);
+    id<MTLBuffer> b = Readback(device, encoder, resolved_b);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(a, kSize, 5, 5) == kYellow && Pixel(a, kSize, 63, 63) == kYellow,
+           "a 4x MSAA clear + resolve pass resolves");
+    Expect(Pixel(b, kSize, 5, 5) == kRed && Pixel(b, kSize, 63, 63) == kRed,
+           "a resolve-only pass (no clears, no draws) still resolves");
+    Expect(device.ErrorCount() == 0, "resolve passes ran without errors");
+}
+
 } // namespace
 
 /// Two schedulers' timelines on one device: each counts its own commits 1, 2, ... and a tick of
@@ -980,6 +1023,7 @@ int main() {
         TestUntrackedRunsFirst();
         TestIndirectResidency();
         TestDepthAspectCopy();
+        TestResolvePasses();
         TestSpecialize();
         TestDepthStencilCache();
         TestTimelines();

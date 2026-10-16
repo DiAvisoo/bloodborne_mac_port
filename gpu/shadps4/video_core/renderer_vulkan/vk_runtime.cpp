@@ -1,12 +1,22 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <mutex>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 #include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
 #include "bbport_toggles.h"
+#include "common/alignment.h"
+#include "common/div_ceil.h"
 #include "video_core/buffer_cache/buffer.h"
-#include "video_core/renderer_vulkan/liverpool_to_vk.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_metal/mtl_encoder.h"
+#include "video_core/renderer_metal/mtl_texture.h"
+#include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
@@ -185,14 +195,12 @@ void Runtime::FillBuffer(const VideoCore::Buffer& dst, u64 offset, u64 size, u32
     });
 }
 
-bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
-                      vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
-                      std::optional<VideoCore::SubresourceRange> subres_range) {
+void Runtime::AccessImage(VideoCore::Image* image, bool write) {
     BeforeImageAccess();
-    if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
-    const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
-    image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
-    return image_barriers.size() != prev_num_barriers;
+    if (scene_targets) {
+        scene_targets->NativeAccess(*image, write ? vk::AccessFlagBits2::eTransferWrite
+                                                  : vk::AccessFlagBits2::eTransferRead);
+    }
 }
 
 Runtime::TransferMark::TransferMark(Runtime& runtime, const char* what,
@@ -219,33 +227,188 @@ Runtime::TransferMark::~TransferMark() {
     }
 }
 
+namespace {
+
+using Metal::BlitAspect;
+
+/// Logs `message` once per Vulkan format.
+void LogOncePerFormat(vk::Format format, const char* message) {
+    static std::mutex mutex;
+    static std::vector<std::pair<vk::Format, const char*>> logged;
+    std::scoped_lock lock{mutex};
+    if (std::ranges::find(logged, std::pair{format, message}) == logged.end()) {
+        logged.emplace_back(format, message);
+        LOG_WARNING(Render_Vulkan, "{} ({})", message, vk::to_string(format));
+    }
+}
+
+/// False (logged once) for images whose format Metal has no texture format for (RGB32 and the
+/// others an RGBA8 texture stands in for, see image.cpp): their copies are skipped.
+bool HasMetalFormat(const VideoCore::Image& image) {
+    if (Metal::VkToMtl::PixelFormat(image.info.pixel_format) != 0) {
+        return true;
+    }
+    LogOncePerFormat(image.info.pixel_format,
+                     "image format has no Metal texture format: copies of it are skipped");
+    return false;
+}
+
+bool IsCombinedDepthStencil(u32 pixel_format) {
+    return Metal::VkToMtl::IsDepthPixelFormat(pixel_format) &&
+           Metal::VkToMtl::HasStencilPixelFormat(pixel_format);
+}
+
+/// The aspect a buffer copy of `mask` moves. Metal copies one aspect of a combined depth-stencil
+/// texture at a time (depth when both are asked for); other formats have one.
+BlitAspect AspectOf(u32 pixel_format, vk::ImageAspectFlags mask) {
+    if (!IsCombinedDepthStencil(pixel_format)) {
+        return BlitAspect::All;
+    }
+    if (!(mask & vk::ImageAspectFlagBits::eDepth) && (mask & vk::ImageAspectFlagBits::eStencil)) {
+        return BlitAspect::Stencil;
+    }
+    return BlitAspect::Depth;
+}
+
+/// How `aspect` of a texture of `pixel_format` lies in a buffer: bytes per block and block size
+/// in texels. Depth of combined formats is 32-bit, stencil 8-bit. bytes == 0: not copyable.
+struct BlockLayout {
+    u32 bytes{}, width{1}, height{1};
+};
+BlockLayout LayoutOf(u32 pixel_format, BlitAspect aspect) {
+    switch (aspect) {
+    case BlitAspect::Depth:
+        return {4};
+    case BlitAspect::Stencil:
+        return {1};
+    case BlitAspect::All:
+        break;
+    }
+    return {Metal::BytesPerBlock(pixel_format), Metal::BlockWidth(pixel_format),
+            Metal::BlockHeight(pixel_format)};
+}
+
+u32 MipSize(u32 size, u32 level) {
+    return std::max(size >> level, 1u);
+}
+
+u32 DepthOf(const Metal::TextureDesc& desc, u32 level) {
+    return desc.type == Metal::TextureType::Tex3D ? MipSize(desc.depth, level) : 1u;
+}
+
+/// The clear colour for a colour attachment of the image's Metal texture: the value member its
+/// numeric format reads, moved to the channels the Metal format stores them in (BGRA-like twins).
+std::array<double, 4> ClearColorOf(vk::Format format, const vk::ClearColorValue& value) {
+    const std::string_view numeric = vk::componentNumericFormat(format, 0);
+    std::array<double, 4> color{};
+    for (u32 i = 0; i < 4; ++i) {
+        color[i] = numeric == "UINT"   ? double(value.uint32[i])
+                   : numeric == "SINT" ? double(value.int32[i])
+                                       : double(value.float32[i]);
+    }
+    const auto swizzle = Metal::VkToMtl::FormatSwizzle(format);
+    const u8 channels[4] = {swizzle.r, swizzle.g, swizzle.b, swizzle.a};
+    std::array<double, 4> stored = color;
+    for (u32 i = 0; i < 4; ++i) {
+        if (channels[i] >= Metal::VkToMtl::SwizzleRed) {
+            stored[channels[i] - Metal::VkToMtl::SwizzleRed] = color[i];
+        }
+    }
+    return stored;
+}
+
+constexpr std::array<u8, 4> IdentitySwizzle{
+    Metal::VkToMtl::IdentitySwizzle.r, Metal::VkToMtl::IdentitySwizzle.g,
+    Metal::VkToMtl::IdentitySwizzle.b, Metal::VkToMtl::IdentitySwizzle.a};
+
+/// One buffer <-> texture copy (offset relative to the buffer reference).
+struct BufferTextureCopy {
+    u64 offset;
+    u32 bytes_per_row, bytes_per_image;
+    u32 level, slice;
+    Metal::Origin3 origin;
+    Metal::Size3 size;
+    BlitAspect aspect;
+};
+
+/// A texture-to-texture copy as recorded: both sizes (they differ in texels when a staging
+/// buffer reinterprets blocks), the staging layout and offset.
+struct TextureCopy {
+    u32 src_level, src_slice, src_z;
+    u32 dst_level, dst_slice, dst_z;
+    Metal::Size3 src_size, dst_size;
+    u32 bytes_per_row, bytes_per_image;
+    u64 offset;
+};
+
+} // namespace
+
+void Runtime::CopyBufferImage(VideoCore::Image& image, const VideoCore::Buffer& buffer,
+                              std::span<const vk::BufferImageCopy> copies, bool upload) {
+    if (!HasMetalFormat(image)) {
+        return;
+    }
+    const Metal::TextureDesc& desc = image.backing->desc;
+    boost::container::small_vector<BufferTextureCopy, 16> blits;
+    for (const auto& copy : copies) {
+        const auto& sub = copy.imageSubresource;
+        const BlitAspect aspect = AspectOf(desc.pixel_format, sub.aspectMask);
+        const BlockLayout block = LayoutOf(desc.pixel_format, aspect);
+        if (block.bytes == 0) {
+            LogOncePerFormat(image.info.pixel_format,
+                             "image format has no buffer copy layout: copy skipped");
+            continue;
+        }
+        const u32 row_length = copy.bufferRowLength ? copy.bufferRowLength : copy.imageExtent.width;
+        const u32 image_height =
+            copy.bufferImageHeight ? copy.bufferImageHeight : copy.imageExtent.height;
+        const u32 bytes_per_row = Common::DivCeil(row_length, block.width) * block.bytes;
+        const u32 bytes_per_image = bytes_per_row * Common::DivCeil(image_height, block.height);
+        for (u32 layer = 0; layer < sub.layerCount; ++layer) {
+            blits.push_back({
+                .offset = copy.bufferOffset + u64(layer) * bytes_per_image * copy.imageExtent.depth,
+                .bytes_per_row = bytes_per_row,
+                .bytes_per_image = bytes_per_image,
+                .level = sub.mipLevel,
+                .slice = sub.baseArrayLayer + layer,
+                .origin = {u32(copy.imageOffset.x), u32(copy.imageOffset.y),
+                           u32(copy.imageOffset.z)},
+                .size = {copy.imageExtent.width, copy.imageExtent.height, copy.imageExtent.depth},
+                .aspect = aspect,
+            });
+        }
+    }
+    if (blits.empty()) {
+        return;
+    }
+    scheduler.Record([texture = image.GetImage(), ref = buffer.Ref(), upload,
+                      blits = scheduler.RecordData(std::span<const BufferTextureCopy>{blits})](
+                         Metal::Encoder& e) {
+        for (const auto& b : blits) {
+            const Metal::BufferRef at{ref.buffer, ref.offset + b.offset};
+            if (upload) {
+                e.CopyBufferToTexture(at, b.bytes_per_row, b.bytes_per_image, texture, b.level,
+                                      b.slice, b.origin, b.size, b.aspect);
+            } else {
+                e.CopyTextureToBuffer(texture, b.level, b.slice, b.origin, b.size, at,
+                                      b.bytes_per_row, b.bytes_per_image, b.aspect);
+            }
+        }
+    });
+}
+
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image upload", *dst};
+    AccessImage(dst, true);
 
-    bool needs_flush =
-        Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eCopy,
-                vk::AccessFlagBits2::eTransferWrite);
-    for (const auto& copy : upload_copies) {
-        const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
-        needs_flush |= IsBufferAccessed(src, copy.bufferOffset, copy_size);
-    }
-    if (needs_flush) {
-        FlushBarriers();
-    }
-
-    scheduler.Record([src_handle = src->Handle(), image = dst->GetImage(),
-                      regions = scheduler.RecordData(upload_copies)](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyBufferToImage(src_handle, image, vk::ImageLayout::eTransferDstOptimal,
-                                 regions.size(), regions.data());
-    });
+    CopyBufferImage(*dst, *src, upload_copies, true);
 
     for (const auto& copy : upload_copies) {
         const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
-        AccessBuffer(src, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
-                     vk::AccessFlagBits2::eTransferRead);
+        AccessBuffer(src, copy.bufferOffset, copy_size);
     }
 
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -256,29 +419,133 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image download", *src};
+    AccessImage(src, false);
 
-    bool needs_flush =
-        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
-                vk::AccessFlagBits2::eTransferRead);
+    CopyBufferImage(*src, *dst, download_copies, false);
+
     for (const auto& copy : download_copies) {
         const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
-        needs_flush |= IsBufferAccessed(dst, copy.bufferOffset, copy_size, true);
+        AccessBuffer(dst, copy.bufferOffset, copy_size);
     }
-    if (needs_flush) {
-        FlushBarriers();
+}
+
+void Runtime::CopyRegions(VideoCore::Image* src, VideoCore::Image* dst,
+                          std::span<const TextureRegion> regions) {
+    if (regions.empty() || !HasMetalFormat(*src) || !HasMetalFormat(*dst)) {
+        return;
+    }
+    const Metal::TextureDesc& sd = src->backing->desc;
+    const Metal::TextureDesc& dd = dst->backing->desc;
+    void* src_texture = src->GetImage();
+    void* dst_texture = dst->GetImage();
+    Metal::Object view;
+    bool bounce = false;
+    if (sd.pixel_format != dd.pixel_format) {
+        // A blit needs one pixel format: view either side as the other when Metal can, else
+        // reinterpret blocks of the same size (BC <-> uncompressed, depth <-> colour) through a
+        // staging buffer.
+        if (Metal::SafeViewPixelFormat(sd.pixel_format, dd.pixel_format, sd.format_views) ==
+            dd.pixel_format) {
+            view = Metal::CreateTextureView(src_texture, dd.pixel_format, sd.type, 0, sd.levels, 0,
+                                            sd.layers, IdentitySwizzle);
+            src_texture = view.Get();
+        } else if (Metal::SafeViewPixelFormat(dd.pixel_format, sd.pixel_format,
+                                              dd.format_views) == sd.pixel_format) {
+            view = Metal::CreateTextureView(dst_texture, sd.pixel_format, dd.type, 0, dd.levels, 0,
+                                            dd.layers, IdentitySwizzle);
+            dst_texture = view.Get();
+        } else {
+            bounce = Metal::BytesPerBlock(sd.pixel_format) != 0 &&
+                     Metal::BytesPerBlock(sd.pixel_format) == Metal::BytesPerBlock(dd.pixel_format);
+        }
+        if (!bounce && !view) {
+            LogOncePerFormat(dst->info.pixel_format,
+                             "image copy between incompatible formats skipped (destination)");
+            return;
+        }
+    }
+    if (bounce ? (sd.samples > 1 || dd.samples > 1) : sd.samples != dd.samples) {
+        LogOncePerFormat(dst->info.pixel_format,
+                         "image copy between different sample counts skipped (destination)");
+        return;
     }
 
-    scheduler.Record([image = src->GetImage(), buffer = dst->Handle(),
-                      regions = scheduler.RecordData(download_copies)](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, buffer,
-                                 regions.size(), regions.data());
+    // Clamp each region to both subresources, in whole blocks of each side.
+    const BlockLayout sb = LayoutOf(sd.pixel_format, BlitAspect::All);
+    const BlockLayout db = LayoutOf(dd.pixel_format, BlitAspect::All);
+    boost::container::small_vector<TextureCopy, 16> copies;
+    u64 staging_size = 0;
+    for (const auto& r : regions) {
+        if (r.src_level >= sd.levels || r.dst_level >= dd.levels || r.src_slice >= sd.layers ||
+            r.dst_slice >= dd.layers || r.src_z >= DepthOf(sd, r.src_level) ||
+            r.dst_z >= DepthOf(dd, r.dst_level)) {
+            continue;
+        }
+        const u32 sw = MipSize(sd.width, r.src_level), sh = MipSize(sd.height, r.src_level);
+        const u32 dw = MipSize(dd.width, r.dst_level), dh = MipSize(dd.height, r.dst_level);
+        const u32 blocks_x = std::min(Common::DivCeil(std::min(r.width, sw), sb.width),
+                                      Common::DivCeil(dw, db.width));
+        const u32 blocks_y = std::min(Common::DivCeil(std::min(r.height, sh), sb.height),
+                                      Common::DivCeil(dh, db.height));
+        const u32 depth = std::min({r.depth, DepthOf(sd, r.src_level) - r.src_z,
+                                    DepthOf(dd, r.dst_level) - r.dst_z});
+        TextureCopy copy{
+            .src_level = r.src_level,
+            .src_slice = r.src_slice,
+            .src_z = r.src_z,
+            .dst_level = r.dst_level,
+            .dst_slice = r.dst_slice,
+            .dst_z = r.dst_z,
+            .src_size = {std::min(blocks_x * sb.width, sw), std::min(blocks_y * sb.height, sh),
+                         depth},
+            .dst_size = {std::min(blocks_x * db.width, dw), std::min(blocks_y * db.height, dh),
+                         depth},
+            .bytes_per_row = blocks_x * sb.bytes,
+            .bytes_per_image = blocks_x * sb.bytes * blocks_y,
+            .offset = staging_size,
+        };
+        if (!bounce) {
+            // Same block size on both sides: one size that fits both.
+            copy.src_size.width = std::min(copy.src_size.width, copy.dst_size.width);
+            copy.src_size.height = std::min(copy.src_size.height, copy.dst_size.height);
+        }
+        staging_size += Common::AlignUp(u64(copy.bytes_per_image) * depth, 16);
+        copies.push_back(copy);
+    }
+    if (copies.empty()) {
+        return;
+    }
+
+    Metal::BufferRef staging{};
+    if (bounce) {
+        const auto ref = staging_pool.Request(staging_size, VideoCore::MemoryType::DeviceLocal, 16);
+        staging = ref.buffer->Ref(ref.offset);
+    }
+    scheduler.Record([src_texture, dst_texture, view = std::move(view), staging, bounce,
+                      copies = scheduler.RecordData(std::span<const TextureCopy>{copies})](
+                         Metal::Encoder& e) mutable {
+        if (view) {
+            e.KeepAlive(std::move(view));
+        }
+        if (!bounce) {
+            for (const auto& c : copies) {
+                e.CopyTexture(src_texture, c.src_level, c.src_slice, {0, 0, c.src_z},
+                              dst_texture, c.dst_level, c.dst_slice, {0, 0, c.dst_z}, c.src_size);
+            }
+            return;
+        }
+        for (const auto& c : copies) {
+            e.CopyTextureToBuffer(src_texture, c.src_level, c.src_slice, {0, 0, c.src_z},
+                                  c.src_size, {staging.buffer, staging.offset + c.offset},
+                                  c.bytes_per_row, c.bytes_per_image);
+        }
+        e.EndEncoding(); // the uploads read what the downloads wrote
+        for (const auto& c : copies) {
+            e.CopyBufferToTexture({staging.buffer, staging.offset + c.offset}, c.bytes_per_row,
+                                  c.bytes_per_image, dst_texture, c.dst_level, c.dst_slice,
+                                  {0, 0, c.dst_z}, c.dst_size);
+        }
     });
-
-    for (const auto& copy : download_copies) {
-        const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
-        AccessBuffer(dst, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
-                     vk::AccessFlagBits2::eTransferWrite);
-    }
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
@@ -301,21 +568,11 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
 
-    boost::container::small_vector<vk::ImageCopy, 8> regions;
-
-    const vk::ImageAspectFlags src_aspect = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
-    const vk::ImageAspectFlags dst_aspect = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
-
-    const bool src_is_2d = ConvertImageType(src->info.type) == vk::ImageType::e2D;
     const bool src_is_3d = ConvertImageType(src->info.type) == vk::ImageType::e3D;
-
-    const bool dst_is_2d = ConvertImageType(dst->info.type) == vk::ImageType::e2D;
     const bool dst_is_3d = ConvertImageType(dst->info.type) == vk::ImageType::e3D;
 
-    const bool is_2d_to_3d = src_is_2d && dst_is_3d;
-    const bool is_3d_to_2d = src_is_3d && dst_is_2d;
-    const bool is_same_type = !is_2d_to_3d && !is_3d_to_2d;
-
+    // 2D <-> 3D: array layer i is depth plane i.
+    boost::container::small_vector<TextureRegion, 16> regions;
     for (u32 mip = 0; mip < num_mips; ++mip) {
         const u32 mip_w = std::max(base_width >> mip, 1u);
         const u32 mip_h = std::max(base_height >> mip, 1u);
@@ -323,59 +580,27 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
         const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, mip_d);
 
-        vk::ImageCopy region{};
-        region.srcSubresource.aspectMask = src_aspect;
-        region.srcSubresource.mipLevel = mip;
-        region.srcSubresource.baseArrayLayer = 0;
-        region.dstSubresource.aspectMask = dst_aspect;
-        region.dstSubresource.mipLevel = mip;
-        region.dstSubresource.baseArrayLayer = 0;
-
-        if (is_same_type) {
-            // 2D->2D OR 3D->3D
-            if (src_is_3d) {
-                // 3D images must use layerCount=1
-                region.srcSubresource.layerCount = 1;
-                region.dstSubresource.layerCount = 1;
-                region.extent = vk::Extent3D(mip_w, mip_h, mip_d);
-            } else {
-                // Array images
-                const u32 copy_layers = std::min(src_layers, dst_layers);
-                region.srcSubresource.layerCount = copy_layers;
-                region.dstSubresource.layerCount = copy_layers;
-                region.extent = vk::Extent3D(mip_w, mip_h, 1);
+        if (src_is_3d && dst_is_3d) {
+            regions.push_back({mip, 0, 0, mip, 0, 0, mip_w, mip_h, mip_d});
+        } else if (!src_is_3d && dst_is_3d) {
+            for (u32 layer = 0; layer < src_layers; ++layer) {
+                regions.push_back({mip, layer, 0, mip, 0, layer, mip_w, mip_h, 1});
             }
-        } else if (is_2d_to_3d) {
-            // 2D array -> 3D volume
-            region.srcSubresource.layerCount = src_layers;
-            region.dstSubresource.layerCount = 1;
-            region.extent = vk::Extent3D(mip_w, mip_h, src_layers);
-        } else if (is_3d_to_2d) {
-            // 3D volume -> 2D array
-            region.srcSubresource.layerCount = 1;
-            region.dstSubresource.layerCount = dst_layers;
-            region.extent = vk::Extent3D(mip_w, mip_h, dst_layers);
+        } else if (src_is_3d) {
+            for (u32 layer = 0; layer < dst_layers; ++layer) {
+                regions.push_back({mip, 0, layer, mip, layer, 0, mip_w, mip_h, 1});
+            }
+        } else {
+            for (u32 layer = 0; layer < std::min(src_layers, dst_layers); ++layer) {
+                regions.push_back({mip, layer, 0, mip, layer, 0, mip_w, mip_h, 1});
+            }
         }
-
-        regions.push_back(region);
     }
 
     scheduler.EndRendering();
-
-    bool needs_flush =
-        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
-                vk::AccessFlagBits2::eTransferRead);
-    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
-                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
-    if (needs_flush) {
-        FlushBarriers();
-    }
-
-    scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                      regions](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
-                         vk::ImageLayout::eTransferDstOptimal, regions);
-    });
+    AccessImage(src, false);
+    AccessImage(dst, true);
+    CopyRegions(src, dst, regions);
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -390,57 +615,54 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
 
-    vk::BufferImageCopy buffer_copy = {
-        .bufferOffset = offset,
-        .bufferRowLength = 0,
-        .bufferImageHeight = 0,
-        .imageSubresource{
-            .aspectMask = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
-            .mipLevel = 0u,
-            .baseArrayLayer = 0,
-            .layerCount = num_layers,
-        },
-        .imageOffset = {0, 0, 0},
-        .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
-    };
-    const auto copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
-
     scheduler.EndRendering();
-
-    bool needs_flush =
-        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
-                vk::AccessFlagBits2::eTransferRead);
-    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
-                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
-    needs_flush |= IsBufferAccessed(buffer, offset, copy_size);
-    if (needs_flush) {
-        FlushBarriers();
-    }
-
-    const auto download_copy = buffer_copy;
-    buffer_copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
-    scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                      handle = buffer->Handle(), download_copy,
-                      upload_copy = buffer_copy](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyImageToBuffer(src_image, vk::ImageLayout::eTransferSrcOptimal, handle,
-                                 download_copy);
-        const vk::MemoryBarrier2 post_copy_barrier = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-        };
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .memoryBarrierCount = 1u,
-            .pMemoryBarriers = &post_copy_barrier,
-        });
-        cmdbuf.copyBufferToImage(handle, dst_image, vk::ImageLayout::eTransferDstOptimal,
-                                 upload_copy);
-    });
+    AccessImage(src, false);
+    AccessImage(dst, true);
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    if (!HasMetalFormat(*src) || !HasMetalFormat(*dst)) {
+        return;
+    }
+    // Each side lays the texels out with its own format (Vulkan's tight buffer copies); the depth
+    // aspect of a combined depth-stencil format (the stencil is not copied).
+    const Metal::TextureDesc& sd = src->backing->desc;
+    const Metal::TextureDesc& dd = dst->backing->desc;
+    const BlitAspect src_aspect =
+        IsCombinedDepthStencil(sd.pixel_format) ? BlitAspect::Depth : BlitAspect::All;
+    const BlitAspect dst_aspect =
+        IsCombinedDepthStencil(dd.pixel_format) ? BlitAspect::Depth : BlitAspect::All;
+    const BlockLayout sb = LayoutOf(sd.pixel_format, src_aspect);
+    const BlockLayout db = LayoutOf(dd.pixel_format, dst_aspect);
+    if (sb.bytes == 0 || db.bytes == 0 || sd.samples > 1 || dd.samples > 1) {
+        LogOncePerFormat(dst->info.pixel_format,
+                         "image copy through a buffer not possible: skipped (destination)");
+        return;
+    }
+    const Metal::Size3 size{std::min(sd.width, dd.width), std::min(sd.height, dd.height),
+                            std::min(sd.depth, dd.depth)};
+    const u32 src_row = Common::DivCeil(size.width, sb.width) * sb.bytes;
+    const u32 src_image = src_row * Common::DivCeil(size.height, sb.height);
+    const u32 dst_row = Common::DivCeil(size.width, db.width) * db.bytes;
+    const u32 dst_image = dst_row * Common::DivCeil(size.height, db.height);
+    const u32 layers = std::min({num_layers, sd.layers, dd.layers});
+
+    AccessBuffer(buffer, offset, u64(std::max(src_image, dst_image)) * size.depth * layers);
+    scheduler.Record([src_texture = src->GetImage(), dst_texture = dst->GetImage(),
+                      ref = buffer->Ref(offset), size, layers, src_row, src_image, dst_row,
+                      dst_image, src_aspect, dst_aspect](Metal::Encoder& e) {
+        for (u32 layer = 0; layer < layers; ++layer) {
+            e.CopyTextureToBuffer(src_texture, 0, layer, {}, size,
+                                  {ref.buffer, ref.offset + u64(layer) * src_image * size.depth},
+                                  src_row, src_image, src_aspect);
+        }
+        e.EndEncoding(); // the uploads read what the downloads wrote
+        for (u32 layer = 0; layer < layers; ++layer) {
+            e.CopyBufferToTexture({ref.buffer, ref.offset + u64(layer) * dst_image * size.depth},
+                                  dst_row, dst_image, dst_texture, 0, layer, {}, size,
+                                  dst_aspect);
+        }
+    });
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
@@ -454,41 +676,16 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     ASSERT(mip_block_h == (src->info.size.height >> src_dim));
     ASSERT(mip_block_p == (src->info.pitch >> src_dim));
 
-    const vk::ImageCopy image_copy{
-        .srcSubresource{
-            .aspectMask = src->aspect_mask,
-            .mipLevel = 0,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        },
-        .dstSubresource{
-            .aspectMask = src->aspect_mask,
-            .mipLevel = mip,
-            .baseArrayLayer = slice,
-            .layerCount = 1,
-        },
-        .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
-    };
-
     SetBackingSamples(dst, dst->info.num_samples);
     SetBackingSamples(src, src->info.num_samples);
 
     scheduler.EndRendering();
+    AccessImage(src, false);
+    AccessImage(dst, true);
 
-    bool needs_flush =
-        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
-                vk::AccessFlagBits2::eTransferRead);
-    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
-                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
-    if (needs_flush) {
-        FlushBarriers();
-    }
-
-    scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                      image_copy](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
-                         vk::ImageLayout::eTransferDstOptimal, image_copy);
-    });
+    const TextureRegion region{
+        0, 0, 0, mip, slice, 0, src->info.size.width, src->info.size.height, src->info.size.depth};
+    CopyRegions(src, dst, std::span{&region, 1});
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -496,11 +693,10 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
-        if (instance.IsMaintenance8Supported() ||
-            src->info.props.is_depth == dst->info.props.is_depth) {
+        if (src->info.props.is_depth == dst->info.props.is_depth) {
             CopyImage(src, dst);
         } else {
-            // Perform depth from/to color copy using the intermediate copy buffer.
+            // Metal has no colour <-> depth blit: through the intermediate copy buffer.
             static constexpr size_t COPY_BUFFER_SIZE = 128_MB;
             const auto copy_ref =
                 staging_pool.Request(COPY_BUFFER_SIZE, VideoCore::MemoryType::DeviceLocal);
@@ -509,17 +705,9 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     } else if (src->info.num_samples == 1 && dst->info.num_samples > 1 &&
                dst->info.props.is_depth) {
         // Perform a rendering pass to transfer the channels of source as samples in dest.
-        bool needs_flush =
-            Transit(src, vk::ImageLayout::eShaderReadOnlyOptimal,
-                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
-        needs_flush |= Transit(dst, vk::ImageLayout::eDepthStencilAttachmentOptimal,
-                               vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                   vk::PipelineStageFlagBits2::eLateFragmentTests,
-                               vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
-        if (needs_flush) {
-            FlushBarriers();
-        }
-
+        scheduler.EndRendering();
+        AccessImage(src, false);
+        AccessImage(dst, true);
         blit_helper->ReinterpretColorAsMsDepth(
             dst->info.size.width, dst->info.size.height, dst->info.num_samples,
             src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
@@ -531,44 +719,76 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
 void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
                                const VideoCore::SubresourceRange& sub_range) {
     scheduler.EndRendering();
-
-    bool needs_flush =
-        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
-                vk::AccessFlagBits2::eTransferRead);
-    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
-                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
-    if (needs_flush) {
-        FlushBarriers();
-    }
-
-    const auto aspect_mask = src->aspect_mask & dst->aspect_mask;
-
-    const vk::ImageCopy region = {
-        .srcSubresource{
-            .aspectMask = aspect_mask,
-            .mipLevel = 0,
-            .baseArrayLayer = sub_range.base.layer,
-            .layerCount = sub_range.extent.layers,
-        },
-        .srcOffset = {0, 0, 0},
-        .dstSubresource{
-            .aspectMask = aspect_mask,
-            .mipLevel = 0,
-            .baseArrayLayer = sub_range.base.layer,
-            .layerCount = sub_range.extent.layers,
-        },
-        .dstOffset = {0, 0, 0},
-        .extent = {dst->info.size.width, dst->info.size.height, 1},
-    };
-
-    scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                      region](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
-                         vk::ImageLayout::eTransferDstOptimal, region);
-    });
-
+    AccessImage(src, false);
+    AccessImage(dst, true);
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+
+    // Metal blits no depth-stencil texture to another one of another format and copies one
+    // aspect of a combined format at a time: each aspect both images have goes through a buffer.
+    const Metal::TextureDesc& sd = src->backing->desc;
+    const Metal::TextureDesc& dd = dst->backing->desc;
+    struct Aspect {
+        BlitAspect src, dst;
+        u32 bytes;
+    };
+    boost::container::static_vector<Aspect, 2> aspects;
+    const auto add = [&](BlitAspect combined) {
+        const BlitAspect sa = IsCombinedDepthStencil(sd.pixel_format) ? combined : BlitAspect::All;
+        const BlitAspect da = IsCombinedDepthStencil(dd.pixel_format) ? combined : BlitAspect::All;
+        const u32 bytes = LayoutOf(sd.pixel_format, sa).bytes;
+        if (bytes == 0 || bytes != LayoutOf(dd.pixel_format, da).bytes) {
+            LogOncePerFormat(dst->info.pixel_format,
+                             "depth-stencil copy between incompatible formats skipped");
+            return;
+        }
+        aspects.push_back({sa, da, bytes});
+    };
+    if (src->has_depth && dst->has_depth) {
+        add(BlitAspect::Depth);
+    }
+    if (src->has_stencil && dst->has_stencil) {
+        add(BlitAspect::Stencil);
+    }
+    if (sd.samples > 1 || dd.samples > 1) {
+        LogOncePerFormat(dst->info.pixel_format, "multisampled depth-stencil copy skipped");
+        return;
+    }
+    const u32 first = sub_range.base.layer;
+    const u32 end = std::min({first + sub_range.extent.layers, sd.layers, dd.layers});
+    if (aspects.empty() || first >= end) {
+        return;
+    }
+    const Metal::Size3 size{std::min({dst->info.size.width, sd.width, dd.width}),
+                            std::min({dst->info.size.height, sd.height, dd.height}), 1};
+    const u64 pixels = u64(size.width) * size.height;
+    u64 staging_size = 0;
+    for (const auto& aspect : aspects) {
+        staging_size += Common::AlignUp(pixels * aspect.bytes, 16) * (end - first);
+    }
+    const auto ref = staging_pool.Request(staging_size, VideoCore::MemoryType::DeviceLocal, 16);
+    scheduler.Record([src_texture = src->GetImage(), dst_texture = dst->GetImage(),
+                      staging = ref.buffer->Ref(ref.offset), aspects, first, end, size,
+                      pixels](Metal::Encoder& e) {
+        const auto each = [&](auto&& copy) {
+            u64 offset = staging.offset;
+            for (const auto& aspect : aspects) {
+                const u64 stride = Common::AlignUp(pixels * aspect.bytes, 16);
+                for (u32 layer = first; layer < end; ++layer, offset += stride) {
+                    copy(aspect, layer, Metal::BufferRef{staging.buffer, offset});
+                }
+            }
+        };
+        each([&](const Aspect& aspect, u32 layer, Metal::BufferRef at) {
+            e.CopyTextureToBuffer(src_texture, 0, layer, {}, size, at, size.width * aspect.bytes,
+                                  u32(pixels * aspect.bytes), aspect.src);
+        });
+        e.EndEncoding(); // the uploads read what the downloads wrote
+        each([&](const Aspect& aspect, u32 layer, Metal::BufferRef at) {
+            e.CopyBufferToTexture(at, size.width * aspect.bytes, u32(pixels * aspect.bytes),
+                                  dst_texture, 0, layer, {}, size, aspect.dst);
+        });
+    });
 }
 
 void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
@@ -576,97 +796,117 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                            const VideoCore::SubresourceRange& dst_range) {
     SetBackingSamples(dst, 1, false);
     scheduler.EndRendering();
-
-    const bool needs_resolve = src->backing->num_samples != 1;
-    const auto dst_stage =
-        needs_resolve ? vk::PipelineStageFlagBits2::eResolve : vk::PipelineStageFlagBits2::eCopy;
-
-    bool needs_flush = Transit(src, vk::ImageLayout::eTransferSrcOptimal, dst_stage,
-                               vk::AccessFlagBits2::eTransferRead);
-    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal, dst_stage,
-                           vk::AccessFlagBits2::eTransferWrite);
-    if (needs_flush) {
-        FlushBarriers();
-    }
-
-    const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, 1);
-    if (!needs_resolve) {
-        const vk::ImageCopy region = {
-            .srcSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = src_range.base.layer,
-                .layerCount = src_layers,
-            },
-            .srcOffset = {0, 0, 0},
-            .dstSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = dst_range.base.layer,
-                .layerCount = dst_layers,
-            },
-            .dstOffset = {0, 0, 0},
-            .extent = {src->info.size.width, src->info.size.height, 1},
-        };
-        scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                          region](vk::CommandBuffer cmdbuf) {
-            cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
-                             vk::ImageLayout::eTransferDstOptimal, region);
-        });
-    } else {
-        const vk::ImageResolve region = {
-            .srcSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = src_range.base.layer,
-                .layerCount = src_layers,
-            },
-            .srcOffset = {0, 0, 0},
-            .dstSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = dst_range.base.layer,
-                .layerCount = dst_layers,
-            },
-            .dstOffset = {0, 0, 0},
-            .extent = {src->info.size.width, src->info.size.height, 1},
-        };
-        scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                          region](vk::CommandBuffer cmdbuf) {
-            cmdbuf.resolveImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
-                                vk::ImageLayout::eTransferDstOptimal, region);
-        });
-    }
-
+    AccessImage(src, false);
+    AccessImage(dst, true);
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+
+    const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, 1);
+    const u32 layers = std::min(src_layers, dst_layers);
+    const Metal::TextureDesc& sd = src->backing->desc;
+    if (sd.samples == 1) {
+        boost::container::small_vector<TextureRegion, 8> regions;
+        for (u32 layer = 0; layer < layers; ++layer) {
+            regions.push_back({0, src_range.base.layer + layer, 0, 0, dst_range.base.layer + layer,
+                               0, src->info.size.width, src->info.size.height, 1});
+        }
+        CopyRegions(src, dst, regions);
+        return;
+    }
+    if (!HasMetalFormat(*src) || !HasMetalFormat(*dst)) {
+        return;
+    }
+    // A pass that loads the multisampled texture and resolves it into the destination (Metal's
+    // resolve needs the same pixel format: view the destination as the source's when they differ).
+    const Metal::TextureDesc& dd = dst->backing->desc;
+    void* dst_texture = dst->GetImage();
+    Metal::Object view;
+    if (dd.pixel_format != sd.pixel_format) {
+        if (Metal::SafeViewPixelFormat(dd.pixel_format, sd.pixel_format, dd.format_views) !=
+            sd.pixel_format) {
+            LogOncePerFormat(dst->info.pixel_format,
+                             "resolve between incompatible formats skipped (destination)");
+            return;
+        }
+        view = Metal::CreateTextureView(dst_texture, sd.pixel_format, dd.type, 0, dd.levels, 0,
+                                        dd.layers, IdentitySwizzle);
+        dst_texture = view.Get();
+    }
+    const u32 src_base = src_range.base.layer;
+    const u32 dst_base = dst_range.base.layer;
+    const u32 count = std::min({layers, sd.layers - std::min(src_base, sd.layers),
+                                dd.layers - std::min(dst_base, dd.layers)});
+    scheduler.Record([src_texture = src->GetImage(), dst_texture, view = std::move(view), src_base,
+                      dst_base, count](Metal::Encoder& e) mutable {
+        if (view) {
+            e.KeepAlive(std::move(view));
+        }
+        for (u32 layer = 0; layer < count; ++layer) {
+            Metal::RenderPassDesc pass{};
+            pass.colors[0].texture = src_texture;
+            pass.colors[0].slice = src_base + layer;
+            pass.colors[0].resolve_texture = dst_texture;
+            pass.colors[0].resolve_slice = dst_base + layer;
+            e.BeginRenderPass(pass);
+            e.EndRenderPass();
+        }
+    });
 }
 
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                          const vk::ClearValue& clear_value) {
     scheduler.EndRendering();
-
-    const bool needs_flush =
-        Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eClear,
-                vk::AccessFlagBits2::eTransferWrite, range);
-    if (needs_flush) {
-        FlushBarriers();
-    }
-
-    const vk::ImageSubresourceRange vk_range = {
-        .aspectMask = vk::ImageAspectFlagBits::eColor,
-        .baseMipLevel = range.base.level,
-        .levelCount = range.extent.levels,
-        .baseArrayLayer = range.base.layer,
-        .layerCount = range.extent.layers,
-    };
-    scheduler.Record([image = dst->GetImage(), color = clear_value.color,
-                      vk_range](vk::CommandBuffer cmdbuf) {
-        cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
-    });
-
+    AccessImage(dst, true);
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+
+    if (dst->has_depth || dst->has_stencil) {
+        // As in Vulkan (vkCmdClearColorImage), only colour images are cleared here.
+        LogOncePerFormat(dst->info.pixel_format, "colour clear of a depth image skipped");
+        return;
+    }
+    // A clear-only render pass per level and layer (per depth plane of 3D textures).
+    const Metal::TextureDesc& desc = dst->backing->desc;
+    if (!desc.render_target) {
+        LogOncePerFormat(dst->info.pixel_format, "clear of a block-compressed image skipped");
+        return;
+    }
+    struct Target {
+        u32 level, slice, plane;
+    };
+    boost::container::small_vector<Target, 16> targets;
+    const u32 level_end = std::min(range.base.level + range.extent.levels, desc.levels);
+    const u32 layer_end = std::min(range.base.layer + range.extent.layers, desc.layers);
+    for (u32 level = range.base.level; level < level_end; ++level) {
+        if (desc.type == Metal::TextureType::Tex3D) {
+            for (u32 plane = 0; plane < DepthOf(desc, level); ++plane) {
+                targets.push_back({level, 0, plane});
+            }
+            continue;
+        }
+        for (u32 layer = range.base.layer; layer < layer_end; ++layer) {
+            targets.push_back({level, layer, 0});
+        }
+    }
+    if (targets.empty()) {
+        return;
+    }
+    scheduler.Record([texture = dst->GetImage(),
+                      color = ClearColorOf(dst->info.pixel_format, clear_value.color),
+                      targets = scheduler.RecordData(std::span<const Target>{targets})](
+                         Metal::Encoder& e) {
+        for (const auto& t : targets) {
+            Metal::RenderPassDesc pass{};
+            pass.colors[0].texture = texture;
+            pass.colors[0].level = t.level;
+            pass.colors[0].slice = t.slice;
+            pass.colors[0].depth_plane = t.plane;
+            pass.colors[0].clear = true;
+            pass.colors[0].clear_color = color;
+            e.BeginRenderPass(pass);
+            e.EndRenderPass();
+        }
+    });
 }
 
 void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing) {
@@ -682,20 +922,8 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     auto it = std::ranges::find(backing_images, num_samples,
                                 &VideoCore::Image::BackingImage::num_samples);
     if (it == backing_images.end()) {
-        auto new_image_ci = backing->image.image_ci;
-        new_image_ci.samples = LiverpoolToVK::NumSamples(num_samples, image->supported_samples);
-
-        new_backing = &backing_images.emplace_back();
-        new_backing->num_samples = num_samples;
-        new_backing->image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-        new_backing->image.Create(new_image_ci);
-
-        Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,
-                              "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (backing)",
-                              info.size.width, info.size.height, info.size.depth,
-                              AmdGpu::NameOf(info.tile_mode), vk::to_string(info.pixel_format),
-                              info.guest_address, info.guest_size, info.resources.layers,
-                              info.resources.levels, num_samples);
+        // A new texture from the image's description with the new sample count.
+        new_backing = &image->CreateBacking(num_samples);
     } else {
         new_backing = std::addressof(*it);
     }
@@ -703,45 +931,13 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     if (copy_backing) {
         scheduler.EndRendering();
         ASSERT(image->info.resources.levels == 1 && image->info.resources.layers == 1);
-
-        // Transition current backing to shader read layout
-        Transit(image, vk::ImageLayout::eShaderReadOnlyOptimal,
-                vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
-
-        // Transition dest backing to color attachment layout, not caring of previous contents
-        constexpr auto dst_stage = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
-        constexpr auto dst_access =
-            vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
-        constexpr auto dst_layout = vk::ImageLayout::eColorAttachmentOptimal;
-        image_barriers.push_back(vk::ImageMemoryBarrier2{
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-            .dstStageMask = dst_stage,
-            .dstAccessMask = dst_access,
-            .oldLayout = vk::ImageLayout::eUndefined,
-            .newLayout = dst_layout,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = new_backing->image,
-            .subresourceRange{
-                .aspectMask = image->aspect_mask,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = image->info.resources.layers,
-            },
-        });
-        FlushBarriers();
+        AccessImage(image, false);
 
         // Copy between ms and non ms backing images
-        blit_helper->CopyBetweenMsImages(
-            info.size.width, info.size.height, new_backing->num_samples, info.pixel_format,
-            backing->num_samples > 1, backing->image, new_backing->image);
-
-        // Update current layout in tracker to new backings layout
-        new_backing->state.layout = dst_layout;
-        new_backing->state.access_mask = dst_access;
-        new_backing->state.pl_stage = dst_stage;
+        blit_helper->CopyBetweenMsImages(info.size.width, info.size.height,
+                                         new_backing->num_samples, info.pixel_format,
+                                         backing->num_samples > 1, backing->texture.Get(),
+                                         new_backing->texture.Get());
     }
 
     backing = new_backing;

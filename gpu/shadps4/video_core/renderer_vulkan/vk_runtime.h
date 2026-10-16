@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <span>
 #include <unordered_map>
 
 #include "common/types.h"
@@ -66,9 +67,9 @@ public:
     /// Fills `size` bytes at `offset` with the 32-bit `value` (offset and size multiples of 4).
     void FillBuffer(const VideoCore::Buffer& dst, u64 offset, u64 size, u32 value);
 
-    bool Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
-                 vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
-                 std::optional<VideoCore::SubresourceRange> subres_range = {});
+    /// Runs before commands that read or write `image` (replaces Transit: Metal tracks hazards
+    /// and has no layouts): the image access hook, then the scene-resolution proxy sync.
+    void AccessImage(VideoCore::Image* image, bool write);
 
     /// BB_GPU_PROFILE: a profiler segment for a transfer of `image` while it lives; the
     /// segment it interrupted continues afterwards.
@@ -114,8 +115,8 @@ public:
     /// No-op: there are no barriers to flush (callers are removed in M3).
     void FlushBarriers(std::source_location where = std::source_location::current()) {}
 
-    /// bbport: runs before this thread changes image state (layouts, pending image
-    /// barriers): the rasterizer joins its texture binding helper there (BindHelper).
+    /// bbport: runs before this thread records commands on an image or changes its backing:
+    /// the rasterizer joins its texture binding helper there (BindHelper).
     void SetImageAccessHook(void (*hook)(void*), void* context) {
         image_access_hook = hook;
         image_access_context = context;
@@ -127,6 +128,22 @@ public:
     }
 
 private:
+    /// One texture-to-texture copy; the size is in source texels (CopyRegions clamps it to both
+    /// subresources). `*_z` is the depth plane of 3D textures.
+    struct TextureRegion {
+        u32 src_level, src_slice, src_z;
+        u32 dst_level, dst_slice, dst_z;
+        u32 width, height, depth;
+    };
+    /// Copies between the images' current backings: a blit when the formats match or one can be
+    /// viewed as the other, else through a staging buffer when their blocks have the same size.
+    void CopyRegions(VideoCore::Image* src, VideoCore::Image* dst,
+                     std::span<const TextureRegion> regions);
+    /// Buffer <-> image copies with Vulkan's region semantics (row length and image height in
+    /// texels, 0 = tight), one Metal copy per layer.
+    void CopyBufferImage(VideoCore::Image& image, const VideoCore::Buffer& buffer,
+                         std::span<const vk::BufferImageCopy> copies, bool upload);
+
     struct HoistPages {
         std::unique_ptr<u16[]> tick; ///< low 16 bits of the submission tick that used the page
         u64 pages;
