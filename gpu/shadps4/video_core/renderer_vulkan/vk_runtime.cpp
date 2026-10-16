@@ -88,13 +88,9 @@ static u32 BufferImageCopySize(const vk::BufferImageCopy& copy, const vk::Format
            width_in_blocks * block_size;
 }
 
-Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
-    : instance{instance_}, scheduler{scheduler_}, staging_pool{instance_, scheduler_} {
-    blit_helper = std::make_unique<VideoCore::BlitHelper>(instance, scheduler);
-
-    memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
-    memory_barrier.dstAccessMask =
-        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+Runtime::Runtime(Metal::Device& device_, Scheduler& scheduler_)
+    : device{device_}, scheduler{scheduler_}, staging_pool{device_, scheduler_} {
+    blit_helper = std::make_unique<VideoCore::BlitHelper>(device, scheduler);
 }
 
 // 1 KiB pages; the tag is the low 16 bits of the submission tick. A tag that wraps around can only
@@ -119,7 +115,7 @@ void Runtime::NoteSubmissionUse(const VideoCore::Buffer* buffer, u64 offset, u64
 }
 
 bool Runtime::HoistCopy(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
-                        std::span<const vk::BufferCopy> copies, bool shader_copy) {
+                        std::span<const VideoCore::BufferCopy> copies, bool shader_copy) {
     if (!scheduler.IsRendering() || BbToggle::Disabled(BbToggle::UploadHoisting) ||
         (shader_copy && BbToggle::Disabled(BbToggle::CopyShaderHoisting))) {
         return false; // outside a pass an inline copy costs no pass break
@@ -134,7 +130,7 @@ bool Runtime::HoistCopy(const VideoCore::Buffer* src, const VideoCore::Buffer* d
             if (copy.size == 0) {
                 continue;
             }
-            const u64 offset = source ? copy.srcOffset : copy.dstOffset;
+            const u64 offset = source ? copy.src_offset : copy.dst_offset;
             const u64 last = (offset + copy.size - 1) >> HoistPageBits;
             if (last >= it->second.pages) {
                 return false;
@@ -152,7 +148,7 @@ bool Runtime::HoistCopy(const VideoCore::Buffer* src, const VideoCore::Buffer* d
     if (!unused(dst, false) || (shader_copy && hoist_targets.contains(src) && !unused(src, true))) {
         return false;
     }
-    scheduler.RecordHoistedCopy(src->Handle(), dst->Handle(), copies, shader_copy);
+    scheduler.RecordHoistedCopy(src->Ref(), dst->Ref(), copies, shader_copy);
     if (!shader_copy) {
         BbStats::hoisted_copies.fetch_add(1, std::memory_order_relaxed);
     }
@@ -163,85 +159,30 @@ void Runtime::TickFrame() {
     staging_pool.TickFrame();
 }
 
-void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
-                         std::span<const vk::BufferCopy> copies, std::source_location where) {
+void Runtime::CopyBuffer(const VideoCore::Buffer& src, const VideoCore::Buffer& dst,
+                         std::span<const VideoCore::BufferCopy> copies,
+                         std::source_location where) {
     scheduler.EndRendering(where);
-
-    // bbport: many regions (HLE copy shaders) are tracked as one bounding range per buffer:
-    // conservative for barriers, and two tree lookups instead of two per region.
-    const bool bounded = copies.size() > 4;
-    u64 src_min = ~0ULL, src_max = 0, dst_min = ~0ULL, dst_max = 0;
-    if (bounded) {
-        for (const auto& copy : copies) {
-            src_min = std::min<u64>(src_min, copy.srcOffset);
-            src_max = std::max<u64>(src_max, copy.srcOffset + copy.size);
-            dst_min = std::min<u64>(dst_min, copy.dstOffset);
-            dst_max = std::max<u64>(dst_max, copy.dstOffset + copy.size);
-        }
-    }
-
-    bool needs_flush{};
-    if (bounded) {
-        needs_flush = IsBufferAccessed(src, src_min, src_max - src_min) ||
-                      IsBufferAccessed(dst, dst_min, dst_max - dst_min, true);
-    } else {
-        for (const auto& copy : copies) {
-            needs_flush |= IsBufferAccessed(src, copy.srcOffset, copy.size);
-            needs_flush |= IsBufferAccessed(dst, copy.dstOffset, copy.size, true);
-        }
-    }
-    if (needs_flush) {
-        FlushBarriers();
-    }
-
-    scheduler.Record([src_handle = src->Handle(), dst_handle = dst->Handle(),
-                      regions = scheduler.RecordData(copies)](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyBuffer(src_handle, dst_handle, regions.size(), regions.data());
-    });
-
-    if (bounded) {
-        AccessBuffer(src, src_min, src_max - src_min, vk::PipelineStageFlagBits2::eCopy,
-                     vk::AccessFlagBits2::eTransferRead);
-        AccessBuffer(dst, dst_min, dst_max - dst_min, vk::PipelineStageFlagBits2::eCopy,
-                     vk::AccessFlagBits2::eTransferWrite);
-        return;
-    }
+    // Metal hazard-tracks the buffers: no barriers, only the hoisting bookkeeping.
     for (const auto& copy : copies) {
-        AccessBuffer(src, copy.srcOffset, copy.size, vk::PipelineStageFlagBits2::eCopy,
-                     vk::AccessFlagBits2::eTransferRead);
-        AccessBuffer(dst, copy.dstOffset, copy.size, vk::PipelineStageFlagBits2::eCopy,
-                     vk::AccessFlagBits2::eTransferWrite);
+        NoteSubmissionUse(&src, copy.src_offset, copy.size);
+        NoteSubmissionUse(&dst, copy.dst_offset, copy.size);
     }
+    scheduler.Record([src_ref = src.Ref(), dst_ref = dst.Ref(),
+                      regions = scheduler.RecordData(copies)](Metal::Encoder& e) {
+        for (const auto& copy : regions) {
+            e.CopyBuffer({src_ref.buffer, src_ref.offset + copy.src_offset},
+                         {dst_ref.buffer, dst_ref.offset + copy.dst_offset}, copy.size);
+        }
+    });
 }
 
-void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value) {
+void Runtime::FillBuffer(const VideoCore::Buffer& dst, u64 offset, u64 size, u32 value) {
     scheduler.EndRendering();
-
-    if (IsBufferAccessed(dst, offset, size, true)) {
-        FlushBarriers();
-    }
-
-    scheduler.Record([handle = dst->Handle(), offset, size, value](vk::CommandBuffer cmdbuf) {
-        cmdbuf.fillBuffer(handle, offset, size, value);
+    NoteSubmissionUse(&dst, offset, size);
+    scheduler.Record([ref = dst.Ref(offset), size, value](Metal::Encoder& e) {
+        e.FillBuffer(ref, size, value);
     });
-
-    AccessBuffer(dst, offset, size, vk::PipelineStageFlagBits2::eClear,
-                 vk::AccessFlagBits2::eTransferWrite);
-}
-
-void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
-    scheduler.EndRendering();
-
-    if (IsBufferAccessed(dst, offset, sizeof(value), true)) {
-        FlushBarriers();
-    }
-
-    scheduler.Record([handle = dst->Handle(), offset, value](vk::CommandBuffer cmdbuf) {
-        cmdbuf.updateBuffer(handle, offset, sizeof(value), &value);
-    });
-
-    AccessBuffer(dst, offset, sizeof(value), vk::PipelineStageFlagBits2::eCopy,
-                 vk::AccessFlagBits2::eTransferWrite);
 }
 
 bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
@@ -806,134 +747,9 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     backing = new_backing;
 }
 
-bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                               bool check_read_access) {
-    const AddressRange range = {
-        .resource = reinterpret_cast<u64>(handle),
-        .range_start = offset,
-        .range_end = offset + size - 1,
-    };
-    bool has_access = barrier_tracker.FindRange(range, Access::Write);
-    if (check_read_access && !has_access) {
-        has_access |= barrier_tracker.FindRange(range, Access::Read);
-    }
-    return has_access;
-}
-
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                           vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
-    AddressRange range = {
-        .resource = reinterpret_cast<u64>(handle),
-        .range_start = offset,
-        .range_end = offset + size - 1,
-    };
-
-    constexpr static vk::AccessFlags2 READ_MASK =
-        vk::AccessFlagBits2::eIndexRead | vk::AccessFlagBits2::eVertexAttributeRead |
-        vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead |
-        vk::AccessFlagBits2::eColorAttachmentRead |
-        vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eTransferRead |
-        vk::AccessFlagBits2::eMemoryRead;
-
-    constexpr static vk::AccessFlags2 WRITE_MASK =
-        vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
-        vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
-        vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
-
-    // bbport: reads are tracked at 4 KiB granularity. Constant data comes from ring allocations
-    // at a new offset every draw; rounded, they land in ranges already present and the
-    // insert returns early instead of growing the tree until the next barrier flush.
-    // Wider read ranges only add barriers, never drop one.
-    if (!(src_access & WRITE_MASK) && !BbToggle::Disabled(BbToggle::CoarseReadTracking)) {
-        range.range_start &= ~u64{0xFFF};
-        range.range_end |= 0xFFF;
-    }
-    const auto insert = [&](Access access) {
-        if (BbToggle::Disabled(BbToggle::AccessMemo)) {
-            barrier_tracker.InsertRange(range, access);
-            return;
-        }
-        u64 hash = range.resource ^ range.range_start * 0x9E3779B97F4A7C15ull ^
-                   range.range_end << 13 ^ u64(access) << 61;
-        hash = (hash ^ hash >> 31) * 0xFF51AFD7ED558CCDull;
-        auto& memo = access_memo[(hash ^ hash >> 29) % access_memo.size()];
-        if (memo.epoch == access_epoch && memo.resource == range.resource &&
-            memo.start == range.range_start && memo.end == range.range_end &&
-            memo.access == u32(access)) {
-            return;
-        }
-        barrier_tracker.InsertRange(range, access);
-        memo = {range.resource, range.range_start, range.range_end, access_epoch, u32(access)};
-    };
-    if (src_access & WRITE_MASK) {
-        insert(Access::Write);
-    }
-    if (src_access & READ_MASK) {
-        insert(Access::Read);
-    }
-
-    memory_barrier.srcStageMask |= src_stage;
-    memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
+                           vk::PipelineStageFlags2, vk::AccessFlags2) {
     NoteSubmissionUse(handle, offset, size);
-}
-
-void Runtime::FlushBarriers(std::source_location where) {
-    BeforeImageAccess();
-    vk::DependencyInfo dep_info{};
-
-    if (memory_barrier.srcStageMask) {
-        dep_info.pMemoryBarriers = &memory_barrier;
-        dep_info.memoryBarrierCount = 1U;
-    }
-    if (!image_barriers.empty()) {
-        dep_info.pImageMemoryBarriers = image_barriers.data();
-        dep_info.imageMemoryBarrierCount = static_cast<u32>(image_barriers.size());
-    }
-
-    if (!dep_info.memoryBarrierCount && !dep_info.imageMemoryBarrierCount) {
-        return;
-    }
-
-    // bbport: BB_PASS_STATS names the caller and the kind of barrier ending the pass (for image
-    // barriers: the first transition and its access masks).
-    static const bool pass_stats = [] {
-        const char* env = std::getenv("BB_PASS_STATS");
-        return env && env[0] == '1';
-    }();
-    if (pass_stats && scheduler.IsRendering()) {
-        std::string detail = dep_info.imageMemoryBarrierCount
-                                 ? (dep_info.memoryBarrierCount ? " [image+memory] " : " [image] ")
-                                 : " [memory]";
-        if (dep_info.imageMemoryBarrierCount) {
-            const auto& b = image_barriers[0];
-            detail += vk::to_string(b.oldLayout) + "->" + vk::to_string(b.newLayout) + " (" +
-                      vk::to_string(b.srcAccessMask) + " -> " + vk::to_string(b.dstAccessMask) +
-                      ") x" + std::to_string(image_barriers.size());
-        }
-        static thread_local std::string stable;
-        stable = std::move(detail);
-        scheduler.EndRendering(where, stable.c_str());
-    } else {
-        scheduler.EndRendering(where);
-    }
-    scheduler.Record([memory = memory_barrier, has_memory = dep_info.memoryBarrierCount != 0,
-                      images = scheduler.RecordData(std::span<const vk::ImageMemoryBarrier2>(
-                          image_barriers.data(), image_barriers.size()))](vk::CommandBuffer cmdbuf) {
-        const vk::DependencyInfo info = {
-            .memoryBarrierCount = has_memory ? 1U : 0U,
-            .pMemoryBarriers = has_memory ? &memory : nullptr,
-            .imageMemoryBarrierCount = static_cast<u32>(images.size()),
-            .pImageMemoryBarriers = images.data(),
-        };
-        cmdbuf.pipelineBarrier2(info);
-    });
-
-    memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
-    memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
-
-    image_barriers.clear();
-    barrier_tracker.Clear();
-    ++access_epoch;
 }
 
 } // namespace Vulkan

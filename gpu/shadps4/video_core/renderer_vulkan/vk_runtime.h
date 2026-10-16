@@ -9,7 +9,6 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_copy.h"
-#include "video_core/renderer_vulkan/vk_barrier_tracker.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/types.h"
@@ -23,12 +22,11 @@ namespace Vulkan {
 class GpuProfiler;
 class SceneTargets;
 
-class Instance;
 class Scheduler;
 
 class Runtime {
 public:
-    explicit Runtime(const Instance& instance, Scheduler& scheduler);
+    explicit Runtime(Metal::Device& device, Scheduler& scheduler);
     ~Runtime() = default;
 
     /// bbport: upload hoisting. A copy issued inside a render pass may run ahead of the whole
@@ -49,8 +47,8 @@ public:
         return scheduler;
     }
 
-    const Instance& GetInstance() const {
-        return instance;
+    Metal::Device& GetDevice() {
+        return device;
     }
 
     StagingBufferPool& GetStagingPool() {
@@ -67,8 +65,6 @@ public:
 
     /// Fills `size` bytes at `offset` with the 32-bit `value` (offset and size multiples of 4).
     void FillBuffer(const VideoCore::Buffer& dst, u64 offset, u64 size, u32 value);
-
-    void InlineData(VideoCore::Buffer* dst, u64 offset, u32 value);
 
     bool Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
@@ -110,13 +106,13 @@ public:
 
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
 
+    /// Metal hazard-tracks buffers: only the hoisting bookkeeping remains. The stage and access
+    /// arguments are unused (callers lose them in M3).
     void AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                      vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access);
+                      vk::PipelineStageFlags2 src_stage = {}, vk::AccessFlags2 src_access = {});
 
-    bool IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                          bool check_read_access = false);
-
-    void FlushBarriers(std::source_location where = std::source_location::current());
+    /// No-op: there are no barriers to flush (callers are removed in M3).
+    void FlushBarriers(std::source_location where = std::source_location::current()) {}
 
     /// bbport: runs before this thread changes image state (layouts, pending image
     /// barriers): the rasterizer joins its texture binding helper there (BindHelper).
@@ -139,24 +135,11 @@ private:
 
     void (*image_access_hook)(void*) = nullptr;
     void* image_access_context = nullptr;
-    const Instance& instance;
+    Metal::Device& device;
     Scheduler& scheduler;
     std::unique_ptr<VideoCore::BlitHelper> blit_helper;
     StagingBufferPool staging_pool;
-    BarrierTracker barrier_tracker;
     VideoCore::Image::Barriers image_barriers;
-    vk::MemoryBarrier2 memory_barrier{};
-    // bbport: ranges inserted into barrier_tracker since its last Clear(); re-inserting a
-    // contained range is a no-op, and draws re-bind the same ranges constantly.
-    struct AccessMemo {
-        u64 resource;
-        u64 start;
-        u64 end;
-        u32 epoch;
-        u32 access;
-    };
-    std::array<AccessMemo, 512> access_memo{};
-    u32 access_epoch = 1;
 };
 
 } // namespace Vulkan
