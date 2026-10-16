@@ -286,7 +286,7 @@ public:
 
     /// Returns true when geometry shaders are supported by the device
     bool IsGeometryStageSupported() const {
-        // bbport: the Metal frame path emulates geometry shaders (BB_METAL_FRAME=1, arm64 host).
+        // bbport: the Metal renderer emulates geometry shaders (arm64 host).
         return features.geometryShader || metal_geometry;
     }
 
