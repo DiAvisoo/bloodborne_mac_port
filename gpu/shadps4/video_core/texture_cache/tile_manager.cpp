@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_metal/mtl_encoder.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
@@ -23,8 +22,8 @@
 #include "video_core/host_shaders/tiling_micro_8_comp.h"
 #include "video_core/host_shaders/tiling_micro_96_comp.h"
 
+#include <cstring>
 #include <magic_enum/magic_enum.hpp>
-#include <vk_mem_alloc.h>
 
 namespace VideoCore {
 
@@ -35,69 +34,24 @@ struct TilingInfo {
     std::array<ImageInfo::MipInfo, 16> mips;
 };
 
-TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
-                         Vulkan::Runtime& runtime_, StreamBuffer& stream_buffer_)
-    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, stream_buffer{stream_buffer_} {
-    const auto device = instance.GetDevice();
-    const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
-        {
-            .binding = 0,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        },
-        {
-            .binding = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        },
-        {
-            .binding = 2,
-            .descriptorType = vk::DescriptorType::eUniformBuffer,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        },
-    }};
-
-    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
-        .bindingCount = static_cast<u32>(bindings.size()),
-        .pBindings = bindings.data(),
-    };
-    auto desc_layout_result = device.createDescriptorSetLayoutUnique(desc_layout_ci);
-    ASSERT_MSG(desc_layout_result.result == vk::Result::eSuccess,
-               "Failed to create descriptor set layout: {}",
-               vk::to_string(desc_layout_result.result));
-    desc_layout = std::move(desc_layout_result.value);
-
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
-    const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
-        .pushConstantRangeCount = 0U,
-        .pPushConstantRanges = nullptr,
-    };
-    auto [layout_result, layout] = device.createPipelineLayoutUnique(layout_info);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess, "Failed to create pipeline layout: {}",
-               vk::to_string(layout_result));
-    pl_layout = std::move(layout);
-}
+TileManager::TileManager(Metal::Device& device_, Vulkan::Scheduler& scheduler_,
+                         Vulkan::Runtime& runtime_)
+    : device{device_}, scheduler{scheduler_}, runtime{runtime_} {}
 
 TileManager::~TileManager() = default;
 
-vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler) {
+const Metal::HostKernel& TileManager::GetTilingKernel(const ImageInfo& info, bool is_tiler) {
     const TilingKey key{
         .tile_mode = info.tile_mode,
         .num_bits = info.num_bits,
         .num_samples = info.num_samples,
         .is_tiler = is_tiler,
     };
-    if (const auto it = tiling_pipelines.find(key); it != tiling_pipelines.end()) {
-        return *it->second;
+    std::scoped_lock lock{kernels_mutex};
+    if (const auto it = tiling_kernels.find(key); it != tiling_kernels.end()) {
+        return it->second;
     }
 
-    const auto device = instance.GetDevice();
     const auto micro_tile_mode = AmdGpu::GetMicroTileMode(info.tile_mode);
     const bool is_macro = AmdGpu::IsMacroTiled(info.array_mode);
     std::array<u32, 12> spec_data{
@@ -150,77 +104,39 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
         UNREACHABLE_MSG("Unsupported tiling pixel width {}", info.num_bits);
     }
 
-    const auto module = Vulkan::CompileSPV(code, device);
-    static constexpr auto spec_entries = [] {
-        std::array<vk::SpecializationMapEntry, 12> entries{};
-        for (u32 i = 0; i < entries.size(); ++i) {
-            entries[i] = vk::SpecializationMapEntry{i, i * u32(sizeof(u32)), sizeof(u32)};
-        }
-        return entries;
-    }();
-
     const u32 spec_count = is_macro ? 12 : 4;
-    const vk::SpecializationInfo specialization{
-        .mapEntryCount = spec_count,
-        .pMapEntries = spec_entries.data(),
-        .dataSize = spec_count * sizeof(u32),
-        .pData = spec_data.data(),
-    };
+    std::array<Metal::SpecConstant, 12> constants{};
+    for (u32 i = 0; i < spec_count; ++i) {
+        constants[i] = {i, spec_data[i]};
+    }
 
     const auto module_name = fmt::format("{}_{} {}", magic_enum::enum_name(info.tile_mode),
                                          info.num_bits, is_tiler ? "tiler" : "detiler");
     LOG_INFO(Render_Vulkan, "Creating tiling pipeline {}", module_name);
-    Vulkan::SetObjectName(device, module, module_name);
 
-    const vk::PipelineShaderStageCreateInfo shader_ci = {
-        .stage = vk::ShaderStageFlagBits::eCompute,
-        .module = module,
-        .pName = "main",
-        .pSpecializationInfo = &specialization,
-    };
-    const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
-        .stage = shader_ci,
-        .layout = *pl_layout,
-    };
-
-    auto [result, pipeline] =
-        device.createComputePipelineUnique(VK_NULL_HANDLE, compute_pipeline_ci);
-    ASSERT_MSG(result == vk::Result::eSuccess, "Detiler pipeline creation failed {}",
-               vk::to_string(result));
-    const auto handle = *pipeline;
-    tiling_pipelines.emplace(key, std::move(pipeline));
-    device.destroyShaderModule(module);
-    return handle;
+    auto kernel = Metal::BuildHostKernel(device, code,
+                                         std::span{constants.data(), spec_count}, module_name);
+    return tiling_kernels.emplace(key, std::move(kernel)).first->second;
 }
 
-void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,
-                                       const vk::DescriptorBufferInfo& linear,
-                                       const vk::DescriptorBufferInfo& params, u32 dim_x) {
-    scheduler.Record([pipeline, layout = *pl_layout, tiled, linear, params,
-                      dim_x](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
-        const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
-            {
-                .dstBinding = 0,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eStorageBuffer,
-                .pBufferInfo = &tiled,
-            },
-            {
-                .dstBinding = 1,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eStorageBuffer,
-                .pBufferInfo = &linear,
-            },
-            {
-                .dstBinding = 2,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eUniformBuffer,
-                .pBufferInfo = &params,
-            },
-        }};
-        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, set_writes);
-        cmdbuf.dispatch(dim_x, 1, 1);
+void TileManager::RecordTilingDispatch(const Metal::HostKernel& kernel, const Buffer* tiled,
+                                       u64 tiled_offset, const Buffer* linear, u64 linear_offset,
+                                       const void* params, u32 params_size, u32 dim_x) {
+    // The parameters are small (268 bytes): SetBytes copies them when the encoder runs, so the
+    // recorded closure owns its own copy.
+    std::array<u8, sizeof(TilingInfo)> params_copy;
+    ASSERT(params_size == params_copy.size());
+    std::memcpy(params_copy.data(), params, params_size);
+    scheduler.Record([pipeline = kernel.pipeline.Get(), tiled_slot = kernel.buffer_slot[0],
+                      linear_slot = kernel.buffer_slot[1], params_slot = kernel.buffer_slot[2],
+                      tiled_ref = tiled->Ref(tiled_offset), linear_ref = linear->Ref(linear_offset),
+                      params_copy, dim_x](Metal::Encoder& e) {
+        e.SetComputePipeline(pipeline);
+        e.SetBuffer(Metal::Stage::Compute, tiled_slot, tiled_ref);
+        e.SetBuffer(Metal::Stage::Compute, linear_slot, linear_ref);
+        e.SetBytes(Metal::Stage::Compute, params_slot, params_copy.data(),
+                   static_cast<u32>(params_copy.size()));
+        e.Dispatch({dim_x, 1, 1}, {64, 1, 1});
     });
 }
 
@@ -243,31 +159,13 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         }
     }
 
-    const vk::DescriptorBufferInfo params_buffer_info{
-        .buffer = stream_buffer.Handle(),
-        .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
-        .range = sizeof(params),
-    };
-
     const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
 
     scheduler.EndRendering();
-    runtime.FlushBarriers();
 
-    const vk::DescriptorBufferInfo tiled_buffer_info{
-        .buffer = in_buffer->Handle(),
-        .offset = in_offset,
-        .range = info.guest_size,
-    };
-    const vk::DescriptorBufferInfo linear_buffer_info{
-        .buffer = staging.buffer->Handle(),
-        .offset = staging.offset,
-        .range = info.guest_size,
-    };
     const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
-    // bbport: recorded with copies of the descriptor infos (threaded recording).
-    RecordTilingDispatch(GetTilingPipeline(info, false), tiled_buffer_info, linear_buffer_info,
-                         params_buffer_info, dim_x);
+    RecordTilingDispatch(GetTilingKernel(info, false), in_buffer, in_offset, staging.buffer,
+                         staging.offset, &params, sizeof(params), dim_x);
     // bbport: the source may be the arena (BB_PREUPLOAD), which later uploads write: a copy into
     // it must wait for this read.
     runtime.AccessBuffer(in_buffer, in_offset, info.guest_size,
@@ -305,34 +203,16 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         }
     }
 
-    const vk::DescriptorBufferInfo params_buffer_info{
-        .buffer = stream_buffer.Handle(),
-        .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
-        .range = sizeof(params),
-    };
-
     const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
     for (auto& copy : buffer_copies) {
         copy.bufferOffset += staging.offset;
     }
 
     runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
-    runtime.FlushBarriers();
 
-    const vk::DescriptorBufferInfo tiled_buffer_info{
-        .buffer = out_buffer->Handle(),
-        .offset = out_offset,
-        .range = info.guest_size,
-    };
-    const vk::DescriptorBufferInfo linear_buffer_info{
-        .buffer = staging.buffer->Handle(),
-        .offset = staging.offset,
-        .range = info.guest_size,
-    };
     const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
-    // bbport: recorded with copies of the descriptor infos (threaded recording).
-    RecordTilingDispatch(GetTilingPipeline(info, true), tiled_buffer_info, linear_buffer_info,
-                         params_buffer_info, dim_x);
+    RecordTilingDispatch(GetTilingKernel(info, true), out_buffer, out_offset, staging.buffer,
+                         staging.offset, &params, sizeof(params), dim_x);
 
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,

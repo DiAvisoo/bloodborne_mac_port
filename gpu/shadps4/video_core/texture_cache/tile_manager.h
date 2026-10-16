@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 #include <boost/container_hash/hash.hpp>
@@ -10,9 +11,11 @@
 #include "common/types.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_metal/mtl_host_kernel.h"
 
 namespace Vulkan {
-struct Runtime;
+class Runtime;
+class Scheduler;
 }
 
 namespace VideoCore {
@@ -42,8 +45,8 @@ class TileManager {
     };
 
 public:
-    explicit TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                         Vulkan::Runtime& runtime, StreamBuffer& stream_buffer);
+    explicit TileManager(Metal::Device& device, Vulkan::Scheduler& scheduler,
+                         Vulkan::Runtime& runtime);
     ~TileManager();
 
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
@@ -53,20 +56,19 @@ public:
                                               const ImageInfo& info);
 
 private:
-    void RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,
-                              const vk::DescriptorBufferInfo& linear,
-                              const vk::DescriptorBufferInfo& params, u32 dim_x);
+    void RecordTilingDispatch(const Metal::HostKernel& kernel, const Buffer* tiled, u64 tiled_offset,
+                              const Buffer* linear, u64 linear_offset, const void* params,
+                              u32 params_size, u32 dim_x);
 
-    vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler);
+    const Metal::HostKernel& GetTilingKernel(const ImageInfo& info, bool is_tiler);
 
 private:
-    const Vulkan::Instance& instance;
+    Metal::Device& device;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
-    StreamBuffer& stream_buffer;
-    vk::UniqueDescriptorSetLayout desc_layout;
-    vk::UniquePipelineLayout pl_layout;
-    std::unordered_map<TilingKey, vk::UniquePipeline, TilingKey::Hash> tiling_pipelines;
+    std::mutex kernels_mutex;
+    // Node-based: kernels keep their address while the map grows.
+    std::unordered_map<TilingKey, Metal::HostKernel, TilingKey::Hash> tiling_kernels;
 };
 
 } // namespace VideoCore
