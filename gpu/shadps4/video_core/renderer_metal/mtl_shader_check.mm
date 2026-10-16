@@ -118,9 +118,11 @@ extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir)
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
     std::printf("MSL check on %s: %u pipeline keys in %s: %u loaded (%u in 0.4.0's format), "
-                "%u not loadable, %u of an older format, %u duplicates; %.1f s on %u threads\n",
+                "%u not loadable (%u permutation conflicts), %u of an older format, "
+                "%u duplicates; %.1f s on %u threads\n",
                 device.Name().c_str(), report.keys, cache_dir, report.loaded, report.legacy,
-                report.not_loaded, report.old_format, report.duplicates, seconds, threads);
+                report.not_loaded, report.conflicts, report.old_format, report.duplicates, seconds,
+                threads);
     unsigned total_built = 0, total_failed = 0, total_unsupported = 0;
     for (u32 k = 0; k < NumKinds; ++k) {
         if (built[k] + failed[k] + unsupported[k] == 0) {
@@ -132,7 +134,16 @@ extern "C" int bbgpu_msl_check(const char* cache_dir, const char* msl_cache_dir)
         total_failed += failed[k];
         total_unsupported += unsupported[k];
     }
-    const bool pass = total_failed == 0 && report.loaded > 0;
+    // At least 90% of the stored keys load; permutation conflicts (left to compile at runtime)
+    // and duplicates (loaded once, as their twin) are not counted against it.
+    const u32 loadable = report.keys - report.conflicts - report.duplicates;
+    const bool enough_loaded = report.loaded > 0 && u64{report.loaded} * 10 >= u64{loadable} * 9;
+    if (!enough_loaded) {
+        std::printf("MSL check: FAILED: %u of %u stored keys loaded (90%% needed; permutation "
+                    "conflicts and duplicates excluded)\n",
+                    report.loaded, loadable);
+    }
+    const bool pass = total_failed == 0 && enough_loaded;
     std::printf("%s: MSL check, %u pipelines built, %u failed, %u unsupported in Metal (logged)\n",
                 pass ? "PASS" : "FAIL", total_built, total_failed, total_unsupported);
     return pass ? 0 : 1;

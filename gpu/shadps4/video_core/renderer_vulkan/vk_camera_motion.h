@@ -5,6 +5,10 @@
 
 #pragma once
 
+#ifndef BB_METAL_NATIVE_STAGE
+#error "BB_METAL_NATIVE_STAGE must be defined (gpu/CMakeLists.txt: target_compile_definitions)"
+#endif
+
 #if BB_METAL_NATIVE_STAGE < 5
 // Not converted to Metal yet (M5): gpu/CMakeLists.txt leaves the source out and this stand-in
 // takes its place.

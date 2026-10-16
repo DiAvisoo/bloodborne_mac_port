@@ -50,6 +50,9 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     // The kernel indexes its runtime arrays without .length(): no buffer-size table is needed.
     static const Metal::HostKernel kernel =
         Metal::BuildHostKernel(device, BUFFER_MULTI_COPY_COMP, {}, "buffer_multi_copy");
+    if (!kernel.pipeline) {
+        return false; // no kernel: CopyBuffer instead of a dispatch without a pipeline
+    }
 
     // The region table goes into the stream buffer (host writes, visible at submission).
     thread_local std::vector<u32> regions;

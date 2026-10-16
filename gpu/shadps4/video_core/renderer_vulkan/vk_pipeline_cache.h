@@ -127,6 +127,7 @@ public:
         u32 old_format = 0; ///< blobs of an older key version, not read
         u32 duplicates = 0; ///< keys stored more than once (loaded once)
         u32 not_loaded = 0; ///< metadata or SPIR-V missing, or a binding/permutation conflict
+        u32 conflicts = 0;  ///< of not_loaded: binding/permutation conflicts (left to runtime)
     };
     /// bbport (`--msl-check`): loads every pipeline stored in the open cache database as WarmUp
     /// does, without the profile check and without writing or clearing anything. Also reads the
@@ -218,6 +219,9 @@ private:
     /// bbport: LoadStored is reading a blob of the previous key version (0.4.0's vertex input
     /// state and shader binary version).
     bool loading_legacy = false;
+    /// bbport: the last LoadPipelineStage refused a stored permutation that conflicts with this
+    /// session's bindings or permutation indices (LoadStored counts them apart).
+    bool load_conflict = false;
 };
 
 } // namespace Vulkan

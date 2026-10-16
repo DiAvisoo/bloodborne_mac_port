@@ -330,6 +330,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
                     "Cached permutation {} of {:#x} starts at binding {} (pipeline needs {}), "
                     "skipping preload",
                     perm_idx, program->info.pgm_hash, spec.start.unified, binding.unified);
+        load_conflict = true;
         return false;
     }
     program->info.AddBindings(binding);
@@ -364,6 +365,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
                             "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
                             "preload",
                             perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
+                load_conflict = true;
                 return false;
             }
             module = it->module.get();
@@ -517,11 +519,13 @@ PipelineCache::StoredReport PipelineCache::LoadStored() {
                 ++report.duplicates;
                 return;
             }
+            load_conflict = false;
             if (is_compute ? LoadComputePipeline(ar) : LoadGraphicsPipeline(ar)) {
                 ++report.loaded;
                 report.legacy += loading_legacy ? 1 : 0;
             } else {
                 ++report.not_loaded;
+                report.conflicts += load_conflict ? 1 : 0;
             }
             // A failed load leaves stages selected: the next pipeline starts clean.
             sel.infos.fill(nullptr);

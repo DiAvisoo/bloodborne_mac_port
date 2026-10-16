@@ -371,7 +371,6 @@ const RenderPipeline* PsoCache::GetRenderPipeline(const Vulkan::GraphicsPipeline
             pipeline->depth_clip = key.depth_clip_enable;
             pipeline->provoking_vertex_last =
                 key.provoking_vtx_last != AmdGpu::ProvokingVtxLast::First;
-            pipeline->clip_minus_w_to_w = key.clip_space == AmdGpu::ClipSpace::MinusWToW;
             pipeline->num_color_attachments = key.num_color_attachments;
 
             MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
