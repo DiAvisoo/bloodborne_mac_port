@@ -3,6 +3,7 @@
 
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -100,6 +101,7 @@ struct Encoder::Impl {
     bool in_pass{}, pass_opened{}, pass_clears{};
     MTLRenderPassDescriptor* pass_first; ///< as begun, with its clears
     MTLRenderPassDescriptor* pass_load;  ///< the same with Load actions (reopening)
+    u32 target_width{}, target_height{}; ///< of the pass (the scissor is clamped to it)
 
     // Render state (Task 5): what the caller set, and what changed since the encoder saw it.
     enum RenderBit : u32 {
@@ -160,8 +162,16 @@ struct Encoder::Impl {
         }
     }
 
+    /// Work recorded inside a pass that has not opened yet must come after the pass's clears.
+    void FlushPendingClear() {
+        if (in_pass && !pass_opened && pass_clears) {
+            Render();
+        }
+    }
+
     id<MTLBlitCommandEncoder> Blit() {
         if (!blit) {
+            FlushPendingClear();
             EndRender();
             EndCompute();
             @autoreleasepool {
@@ -173,6 +183,7 @@ struct Encoder::Impl {
 
     id<MTLComputeCommandEncoder> Compute() {
         if (!compute) {
+            FlushPendingClear();
             EndRender();
             EndBlit();
             @autoreleasepool {
@@ -218,7 +229,7 @@ struct Encoder::Impl {
                                                                                : pass_first];
             }
             pass_opened = true;
-            render_dirty = render_used;
+            render_dirty = render_used; // incl. the scissor, clamped to this pass's target
             vertex.Reapply();
             fragment.Reapply();
         }
@@ -273,8 +284,12 @@ struct Encoder::Impl {
                                          viewport.min_depth, viewport.max_depth}];
         }
         if (d & BitScissor) {
-            [e setScissorRect:(MTLScissorRect){scissor.x, scissor.y, scissor.width,
-                                               scissor.height}];
+            // Metal requires the scissor inside the target (Vulkan does not); state carried from
+            // a bigger pass is common.
+            const u32 x = std::min(scissor.x, target_width);
+            const u32 y = std::min(scissor.y, target_height);
+            [e setScissorRect:(MTLScissorRect){x, y, std::min(scissor.width, target_width - x),
+                                               std::min(scissor.height, target_height - y)}];
         }
         if (d & BitCull) {
             [e setCullMode:ToMtl(cull)];
@@ -533,6 +548,22 @@ void Encoder::BeginRenderPass(const RenderPassDesc& desc) {
         first.renderTargetHeight = desc.height;
         first.defaultRasterSampleCount = 1;
     }
+    // Target size: the first color attachment, else depth, else the declared render area.
+    u32 width = desc.width, height = desc.height;
+    const auto size_of = [&](void* texture, u32 level) {
+        id<MTLTexture> t = (__bridge id<MTLTexture>)texture;
+        width = std::max<u32>(1, u32(t.width) >> level);
+        height = std::max<u32>(1, u32(t.height) >> level);
+    };
+    const auto color = std::find_if(desc.colors.begin(), desc.colors.end(),
+                                    [](const ColorAttachment& c) { return c.texture != nullptr; });
+    if (color != desc.colors.end()) {
+        size_of(color->texture, color->level);
+    } else if (desc.depth.texture) {
+        size_of(desc.depth.texture, desc.depth.level);
+    }
+    impl->target_width = width;
+    impl->target_height = height;
     MTLRenderPassDescriptor* load = [first copy];
     for (u32 i = 0; i < RenderPassDesc::MaxColors; ++i) {
         load.colorAttachments[i].loadAction = MTLLoadActionLoad;

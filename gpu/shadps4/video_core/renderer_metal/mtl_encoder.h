@@ -86,6 +86,10 @@ public:
 
     // Resources by stage and slot: render stages apply at the next draw, compute at the next
     // dispatch. Slots: buffers 0-30, textures 0-31, samplers 0-15.
+    // Bindings are unretained pointers that stay bound until replaced, also across Submit and
+    // into new Metal encoders (which get every bound slot again). An object must outlive its
+    // binding: its owner frees it only after replacing the binding (M2's scheduler and caches
+    // define when; open item from the M1 review).
     void SetBuffer(Stage stage, u32 slot, BufferRef buffer);
     /// Copies `size` bytes now. Up to 4 KiB they go inline (setBytes); more go through a
     /// temporary shared buffer kept until the command buffer completes.

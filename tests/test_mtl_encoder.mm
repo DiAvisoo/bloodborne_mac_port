@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 #include "video_core/renderer_metal/mtl_object.h"
 #include "video_core/renderer_metal/mtl_device.h"
@@ -488,6 +489,99 @@ void TestWaitMeansCompleted() {
     Expect(completed, "after Wait(tick) the tick's command buffer has completed");
 }
 
+
+/// Bindings end with their command buffer (as in Vulkan): a slot left bound must not be applied
+/// again after Submit, when its object may be gone (here an 8 KiB SetBytes temporary).
+void TestBindingsEndAtSubmit() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = TestLibrary(device);
+    id<MTLComputePipelineState> copy = Kernel(device, library, @"copy_constants");
+    std::vector<u32> large(2048, 7u), small(64, 9u);
+    id<MTLBuffer> out = SharedBuffer(device, 64 * 4);
+    encoder.SetComputePipeline((__bridge void*)copy);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(out));
+    encoder.SetBytes(Metal::Stage::Compute, 1, small.data(), u32(small.size() * 4));
+    encoder.SetBytes(Metal::Stage::Compute, 2, large.data(), u32(large.size() * 4)); // unused slot
+    encoder.Dispatch({1, 1, 1}, {64, 1, 1});
+    device.Wait(encoder.Submit());
+    for (int i = 0; i < 100; ++i) {
+        [NSThread sleepForTimeInterval:0.001]; // the temporary is released after completion
+    }
+    id<MTLBuffer> out2 = SharedBuffer(device, 64 * 4);
+    encoder.SetComputePipeline((__bridge void*)copy);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(out2));
+    encoder.SetBytes(Metal::Stage::Compute, 1, small.data(), u32(small.size() * 4));
+    encoder.Dispatch({1, 1, 1}, {64, 1, 1}); // must not touch slot 2's freed buffer
+    device.Wait(encoder.Submit());
+    Expect(static_cast<const u32*>(out2.contents)[63] == 9u, "a new command buffer starts unbound");
+}
+
+/// The recorder is a plain thread with no autorelease pool: recording must not leave
+/// autoreleased objects behind on it (they would pile up until the thread exits). A pass
+/// descriptor holds its attachment textures, so a leaked descriptor keeps the texture alive.
+void TestNoLeakOnPoollessThread() {
+    Metal::Device device;
+    bool released = false;
+    std::thread recorder([&] {
+        Metal::Encoder encoder{device};
+        __weak id<MTLTexture> weak;
+        {
+            id<MTLTexture> target = Texture(device, kSize, kSize);
+            weak = target;
+            encoder.BeginRenderPass(ColorPass(target, false, 0));
+            encoder.EndRenderPass();
+        }
+        released = weak == nil; // still on the thread: its implicit pool has not drained
+        device.Wait(encoder.Submit());
+    });
+    recorder.join();
+    Expect(released, "recording on a thread without a pool leaves nothing autoreleased");
+}
+
+/// A copy recorded inside a clearing pass before its first draw sees the cleared target.
+void TestCopyInPassSeesClear() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    FillTexture(device, encoder, target, kBlue);
+    encoder.BeginRenderPass(ColorPass(target, true, kYellow));
+    id<MTLBuffer> out = Readback(device, encoder, target); // before any draw
+    encoder.EndRenderPass();
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize, 4, 4) == kYellow, "the pass's clear happens before a copy inside it");
+}
+
+/// A scissor carried from a bigger pass is clamped to the next, smaller target (Metal requires
+/// the scissor inside the render target; Vulkan does not).
+void TestScissorClampedToTarget() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = TestLibrary(device);
+    id<MTLRenderPipelineState> solid = SolidPipeline(device, library, @"fullscreen");
+    id<MTLTexture> big = Texture(device, kSize, kSize);
+    id<MTLTexture> small = Texture(device, kSize / 2, kSize / 2);
+    encoder.BeginRenderPass(ColorPass(big, true, kBlack));
+    encoder.SetRenderPipeline((__bridge void*)solid);
+    encoder.SetViewport({0, 0, float(kSize), float(kSize), 0, 1});
+    encoder.SetScissor({0, 0, kSize, kSize});
+    SetColor(encoder, kRed);
+    encoder.Draw(Metal::Primitive::Triangle, 3);
+    encoder.EndRenderPass();
+    Metal::RenderPassDesc second = ColorPass(small, true, kBlack);
+    second.width = second.height = kSize / 2;
+    encoder.BeginRenderPass(second);
+    encoder.SetViewport({0, 0, float(kSize / 2), float(kSize / 2), 0, 1});
+    encoder.Draw(Metal::Primitive::Triangle, 3); // scissor 64x64 carried into a 32x32 target
+    encoder.EndRenderPass();
+    id<MTLBuffer> out = SharedBuffer(device, kSize * kSize);
+    encoder.CopyTextureToBuffer((__bridge void*)small, 0, 0, {}, {kSize / 2, kSize / 2, 1}, Ref(out),
+                                kSize / 2 * 4, kSize * kSize);
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize / 2, kSize / 2 - 1, kSize / 2 - 1) == kRed,
+           "a draw with a carried, too-large scissor fills the smaller target");
+}
+
 } // namespace
 
 int main() {
@@ -504,6 +598,10 @@ int main() {
         TestPassReopenKeepsDrawing();
         TestStatePersistsAcrossPasses();
         TestIndexedDraw();
+        TestBindingsEndAtSubmit();
+        TestNoLeakOnPoollessThread();
+        TestCopyInPassSeesClear();
+        TestScissorClampedToTarget();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);
