@@ -143,6 +143,43 @@ struct Encoder::Impl {
         return blit;
     }
 
+    id<MTLComputeCommandEncoder> Compute() {
+        if (!compute) {
+            EndRender();
+            EndBlit();
+            @autoreleasepool {
+                compute = [Cmd() computeCommandEncoder];
+            }
+            compute_stage.Reapply();
+            compute_pipeline_dirty = compute_pipeline != nullptr;
+        }
+        return compute;
+    }
+
+    void ApplyCompute() {
+        id<MTLComputeCommandEncoder> e = Compute();
+        if (compute_pipeline_dirty) {
+            [e setComputePipelineState:(__bridge id<MTLComputePipelineState>)compute_pipeline];
+            compute_pipeline_dirty = false;
+        }
+        StageState& s = compute_stage;
+        ForEachBit(s.buffers_dirty, [&](u32 slot) {
+            const StageState::Slot& b = s.buffers[slot];
+            if (!b.bytes.empty()) {
+                [e setBytes:b.bytes.data() length:b.bytes.size() atIndex:slot];
+            } else {
+                [e setBuffer:(__bridge id<MTLBuffer>)b.buffer offset:b.offset atIndex:slot];
+            }
+        });
+        ForEachBit(s.textures_dirty, [&](u32 slot) {
+            [e setTexture:(__bridge id<MTLTexture>)s.textures[slot] atIndex:slot];
+        });
+        ForEachBit(s.samplers_dirty, [&](u32 slot) {
+            [e setSamplerState:(__bridge id<MTLSamplerState>)s.samplers[slot] atIndex:slot];
+        });
+        s.buffers_dirty = s.textures_dirty = s.samplers_dirty = 0;
+    }
+
     StageState& StateOf(Stage stage) {
         switch (stage) {
         case Stage::Vertex:
@@ -259,23 +296,69 @@ u64 Encoder::Submit() {
 
 // ---- Compute (Task 4) ----
 
-void Encoder::SetComputePipeline(void*) {
-    UNREACHABLE_MSG("Metal::Encoder compute: Task 4");
+void Encoder::SetBuffer(Stage stage, u32 slot, BufferRef buffer) {
+    ASSERT(slot < MaxBuffers);
+    StageState& s = impl->StateOf(stage);
+    StageState::Slot& b = s.buffers[slot];
+    b.buffer = buffer.buffer;
+    b.offset = buffer.offset;
+    b.bytes.clear();
+    s.buffers_dirty |= 1u << slot;
+    s.buffers_used |= 1u << slot;
 }
-void Encoder::Dispatch(Size3, Size3) {
-    UNREACHABLE_MSG("Metal::Encoder compute: Task 4");
+
+void Encoder::SetBytes(Stage stage, u32 slot, const void* data, u32 size) {
+    ASSERT(slot < MaxBuffers && size > 0);
+    if (size > MaxInlineBytes) {
+        id<MTLBuffer> temp;
+        @autoreleasepool {
+            temp = [impl->dev newBufferWithBytes:data
+                                          length:size
+                                         options:MTLResourceStorageModeShared];
+        }
+        SetBuffer(stage, slot, {(__bridge void*)temp, 0});
+        KeepAlive(Object::Retain((__bridge void*)temp));
+        return;
+    }
+    StageState& s = impl->StateOf(stage);
+    StageState::Slot& b = s.buffers[slot];
+    b.buffer = nullptr;
+    b.offset = 0;
+    b.bytes.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + size);
+    s.buffers_dirty |= 1u << slot;
+    s.buffers_used |= 1u << slot;
 }
-void Encoder::SetBuffer(Stage, u32, BufferRef) {
-    UNREACHABLE_MSG("Metal::Encoder resources: Task 4");
+
+void Encoder::SetTexture(Stage stage, u32 slot, void* texture) {
+    ASSERT(slot < MaxTextures);
+    StageState& s = impl->StateOf(stage);
+    s.textures[slot] = texture;
+    s.textures_dirty |= 1u << slot;
+    s.textures_used |= 1u << slot;
 }
-void Encoder::SetBytes(Stage, u32, const void*, u32) {
-    UNREACHABLE_MSG("Metal::Encoder resources: Task 4");
+
+void Encoder::SetSampler(Stage stage, u32 slot, void* sampler) {
+    ASSERT(slot < MaxSamplers);
+    StageState& s = impl->StateOf(stage);
+    s.samplers[slot] = sampler;
+    s.samplers_dirty |= 1u << slot;
+    s.samplers_used |= 1u << slot;
 }
-void Encoder::SetTexture(Stage, u32, void*) {
-    UNREACHABLE_MSG("Metal::Encoder resources: Task 4");
+
+void Encoder::SetComputePipeline(void* pipeline) {
+    if (pipeline != impl->compute_pipeline) {
+        impl->compute_pipeline = pipeline;
+        impl->compute_pipeline_dirty = true;
+    }
 }
-void Encoder::SetSampler(Stage, u32, void*) {
-    UNREACHABLE_MSG("Metal::Encoder resources: Task 4");
+
+void Encoder::Dispatch(Size3 groups, Size3 threads_per_group) {
+    ASSERT_MSG(impl->compute_pipeline, "Dispatch without a compute pipeline");
+    impl->ApplyCompute();
+    [impl->compute dispatchThreadgroups:MTLSizeMake(groups.width, groups.height, groups.depth)
+                  threadsPerThreadgroup:MTLSizeMake(threads_per_group.width,
+                                                    threads_per_group.height,
+                                                    threads_per_group.depth)];
 }
 
 // ---- Render passes and draws (Task 5) ----

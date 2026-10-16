@@ -5,7 +5,9 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -198,6 +200,123 @@ void TestDeviceLifetime() {
     Expect(clean, "a destroyed Device's completion handlers do not touch a new Device");
 }
 
+constexpr const char* kTestShaders = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void doubles(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    out[i] = i * 2u;
+}
+
+kernel void copy_constants(device uint* out [[buffer(0)]], constant uint* in [[buffer(1)]],
+                           uint i [[thread_position_in_grid]]) {
+    out[i] = in[i];
+}
+
+struct VOut { float4 pos [[position]]; };
+
+vertex VOut fullscreen(uint vid [[vertex_id]]) {
+    const float2 uv = float2((vid << 1) & 2, vid & 2);
+    VOut o;
+    o.pos = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+    return o;
+}
+
+vertex VOut indexed_quad(uint vid [[vertex_id]], constant float2* corners [[buffer(0)]]) {
+    VOut o;
+    o.pos = float4(corners[vid], 0.0, 1.0);
+    return o;
+}
+
+fragment float4 solid(constant float4& color [[buffer(0)]]) {
+    return color;
+}
+)";
+
+id<MTLLibrary> TestLibrary(Metal::Device& device) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    NSError* error = nil;
+    id<MTLLibrary> library = [dev newLibraryWithSource:@(kTestShaders) options:nil error:&error];
+    if (!library) {
+        std::printf("FAIL: test shaders: %s\n", error.localizedDescription.UTF8String);
+        std::exit(1);
+    }
+    return library;
+}
+
+id<MTLComputePipelineState> Kernel(Metal::Device& device, id<MTLLibrary> library, NSString* name) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    NSError* error = nil;
+    id<MTLComputePipelineState> pipeline =
+        [dev newComputePipelineStateWithFunction:[library newFunctionWithName:name] error:&error];
+    if (!pipeline) {
+        std::printf("FAIL: kernel: %s\n", error.localizedDescription.UTF8String);
+        std::exit(1);
+    }
+    return pipeline;
+}
+
+void TestCompute() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = TestLibrary(device);
+    id<MTLComputePipelineState> doubles = Kernel(device, library, @"doubles");
+    id<MTLBuffer> out = SharedBuffer(device, 64 * 4);
+    encoder.SetComputePipeline((__bridge void*)doubles);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(out));
+    encoder.Dispatch({4, 1, 1}, {16, 1, 1});
+    // A blit between two dispatches ends the compute encoder; the second dispatch must get its
+    // pipeline and buffer again on the new encoder.
+    id<MTLBuffer> scratch = SharedBuffer(device, 16);
+    encoder.FillBuffer(Ref(scratch), 16, 0);
+    id<MTLBuffer> out2 = SharedBuffer(device, 64 * 4);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(out2));
+    encoder.Dispatch({4, 1, 1}, {16, 1, 1});
+    device.Wait(encoder.Submit());
+
+    bool ok = true, ok2 = true;
+    for (u32 i = 0; i < 64; ++i) {
+        ok &= static_cast<const u32*>(out.contents)[i] == i * 2;
+        ok2 &= static_cast<const u32*>(out2.contents)[i] == i * 2;
+    }
+    Expect(ok, "Dispatch runs the kernel over the grid");
+    Expect(ok2, "state is reapplied on a compute encoder opened after a blit");
+}
+
+void TestLargeBytes() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLLibrary> library = TestLibrary(device);
+    id<MTLComputePipelineState> copy = Kernel(device, library, @"copy_constants");
+    std::vector<u32> small(64), large(2048); // 256 B inline; 8 KiB over the setBytes limit
+    for (u32 i = 0; i < small.size(); ++i) {
+        small[i] = 1000 + i;
+    }
+    for (u32 i = 0; i < large.size(); ++i) {
+        large[i] = 50000 + i;
+    }
+    id<MTLBuffer> out_small = SharedBuffer(device, small.size() * 4);
+    id<MTLBuffer> out_large = SharedBuffer(device, large.size() * 4);
+    encoder.SetComputePipeline((__bridge void*)copy);
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(out_small));
+    encoder.SetBytes(Metal::Stage::Compute, 1, small.data(), u32(small.size() * 4));
+    encoder.Dispatch({1, 1, 1}, {64, 1, 1});
+    encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(out_large));
+    encoder.SetBytes(Metal::Stage::Compute, 1, large.data(), u32(large.size() * 4));
+    std::fill(large.begin(), large.end(), 0u); // the encoder must have copied the bytes already
+    encoder.Dispatch({32, 1, 1}, {64, 1, 1});
+    device.Wait(encoder.Submit());
+
+    Expect(std::memcmp(out_small.contents, small.data(), small.size() * 4) == 0,
+           "SetBytes up to 4 KiB arrives");
+    bool ok = true;
+    for (u32 i = 0; i < 2048; ++i) {
+        ok &= static_cast<const u32*>(out_large.contents)[i] == 50000 + i;
+    }
+    Expect(ok, "SetBytes over 4 KiB arrives (temporary buffer)");
+    Expect(device.ErrorCount() == 0, "compute ran without errors");
+}
+
 } // namespace
 
 int main() {
@@ -207,6 +326,8 @@ int main() {
         TestDeviceLifetime();
         TestBlits();
         TestKeepAlive();
+        TestCompute();
+        TestLargeBytes();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);
