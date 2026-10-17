@@ -53,10 +53,13 @@ Metal::LayerConfig LayerConfigFromEnv() {
     config.pixel_format = FrameFormat;
     // MoltenVK has no Mailbox and 0.4.0 fell back to Fifo: only Immediate turns display sync off.
     config.display_sync = EmulatorSettings.GetPresentMode() != "Immediate";
-    // Two drawables, as the Vulkan swapchain had (measured 2026-10-14: 48.5 -> 31.7 ms present
-    // latency at the same frame rate as three); BB_SWAPCHAIN_IMAGES overrides, CAMetalLayer
-    // takes 2..3.
-    config.max_drawables = 2;
+    // Two drawables up to a 60 FPS limit, as the Vulkan swapchain had (measured 2026-10-14:
+    // 48.5 -> 31.7 ms present latency at the same frame rate as three). Above it, three: with two
+    // on a 120 Hz display every frame longer than one refresh waits a whole extra refresh for a
+    // drawable, which locked 90 and 120 FPS limits at 60 (2026-10-17). BB_SWAPCHAIN_IMAGES
+    // overrides, CAMetalLayer takes 2..3.
+    const u32 limit = EmulatorSettings.GetFrameLimit();
+    config.max_drawables = limit == 0 || limit > 60 ? 3 : 2;
     if (const char* env = std::getenv("BB_SWAPCHAIN_IMAGES")) {
         config.max_drawables = u32(std::clamp(std::atoi(env), 2, 3));
     }
@@ -124,8 +127,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         LOG_WARNING(Render_Vulkan,
                     "FSR 1 returns with the Metal renderer's M6; presenting without it");
     }
-    LOG_INFO(Render_Vulkan, "Presenter: CAMetalLayer, {} drawables, display sync {}",
-             config.max_drawables, config.display_sync ? "on" : "off");
+    std::printf("Presenter: CAMetalLayer, %u drawables, display sync %s, frame limit %u\n",
+                config.max_drawables, config.display_sync ? "on" : "off",
+                EmulatorSettings.GetFrameLimit());
 }
 
 Presenter::~Presenter() {
