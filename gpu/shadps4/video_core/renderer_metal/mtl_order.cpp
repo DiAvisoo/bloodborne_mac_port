@@ -9,9 +9,15 @@ namespace Metal {
 
 namespace {
 
+/// A fence not added before (slot sets give distinct fences; only the reused slot's end and
+/// the uploads' fence are added beside them).
 void AddWait(OrderPlan& p, u32 fence) {
+    p.waits[p.num_waits++] = u16(fence);
+}
+
+void AddWaitOnce(OrderPlan& p, u32 fence) {
     if (!p.Waits(fence)) {
-        p.waits[p.num_waits++] = u16(fence);
+        AddWait(p, fence);
     }
 }
 
@@ -19,17 +25,11 @@ void AddUpdate(OrderPlan& p, u32 fence) {
     p.updates[p.num_updates++] = u16(fence);
 }
 
-/// Calls `f(k)` for every set bit of `mask`.
-template <typename F>
-void ForEachSlot(u64 mask, F&& f) {
-    for (; mask; mask &= mask - 1) {
-        f(u32(std::countr_zero(mask)));
-    }
-}
-
-static_assert(OrderTracker::Slots == 64, "slot sets are 64-bit masks");
-static_assert(OrderPlan::MaxWaits >= NumHazardClasses * OrderTracker::Slots + 1);
+// The bound derived at OrderPlan::MaxWaits.
+static_assert(OrderPlan::MaxWaits == NumHazardClasses * (OrderTracker::Slots + 1) + 1);
 static_assert(OrderPlan::MaxUpdates >= NumHazardClasses * 2);
+static_assert(OrderTracker::NumFences <= 0x10000, "plans store fence indices as u16");
+static_assert(OrderSlots % 64 == 0);
 
 } // namespace
 
@@ -44,49 +44,56 @@ bool OrderPlan::Updates(u32 fence) const noexcept {
 }
 
 void OrderTracker::BarrierLocked(ClassState& s, HazardClass c, BarrierScopes scopes) {
-    u64 ends = 0, vertices = 0;
+    SlotSet ends, vertices;
     if (scopes & ScopeRenderEnd) {
         ends |= s.render_end;
-        s.render_end = s.render_vertex = 0;
+        s.render_end.Clear();
+        s.render_vertex.Clear();
     } else if (scopes & ScopeRenderVertex) {
         vertices |= s.render_vertex;
-        s.render_vertex = 0;
+        s.render_vertex.Clear();
     }
     if (scopes & ScopeCopyEnd) {
         ends |= s.copy_end;
-        s.copy_end = 0;
+        s.copy_end.Clear();
     }
     if (scopes & ScopeComputeEnd) {
         ends |= s.compute_end;
-        s.compute_end = 0;
+        s.compute_end.Clear();
     }
-    vertices &= ~ends;
+    vertices.Remove(ends);
     const bool ahead = (scopes & ScopeAhead) && c == HazardClass::Memory;
-    if (!(ends | vertices) && !ahead) {
+    if (!ends.Any() && !vertices.Any() && !ahead) {
         return; // nothing since: the current waits still order everything they did
     }
     // A slot waited for now waited, when it opened, for everything installed up to its
     // generation: those waits are implied.
     u32 newest = 0;
-    ForEachSlot(ends | vertices, [&](u32 k) { newest = std::max(newest, s.open_gen[k] + 1); });
-    ForEachSlot(s.wait_end, [&](u32 k) {
+    const auto newer = [&](u32 k) { newest = std::max(newest, s.open_gen[k] + 1); };
+    ends.ForEach(newer);
+    vertices.ForEach(newer);
+    SlotSet implied;
+    s.wait_end.ForEach([&](u32 k) {
         if (s.end_gen[k] < newest) {
-            s.wait_end &= ~(1ull << k);
+            implied.Set(k);
         }
     });
-    ForEachSlot(s.wait_vertex, [&](u32 k) {
+    s.wait_vertex.ForEach([&](u32 k) {
         if (s.vertex_gen[k] < newest) {
-            s.wait_vertex &= ~(1ull << k);
+            implied.Set(k);
         }
     });
+    s.wait_end.Remove(implied);
+    s.wait_vertex.Remove(implied);
     if (s.wait_ahead && s.ahead_gen < newest) {
         s.wait_ahead = false;
     }
     ++s.gen;
-    ForEachSlot(ends, [&](u32 k) { s.end_gen[k] = s.gen; });
-    ForEachSlot(vertices, [&](u32 k) { s.vertex_gen[k] = s.gen; });
+    ends.ForEach([&](u32 k) { s.end_gen[k] = s.gen; });
+    vertices.ForEach([&](u32 k) { s.vertex_gen[k] = s.gen; });
     s.wait_end |= ends;
-    s.wait_vertex = (s.wait_vertex | vertices) & ~s.wait_end;
+    s.wait_vertex |= vertices;
+    s.wait_vertex.Remove(s.wait_end);
     if (ahead) {
         s.wait_ahead = true;
         s.ahead_gen = s.gen;
@@ -105,58 +112,62 @@ OrderPlan OrderTracker::Open(const Accesses& accesses, Lane lane, u64 tick, u64 
         ClassState& s = classes[i];
         // Encoders of completed command buffers need no waiting: drop their slots.
         if (completed) {
-            u64 done = 0;
+            SlotSet done;
             for (u32 k = 0; k < Slots; ++k) {
                 if (s.slot_tick[k] && s.slot_tick[k] <= completed) {
-                    done |= 1ull << k;
+                    done.Set(k);
                     s.slot_tick[k] = 0;
                 }
             }
-            s.render_vertex &= ~done;
-            s.render_end &= ~done;
-            s.copy_end &= ~done;
-            s.compute_end &= ~done;
-            s.wait_vertex &= ~done;
-            s.wait_end &= ~done;
+            if (done.Any()) {
+                for (SlotSet* set : {&s.render_vertex, &s.render_end, &s.copy_end,
+                                     &s.compute_end, &s.wait_vertex, &s.wait_end}) {
+                    set->Remove(done);
+                }
+            }
         }
         if (s.isolate || access == Access::Write) {
             s.isolate = false;
             BarrierLocked(s, c, ScopeAll); // after the isolated write / before this one
         }
         s.isolate = access == Access::Write;
-        ForEachSlot(s.wait_end, [&](u32 k) { AddWait(plan, SlotFence(c, k)); });
-        ForEachSlot(s.wait_vertex, [&](u32 k) {
-            AddWait(plan, SlotFence(c, k, (s.render >> k) & 1 ? VertexDone : EncoderDone));
+        s.wait_end.ForEach([&](u32 k) { AddWait(plan, SlotFence(c, k)); });
+        s.wait_vertex.ForEach([&](u32 k) {
+            AddWait(plan, SlotFence(c, k, s.render.Test(k) ? VertexDone : EncoderDone));
         });
         if (s.wait_ahead) {
             AddWait(plan, AheadFence);
         }
         const bool memory = c == HazardClass::Memory;
         // A slot no barrier needs, searching from `next`; else reuse `next`, waiting on it.
-        const u64 busy = s.render_vertex | s.render_end | s.copy_end | s.compute_end |
-                         s.wait_vertex | s.wait_end;
-        u32 k = s.next;
-        if (~busy) {
-            const u64 rotated = std::rotr(~busy, int(s.next));
-            k = (s.next + u32(std::countr_zero(rotated))) % Slots;
-        } else {
-            AddWait(plan, SlotFence(c, k));
+        SlotSet busy = s.render_vertex;
+        for (const SlotSet* set :
+             {&s.render_end, &s.copy_end, &s.compute_end, &s.wait_vertex, &s.wait_end}) {
+            busy |= *set;
+        }
+        u32 k = busy.FirstFree(s.next);
+        if (k == Slots) {
+            k = s.next;
+            AddWaitOnce(plan, SlotFence(c, k));
+            busy_reuses[i].fetch_add(1, std::memory_order_relaxed);
         }
         s.next = (k + 1) % Slots;
         s.open_gen[k] = s.gen;
         s.slot_tick[k] = tick;
         // Motion history is read and written by vertex shaders only: one fence, after them.
         const bool render_slot = lane == Lane::Render && memory;
-        const u64 bit = 1ull << k;
-        s.render = (s.render & ~bit) | (render_slot ? bit : 0);
+        SlotSet bit;
+        bit.Set(k);
+        s.render.Remove(bit);
         if (render_slot) {
-            s.render_vertex |= bit;
-            s.render_end |= bit;
+            s.render.Set(k);
+            s.render_vertex.Set(k);
+            s.render_end.Set(k);
             AddUpdate(plan, SlotFence(c, k, VertexDone));
         } else if (lane == Lane::Copy && memory) {
-            s.copy_end |= bit;
+            s.copy_end.Set(k);
         } else {
-            s.compute_end |= bit; // (motion history: every encoder, one fence)
+            s.compute_end.Set(k); // (motion history: every encoder, one fence)
         }
         AddUpdate(plan, SlotFence(c, k));
     }

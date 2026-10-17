@@ -180,6 +180,13 @@ bool Runtime::UsedInFlight(const VideoCore::Buffer* buffer,
     if (in_flight == 0) {
         return false;
     }
+    const auto in_flight_tag = [&](u16 tag) {
+        const u16 age = static_cast<u16>(static_cast<u16>(current) - tag);
+        return age != 0 && age <= in_flight;
+    };
+    if (in_flight_tag(std::atomic_ref<u16>(it->second.whole_tick).load(std::memory_order_relaxed))) {
+        return true;
+    }
     for (const auto& copy : copies) {
         if (copy.size == 0) {
             continue;
@@ -187,9 +194,8 @@ bool Runtime::UsedInFlight(const VideoCore::Buffer* buffer,
         const u64 offset = source ? copy.src_offset : copy.dst_offset;
         const u64 last = std::min((offset + copy.size - 1) >> HoistPageBits, it->second.pages - 1);
         for (u64 page = offset >> HoistPageBits; page <= last; ++page) {
-            const u16 tag = std::atomic_ref<u16>(it->second.tick[page]).load(std::memory_order_relaxed);
-            const u16 age = static_cast<u16>(static_cast<u16>(current) - tag);
-            if (age != 0 && age <= in_flight) {
+            if (in_flight_tag(
+                    std::atomic_ref<u16>(it->second.tick[page]).load(std::memory_order_relaxed))) {
                 return true;
             }
         }
@@ -203,6 +209,11 @@ void Runtime::NoteSubmissionUse(const VideoCore::Buffer* buffer, u64 offset, u64
         return;
     }
     const u16 tick = static_cast<u16>(scheduler.CurrentTick());
+    if (offset == 0 && size >= (it->second.pages << HoistPageBits)) {
+        // The whole buffer (direct memory access): one tag, not a walk over every page.
+        std::atomic_ref<u16>(it->second.whole_tick).store(tick, std::memory_order_relaxed);
+        return;
+    }
     const u64 last = std::min((offset + size - 1) >> HoistPageBits, it->second.pages - 1);
     for (u64 page = offset >> HoistPageBits; page <= last; ++page) {
         std::atomic_ref<u16>(it->second.tick[page]).store(tick, std::memory_order_relaxed);
@@ -218,7 +229,8 @@ bool Runtime::HoistCopy(const VideoCore::Buffer* src, const VideoCore::Buffer* d
     const u16 tick = static_cast<u16>(scheduler.CurrentTick());
     const auto unused = [&](const VideoCore::Buffer* buffer, bool source) {
         const auto it = hoist_targets.find(buffer);
-        if (it == hoist_targets.end()) {
+        if (it == hoist_targets.end() ||
+            std::atomic_ref<u16>(it->second.whole_tick).load(std::memory_order_relaxed) == tick) {
             return false;
         }
         for (const auto& copy : copies) {

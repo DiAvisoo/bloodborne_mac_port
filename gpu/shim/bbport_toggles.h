@@ -103,6 +103,9 @@ inline std::atomic<std::uint64_t> hoisted_shader_copies{0}, inline_shader_copies
 /// and the others), and uploads not hoisted because their ranges were in use by a submission
 /// in flight.
 inline std::atomic<std::uint64_t> arena_barriers{0}, arena_other_barriers{0}, hoists_in_flight{0};
+/// bbport: encoders that found every ordering slot busy (Metal::OrderTracker::BusyReuses), for
+/// guest memory and object motion's history.
+inline std::atomic<std::uint64_t> busy_slot_reuses{0}, busy_motion_slot_reuses{0};
 /// Frames the GPU command thread has started (display pass), for per-frame diagnostics.
 inline std::atomic<std::uint64_t> gpu_frames{0};
 /// Wall time spent in operations suspected of stalls (ns, all threads).

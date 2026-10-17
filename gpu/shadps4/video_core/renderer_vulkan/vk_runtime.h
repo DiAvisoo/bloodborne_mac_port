@@ -111,10 +111,10 @@ public:
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
 
     /// bbport: ordering of the untracked arena (as the Vulkan renderer's barrier tracker):
-    /// a command first asks IsBufferAccessed for each range it reads or writes; when any is,
-    /// FlushBarriers before recording it; after recording it, AccessBuffer marks its ranges
-    /// (and the hoisting bookkeeping). Unregistered buffers are not tracked here: tracked ones
-    /// Metal orders, untracked ones the Encoder (an isolated write, mtl_order.h).
+    /// right before a command is recorded, IsBufferAccessed for each range it reads or writes,
+    /// then FlushBarriers with the scopes they give; after recording it, AccessBuffer marks its
+    /// ranges (and the hoisting bookkeeping). Unregistered buffers are not tracked here: tracked
+    /// ones Metal orders, untracked ones the Encoder (an isolated write, mtl_order.h).
     /// What a barrier before the access must wait for (RAW, WAR, WAW; ScopeNone: no barrier).
     [[nodiscard]] Metal::BarrierScopes IsBufferAccessed(const VideoCore::Buffer* handle,
                                                         u64 offset, u64 size,
@@ -144,8 +144,6 @@ public:
     /// the barrier before it, and its marks after it (the command orders its two halves).
     void BeginStagingRoundTrip(const VideoCore::Buffer* staging, u64 offset, u64 size);
     void EndStagingRoundTrip(const VideoCore::Buffer* staging, u64 offset, u64 size);
-    /// Records a barrier (Metal::Encoder::OrderBarrier) when anything was accessed since the
-    /// last one: every command after it waits for every command before it.
     /// Records a barrier waiting for `scopes` (Metal::Encoder::OrderBarrier), when anything is
     /// to be ordered.
     void FlushBarriers(Metal::BarrierScopes scopes);
@@ -186,6 +184,7 @@ private:
     struct HoistPages {
         std::unique_ptr<u16[]> tick; ///< low 16 bits of the submission tick that used the page
         u64 pages;
+        mutable u16 whole_tick{}; ///< ... that used the whole buffer (direct memory access)
     };
     std::unordered_map<const VideoCore::Buffer*, HoistPages> hoist_targets;
     /// Whether a hoisted copy's ranges were used by a submission still running (the upload then

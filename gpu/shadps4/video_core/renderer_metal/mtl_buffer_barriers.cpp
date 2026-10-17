@@ -2,6 +2,8 @@
 // bbport: which accesses to the guest arena need a barrier (mtl_buffer_barriers.h).
 
 #include <algorithm>
+#include <cstdlib>
+#include "common/logging/log.h"
 #include "video_core/renderer_metal/mtl_buffer_barriers.h"
 
 namespace Metal {
@@ -21,23 +23,47 @@ u16 BlockMask(u64 page, u64 offset, u64 end) {
 }
 } // namespace
 
+void BufferBarriers::FreeDeleter::operator()(void* p) const noexcept {
+    std::free(p);
+}
+
 void BufferBarriers::Register(const void* buffer, u64 size) {
     const u64 pages = (size + PageSize - 1) >> PageBits;
     const u64 chunks = (size + ChunkSize - 1) >> ChunkBits;
     Tags t;
-    // Zero-filled (epoch 0: never accessed); the OS commits the pages as they are touched.
-    for (u32 k = 0; k < NumKinds; ++k) {
-        t.page[k] = std::make_unique<u32[]>(pages);
-        t.blocks[k] = std::make_unique<u16[]>(pages);
-        t.any[k] = std::make_unique<u32[]>(chunks);
-        t.whole[k] = std::make_unique<u32[]>(chunks);
-    }
     t.size = size;
+    // calloc: zero (epoch 0, never accessed); arrays this large are fresh zero-filled pages
+    // the OS commits only as accesses touch them (make_unique<T[]> would write every byte).
+    const auto zero = []<typename T>(ZeroArray<T>& array, u64 count) {
+        array.reset(static_cast<T*>(std::calloc(count, sizeof(T))));
+    };
+    bool allocated = true;
+    for (u32 k = 0; k < NumKinds && allocated; ++k) {
+        zero(t.page[k], pages);
+        zero(t.blocks[k], pages);
+        zero(t.any[k], chunks);
+        zero(t.whole[k], chunks);
+        allocated = t.page[k] && t.blocks[k] && t.any[k] && t.whole[k];
+    }
+    if (!allocated) {
+        LOG_ERROR(Render, "Buffer ordering: no memory for the access tags of a {:#x}-byte buffer; "
+                          "every access to it waits for all work before it",
+                  size);
+        t = Tags{};
+        t.size = size;
+        t.conservative = true;
+    }
     buffers[buffer] = std::move(t);
 }
 
 bool BufferBarriers::Overlaps(const Tags& t, Kind kind, u64 offset, u64 end) const {
     const u32 current = epoch[GroupOf(kind)];
+    if (t.whole_buffer[kind] == current) {
+        return true;
+    }
+    if (offset == 0 && end >= t.size) {
+        return t.any_buffer[kind] == current; // a whole-buffer query: no walk either
+    }
     const u32* page = t.page[kind].get();
     const u16* blocks = t.blocks[kind].get();
     const u64 first_page = offset >> PageBits, last_page = (end - 1) >> PageBits;
@@ -66,6 +92,9 @@ BarrierScopes BufferBarriers::Conflicts(const void* buffer, u64 offset, u64 size
         return ScopeNone;
     }
     const Tags& t = it->second;
+    if (t.conservative) {
+        return ScopeAll;
+    }
     const u64 end = std::min(offset + size, t.size);
     const auto has = [&](Kind kind) { return marked[GroupOf(kind)] && Overlaps(t, kind, offset, end); };
     BarrierScopes scopes = ScopeNone;
@@ -109,6 +138,11 @@ void BufferBarriers::MarkKind(Tags& t, Kind kind, u64 offset, u64 end) {
     const Group g = GroupOf(kind);
     marked[g] = true;
     const u32 current = epoch[g];
+    t.any_buffer[kind] = current;
+    if (offset == 0 && end >= t.size) {
+        t.whole_buffer[kind] = current; // one tag, not a walk over every chunk
+        return;
+    }
     u32* page = t.page[kind].get();
     u16* blocks = t.blocks[kind].get();
     const u64 first_page = offset >> PageBits, last_page = (end - 1) >> PageBits;
@@ -136,6 +170,12 @@ void BufferBarriers::Mark(const void* buffer, u64 offset, u64 size, bool write, 
         return;
     }
     Tags& t = it->second;
+    if (t.conservative) {
+        for (bool& m : marked) {
+            m = true; // the next barrier has something to order
+        }
+        return;
+    }
     const u64 end = std::min(offset + size, t.size);
     if (encoders & EncoderRender) {
         MarkKind(t,
@@ -174,8 +214,6 @@ BarrierScopes BufferBarriers::Barrier(BarrierScopes scopes) {
     if (done) {
         ++barriers;
     }
-    // (A render-end barrier with only vertex-stage render accesses to order waits for the
-    // vertex stages only.)
     return done;
 }
 

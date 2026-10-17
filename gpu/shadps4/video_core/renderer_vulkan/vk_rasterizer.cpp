@@ -1919,14 +1919,11 @@ void Rasterizer::ResetBindings() {
     bound_images.clear();
     bound_buffers.clear();
     read_ranges.clear();
-    needs_barrier = Metal::ScopeNone;
 }
 
 void Rasterizer::NoteRead(const VideoCore::Buffer* buffer, u64 offset, u64 size,
                           Metal::ReadStage stage) {
-    needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size);
-    read_ranges.push_back(
-        {buffer, offset, u32(std::min<u64>(size, ~0u)), false, stage, draw_encoders});
+    read_ranges.push_back({buffer, offset, size, false, stage, draw_encoders});
 }
 
 void Rasterizer::SetDrawEncoders(const Pipeline& pipeline, bool indirect) {
@@ -1941,8 +1938,16 @@ void Rasterizer::SetDrawEncoders(const Pipeline& pipeline, bool indirect) {
 }
 
 void Rasterizer::OrderAccesses() {
-    runtime.FlushBarriers(needs_barrier);
-    needs_barrier = Metal::ScopeNone;
+    // Checked now, right before the command is recorded: the uploads and copies recorded while
+    // its resources were bound are among the accesses it is checked against.
+    Metal::BarrierScopes need = Metal::ScopeNone;
+    for (const auto& b : bound_buffers) {
+        need |= runtime.IsBufferAccessed(b.buffer, b.offset, b.size, b.is_written);
+    }
+    for (const auto& r : read_ranges) {
+        need |= runtime.IsBufferAccessed(r.buffer, r.offset, r.size);
+    }
+    runtime.FlushBarriers(need);
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -2215,8 +2220,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
                 push_data.AddOffset(binding.buffer, adjust);
                 element = {.buffer = buffer->Ref(offset_aligned), .size = size + adjust};
-                needs_barrier |=
-                    runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written,
                                            stage.sw_stage == Shader::SwStage::Fragment ||
                                                    stage.sw_stage == Shader::SwStage::Compute

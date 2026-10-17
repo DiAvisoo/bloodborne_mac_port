@@ -556,6 +556,15 @@ u64 Scheduler::SubmitExecution() {
     BbStats::queue_submit_ns.fetch_add(bbport::CyclesToNs(bbport::CpuCycles() - submit_start),
                                        std::memory_order_relaxed);
     BbStats::queue_submits.fetch_add(1, std::memory_order_relaxed);
+    if (const auto* order = device.Order(); order && BbStats::enabled) {
+        static u64 last_memory = 0, last_motion = 0;
+        const u64 memory = order->BusyReuses(Metal::HazardClass::Memory);
+        const u64 motion = order->BusyReuses(Metal::HazardClass::MotionHistory);
+        BbStats::busy_slot_reuses.fetch_add(memory - last_memory, std::memory_order_relaxed);
+        BbStats::busy_motion_slot_reuses.fetch_add(motion - last_motion, std::memory_order_relaxed);
+        last_memory = memory;
+        last_motion = motion;
+    }
     ASSERT_MSG(tick == signal_value, "Submission signalled tick {}, expected {}", tick,
                signal_value);
     upload_lock.unlock();

@@ -4,6 +4,7 @@
 // Metal::Encoder blits, dispatches, render passes and draws, on the system's GPU. No window.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <mach/mach.h>
 
 #include <algorithm>
 #include <atomic>
@@ -2069,9 +2070,11 @@ void TestOrderTracker() {
         for (u32 i = 0; i < T::Slots; ++i) {
             Expect(t.Open(read).num_waits == 0, "order: no chain while slots are free");
         }
+        Expect(t.BusyReuses(HazardClass::Memory) == 0, "order: no busy reuse while slots are free");
         const auto wrapped = t.Open(read);
         Expect(wrapped.Updates(end(0)) && wrapped.Waits(end(0)),
                "order: a slot reused before a barrier waited for it is waited on first");
+        Expect(t.BusyReuses(HazardClass::Memory) == 1, "order: a busy reuse is counted");
     }
     {
         T t; // classes are independent; no access, no plan
@@ -2094,6 +2097,14 @@ void TestOrderTracker() {
                    ahead.num_updates == 1 && ahead.Updates(T::AheadFence),
                "order: an upload ahead waits for the uploads before it, and updates their fence");
     }
+}
+
+/// The process's physical footprint (bytes), as Activity Monitor counts memory.
+u64 Footprint() {
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count);
+    return info.phys_footprint;
 }
 
 void TestBufferBarriers() {
@@ -2172,6 +2183,40 @@ void TestBufferBarriers() {
            "barriers: a write to another 256-byte block of the page does not conflict");
     Expect(b.Conflicts(arena, 0x700c0, 0x80, true) == Metal::ScopeRenderEnd,
            "barriers: ... a write to the same block does");
+    // Whole-buffer accesses (direct memory access) are one tag, and seen by any range.
+    b.Barrier(Metal::ScopeAll);
+    b.Mark(arena, 0, 64ull << 20, false, render);
+    Expect(b.Conflicts(arena, 0x123400, 4, true) == Metal::ScopeRenderEnd,
+           "barriers: a write anywhere conflicts with a whole-buffer read");
+    b.Barrier(Metal::ScopeAll);
+    b.Mark(arena, 0x9000, 4, true, other);
+    Expect(b.Conflicts(arena, 0, 64ull << 20, false) == Metal::ScopeCopyEnd,
+           "barriers: a whole-buffer read sees one written block");
+    Expect(b.Conflicts(arena, 0, 64ull << 20, true) == Metal::ScopeCopyEnd,
+           "barriers: ... as does a whole-buffer write");
+    b.Barrier(Metal::ScopeAll);
+    Expect(b.Conflicts(arena, 0, 64ull << 20, true) == Metal::ScopeNone,
+           "barriers: ... and nothing after a barrier");
+    // Registering is free: the tag arrays are committed only where accesses touch them.
+    {
+        const u64 before = Footprint();
+        Metal::BufferBarriers big;
+        int big_storage = 0;
+        big.Register(&big_storage, 16ull << 30);
+        const u64 after = Footprint();
+        Expect(after < before + (8ull << 20),
+               "barriers: registering a 16 GiB buffer commits (almost) no memory");
+        // A buffer whose tags cannot be allocated is ordered conservatively: every access
+        // conflicts with everything.
+        int huge_storage = 0;
+        big.Register(&huge_storage, 1ull << 62);
+        Expect(big.Registered(&huge_storage), "barriers: a buffer without tags is still tracked");
+        Expect(big.Conflicts(&huge_storage, 0, 4, false) == Metal::ScopeAll,
+               "barriers: ... and every access to it waits for everything");
+        big.Mark(&huge_storage, 0, 4, false, render);
+        Expect(big.Barrier(Metal::ScopeAll) != Metal::ScopeNone,
+               "barriers: ... and its accesses give the barrier something to order");
+    }
     // Unregistered buffers: the Encoder orders them itself
     Expect(b.Conflicts(unregistered, 0, 4, true) == Metal::ScopeNone,
            "barriers: unregistered buffers never conflict");
@@ -2268,6 +2313,23 @@ void TestUntrackedOrdering() {
     device.Wait(encoder.Submit());
     Expect(AllEqual(war_old, 2), "untracked: a write does not overtake the read before it");
     Expect(AllEqual(war_new, 3), "untracked: the write lands before the next read");
+    // WAR across command buffers: a slow read committed (not waited for), then a write in the
+    // next command buffer must not overtake it (fails without the fences).
+    {
+        id<MTLBuffer> old_value = SharedBuffer(device, kBytes), new_value = SharedBuffer(device, kBytes);
+        for (u32 round = 0; round < 3; ++round) {
+            Store(encoder, 20 + round, 0);
+            device.Wait(encoder.Submit());
+            Copy(encoder, old_value, kOrderSpins * 4);
+            encoder.Submit();
+            Store(encoder, 30 + round, 0);
+            Copy(encoder, new_value, 0);
+            device.Wait(encoder.Submit());
+            Expect(AllEqual(old_value, 20 + round),
+                   "untracked: a write in the next command buffer does not overtake a slow read");
+            Expect(AllEqual(new_value, 30 + round), "untracked: ... and lands before the next read");
+        }
+    }
     // Hoisted upload, as the scheduler records one: its range is not in use by work in flight
     // (the store before it completed), and a read recorded after it behind a barrier on the
     // uploads (as the renderer records one before a read of an uploaded range) sees it.

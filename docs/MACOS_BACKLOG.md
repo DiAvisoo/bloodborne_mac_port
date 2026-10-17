@@ -342,15 +342,15 @@ Each item: what was done for now, what the refinement is, and where it lives.
   while only the conflicting command needs to (measured: 108 FPS when only the next encoder
   waits, unsafe). Next: per-command ordering, each command waiting for exactly the encoders it
   conflicts with: the renderer records which commands' accesses conflict (command ids per
-  256-byte block), the Encoder maps command ids to slot fences; needs more than 64 slots (a
-  frame and a half in flight is ~450 encoders) and transitive pruning of waits (an encoder
-  that waited stands for what it waited for, across encoder kinds). A first try retiring per
-  waiting kind ran out of slots (87.7 FPS).
-- **Metal-native (M5): with object motion on, untracked buffers gain nothing** (city, TAA,
-  1440p: 50.7 FPS untracked against 51.0 tracked; off: 71.7 against 62.1), so object motion
-  now costs +5.8 ms instead of +3.5. The motion passes' history buffer is ordered per frame
-  (one barrier at frame start, vertex-stage fences); find what serialises the motion frame
-  (GPU profile per pass, `BB_GPU_PROFILE=1`).
+  256-byte block), the Encoder maps command ids to slot fences (now 256 slots per class) and
+  needs transitive pruning of waits (an encoder that waited stands for what it waited for,
+  across encoder kinds). A first try retiring per waiting kind ran out of slots (87.7 FPS, at
+  64 slots).
+- **Metal-native (M5): with object motion on, the frame takes ~19.6 ms whatever the ordering**
+  (city, TAA, 1440p, background: untracked 51.0 FPS, tracked 51.3; off: 75.0 against 64.0), so
+  object motion's cost grew to +6.3 ms only because the frame without it got faster. Not ordering
+  slots (0 busy reuses in the motion class, FINDINGS Task 10b fix round 1): profile the motion
+  passes (`BB_GPU_PROFILE=1`; the RGBA32F motion attachment, the motion shader variants).
 
 - **Metal-native (M4): the second frame waits ~344 ms for the preloaded pipelines.** `WarmUp`
   hands the stored pipelines to the build pool and returns at once, so the first frames' draws

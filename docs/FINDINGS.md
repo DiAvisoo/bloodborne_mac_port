@@ -1101,3 +1101,33 @@ uncapped, alternating runs):
 
 With object motion on, untracked buffers gain nothing (50.7 against 51.0): the motion frame is
 as slow as before, so its cost in milliseconds grows. Not explained yet (backlog).
+
+### Task 10b fix round 1 (review): slots, object motion, tag memory
+
+Runs from here on keep the game window in the background (`SDL_MAC_BACKGROUND_APP=1
+SDL_WINDOW_ACTIVATE_WHEN_SHOWN=0`, so it does not take focus from whoever uses the Mac). In the
+background the GPU is ~12% slower: the city scene at 1080p, tracked, runs 76.9 FPS (86.95 in
+front); compare only runs made the same way.
+
+- **Ordering slots ran out.** With 64 slots per class, ~150 encoders per frame found every slot
+  busy and reused one, waiting for an unrelated encoder first (new `BB_FRAME_STATS` field
+  "busy-slot reuses"): render-pass slots stay needed until a render-pass barrier (~2 per
+  frame) or the command buffer completes, and ~450 encoders are in flight. With 256 slots: 0
+  reuses; city 1080p in the background 85.05 -> 85.95 FPS (tracked: 76.9).
+- **Object motion** (hypothesis from review: its history slots run out): ruled out, 0 busy
+  reuses in the motion class. Background, `upscaler=taa preset=0 2560x1440`, uncapped:
+
+  | Mode | object_motion=0 | object_motion=1 | Cost |
+  |---|---|---|---|
+  | untracked (2 runs each) | 74.99 FPS (75.03 / 74.95), 13.34 ms | 50.99 (51.05 / 50.92), 19.61 ms | +6.3 ms |
+  | tracked (1 run each) | 64.03, 15.61 ms | 51.32, 19.48 ms | +3.9 ms |
+
+  The motion frame takes ~19.6 ms in every mode (front or back, tracked or not): untracked
+  buffers shorten the frame without object motion only, so the difference grows while the
+  motion frame itself is no slower. Where the motion frame's time goes is still open
+  (`docs/MACOS_BACKLOG.md`).
+- **Tag memory:** the access tags were allocated with `make_unique<T[]>`, which writes every
+  byte (+216 MB footprint, review). Now `calloc`: zero pages committed only where accesses
+  touch them. In play (city, 110 s): MALLOC_LARGE 1470 MB untracked against 1465 MB tracked
+  (`footprint`). A buffer whose tags cannot be allocated is logged and ordered conservatively
+  (every access to it waits for everything before).

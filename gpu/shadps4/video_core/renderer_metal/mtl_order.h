@@ -44,6 +44,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <bit>
 #include <mutex>
 #include "common/types.h"
 #include "video_core/renderer_metal/mtl_buffer_barriers.h"
@@ -66,10 +68,70 @@ enum class Lane : u8 {
     Compute, ///< compute encoders of dispatches
 };
 
+/// Slots per hazard class: encoders that may still need waiting for. A frame and a half in flight
+/// is ~450 Metal encoders; 64 slots ran out about 150 times a frame (each reuse makes the new
+/// encoder wait for an unrelated one), BB_FRAME_STATS "busy-slot reuses".
+constexpr u32 OrderSlots = 256;
+
+/// A set of slots, a bit each.
+struct SlotSet {
+    static constexpr u32 Words = OrderSlots / 64;
+    std::array<u64, Words> w{};
+
+    void Set(u32 k) noexcept { w[k / 64] |= 1ull << (k % 64); }
+    [[nodiscard]] bool Test(u32 k) const noexcept { return (w[k / 64] >> (k % 64)) & 1; }
+    [[nodiscard]] bool Any() const noexcept {
+        for (u64 x : w) {
+            if (x) {
+                return true;
+            }
+        }
+        return false;
+    }
+    SlotSet& operator|=(const SlotSet& o) noexcept {
+        for (u32 i = 0; i < Words; ++i) w[i] |= o.w[i];
+        return *this;
+    }
+    /// Removes the slots of `o`.
+    SlotSet& Remove(const SlotSet& o) noexcept {
+        for (u32 i = 0; i < Words; ++i) w[i] &= ~o.w[i];
+        return *this;
+    }
+    void Clear() noexcept { w = {}; }
+    template <typename F>
+    void ForEach(F&& f) const {
+        for (u32 i = 0; i < Words; ++i) {
+            for (u64 x = w[i]; x; x &= x - 1) {
+                f(i * 64 + u32(std::countr_zero(x)));
+            }
+        }
+    }
+    /// The first slot from `from` (wrapping around) not in the set; OrderSlots: none.
+    [[nodiscard]] u32 FirstFree(u32 from) const noexcept {
+        for (u32 n = 0; n < OrderSlots; n += 64) {
+            const u32 k = (from + n) % OrderSlots;
+            // The free bits of the 64 slots from k (crossing a word boundary when unaligned).
+            const u32 i = k / 64, b = k % 64;
+            u64 free = ~w[i] >> b;
+            if (b) {
+                free |= ~w[(i + 1) % Words] << (64 - b);
+            }
+            if (free) {
+                return (k + u32(std::countr_zero(free))) % OrderSlots;
+            }
+        }
+        return OrderSlots;
+    }
+};
+
 /// The fence waits to encode when an encoder opens and the updates to encode when it ends
 /// (indices into the device's fence table, OrderTracker::NumFences).
 struct OrderPlan {
-    static constexpr u32 MaxWaits = NumHazardClasses * 64 + 2, MaxUpdates = 4;
+    /// Per class, at most one fence per slot (the end and vertex wait sets are disjoint) plus,
+    /// when every slot is busy, the reused slot's end (whose vertex fence may be waited too);
+    /// then the uploads' fence: NumHazardClasses * (OrderSlots + 1) + 1. Updates: a render
+    /// slot's two fences per class.
+    static constexpr u32 MaxWaits = NumHazardClasses * (OrderSlots + 1) + 1, MaxUpdates = 4;
     std::array<u16, MaxWaits> waits{};
     std::array<u16, MaxUpdates> updates{};
     u32 num_waits{}, num_updates{};
@@ -83,7 +145,7 @@ struct OrderPlan {
 
 class OrderTracker {
 public:
-    static constexpr u32 Slots = 64; ///< per class (64-bit masks)
+    static constexpr u32 Slots = OrderSlots; ///< per class
     enum FenceStage : u32 { VertexDone, EncoderDone };
     /// Updated by every encoder committed ahead of the in-order stream.
     static constexpr u32 AheadFence = NumHazardClasses * Slots * 2;
@@ -116,20 +178,25 @@ public:
     /// then updates AheadFence. (Its ranges are not in use by work in flight: Runtime::HoistCopy.)
     /// Every fence must have been updated once before (Device primes them).
     static OrderPlan OpenAhead();
+    /// Encoders that found every slot of class `c` busy and reused one, waiting on it first
+    /// (a false dependency; BB_FRAME_STATS).
+    [[nodiscard]] u64 BusyReuses(HazardClass c) const noexcept {
+        return busy_reuses[u32(c)].load(std::memory_order_relaxed);
+    }
 
 private:
     struct ClassState {
         // Slots not waited for yet by a barrier of the scope.
-        u64 render_vertex{}; ///< render slots whose vertex stage no barrier waited for
-        u64 render_end{};    ///< render slots whose end no barrier waited for
-        u64 copy_end{};      ///< copy slots no barrier waited for
-        u64 compute_end{};   ///< compute slots no barrier waited for
+        SlotSet render_vertex; ///< render slots whose vertex stage no barrier waited for
+        SlotSet render_end;    ///< render slots whose end no barrier waited for
+        SlotSet copy_end;      ///< copy slots no barrier waited for
+        SlotSet compute_end;   ///< compute slots no barrier waited for
         // What every new encoder waits for, and the barrier generation that installed it.
-        u64 wait_vertex{}, wait_end{};
+        SlotSet wait_vertex, wait_end;
         std::array<u32, Slots> vertex_gen{}, end_gen{};
         std::array<u32, Slots> open_gen{}; ///< the generation a slot's encoder opened in
         std::array<u64, Slots> slot_tick{}; ///< its command buffer's device tick (0: unknown)
-        u64 render{};       ///< slots of render encoders (they have a vertex fence)
+        SlotSet render;     ///< slots of render encoders (they have a vertex fence)
         u32 gen{};          ///< barriers so far
         u32 next{};         ///< round-robin start of the slot search
         bool isolate{}; ///< the last encoder wrote unordered memory: full barrier before the next
@@ -139,6 +206,7 @@ private:
     void BarrierLocked(ClassState& s, HazardClass c, BarrierScopes scopes);
     std::mutex mutex;
     std::array<ClassState, NumHazardClasses> classes{};
+    std::array<std::atomic<u64>, NumHazardClasses> busy_reuses{};
 };
 
 } // namespace Metal

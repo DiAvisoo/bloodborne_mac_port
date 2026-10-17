@@ -67,7 +67,10 @@ public:
     static constexpr u32 BlockBits = 8; ///< 16 blocks per page: a u16 mask
     static constexpr u32 ChunkBits = 20;
 
-    /// Tracks `buffer` (its first `size` bytes; accesses past them are clamped).
+    /// Tracks `buffer` (its first `size` bytes; accesses past them are clamped). The tag arrays
+    /// are reserved, not committed (~1.3% of `size`, committed as accesses touch them). When
+    /// they cannot be allocated (logged), the buffer is ordered conservatively: every access
+    /// to it needs a full barrier.
     void Register(const void* buffer, u64 size);
     void Unregister(const void* buffer) {
         buffers.erase(buffer);
@@ -118,12 +121,24 @@ private:
                : kind <= ComputeWrite   ? GroupCompute
                                         : GroupAhead;
     }
+    /// calloc'd: zero (epoch 0, never accessed) without committing memory; large blocks come
+    /// from fresh zero pages the OS commits as accesses touch them.
+    struct FreeDeleter {
+        void operator()(void* p) const noexcept;
+    };
+    template <typename T>
+    using ZeroArray = std::unique_ptr<T[], FreeDeleter>;
     struct Tags {
-        std::unique_ptr<u32[]> page[NumKinds];   ///< epoch of the last access, per page
-        std::unique_ptr<u16[]> blocks[NumKinds]; ///< the page's blocks accessed in that epoch
-        std::unique_ptr<u32[]> any[NumKinds];    ///< ... of some page of the chunk
-        std::unique_ptr<u32[]> whole[NumKinds];  ///< ... of the whole chunk
+        ZeroArray<u32> page[NumKinds];   ///< epoch of the last access, per page
+        ZeroArray<u16> blocks[NumKinds]; ///< the page's blocks accessed in that epoch
+        ZeroArray<u32> any[NumKinds];    ///< ... of some page of the chunk
+        ZeroArray<u32> whole[NumKinds];  ///< ... of the whole chunk
+        u32 whole_buffer[NumKinds]{};    ///< ... of the whole buffer (direct memory access)
+        u32 any_buffer[NumKinds]{};      ///< ... of some part of the buffer
         u64 size{};
+        /// The arrays could not be allocated: every access conflicts with everything (each
+        /// command touching the buffer gets a full barrier).
+        bool conservative{};
     };
     /// Whether a `kind` access of the current epoch overlaps [offset, end).
     bool Overlaps(const Tags& t, Kind kind, u64 offset, u64 end) const;

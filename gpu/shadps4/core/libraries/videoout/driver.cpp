@@ -827,7 +827,8 @@ void VideoOutDriver::Flip(const Request& req) {
                             "recording %.2f; flip submit -> GPU done %.2f, GPU done every %.2f; "
                             "per frame %.1f tessellated, %.1f rect/quad-list draws; hoisted "
                             "%.1f uploads, copy shader %.1f hoisted / %.1f inline; arena barriers "
-                            "%.1f on render passes, %.1f others; %.1f not hoisted (in flight)\n",
+                            "%.1f on render passes, %.1f others; %.1f not hoisted (in flight); "
+                            "busy-slot reuses %.1f guest memory, %.1f motion\n",
                             rec_busy, flip_submit, ahead, rec_idle, queue_submit, submits, drain,
                             gpu_latency, gpu_gap, double(BbStats::tess_draws.exchange(0)) / frames,
                             double(BbStats::rect_draws.exchange(0)) / frames,
@@ -836,7 +837,9 @@ void VideoOutDriver::Flip(const Request& req) {
                             double(BbStats::inline_shader_copies.exchange(0)) / frames,
                             double(BbStats::arena_barriers.exchange(0)) / frames,
                             double(BbStats::arena_other_barriers.exchange(0)) / frames,
-                            double(BbStats::hoists_in_flight.exchange(0)) / frames);
+                            double(BbStats::hoists_in_flight.exchange(0)) / frames,
+                            double(BbStats::busy_slot_reuses.exchange(0)) / frames,
+                            double(BbStats::busy_motion_slot_reuses.exchange(0)) / frames);
             }
             if (const u64 built = BbStats::background_builds.exchange(0)) {
                 std::printf("Pipelines: %llu built in the background (%.1f ms on the creation "
