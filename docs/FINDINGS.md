@@ -976,3 +976,59 @@ show none.
   same. What remains is the motion pipelines themselves (the extra RGBA32F colour attachment 7
   on the G-buffer passes, the motion shader variants); GPU timings per pass (M5 Task 10) can
   split those.
+
+## 2026-10-17: Metal-native M5 Task 10, why the native renderer is ~11% slower than 0.4.0
+
+Central Yharnam spawn (cages save), standing, `upscaler=off preset=0 output_res=1920x1080`,
+uncapped (`fps_cap=0 BB_VBLANK_HZ=480 BB_PRESENT_MODE=Immediate`), the same ini on both builds,
+mean of the last six `Frame stats` lines per run. GPU busy: the union of every Metal command
+buffer's `GPUStartTime..GPUEndTime` in bbgpu-host, measured the same way on both builds by an
+interposer (`DYLD_INSERT_LIBRARIES` through a `BB_GPU_HOST` wrapper; SIP strips `DYLD_*` from
+`run.sh`'s shells), and on metal-native also by the new `BB_FRAME_STATS` "GPU busy" (they agree).
+
+| Build | FPS (3 runs) | GPU busy | GPU ms/frame |
+|---|---|---|---|
+| 0.4.0 (MoltenVK) | 98.83 (98.50 / 98.93 / 99.05) | 98.3% | 9.94 |
+| metal-native | 88.25 (88.23 / 88.27 / 88.25) | 98.9% | 11.21 |
+
+Both are GPU-bound; the native renderer spends **1.27 ms more GPU time per frame** (+12.8%).
+It records fewer encoders (147 render encoders/frame against MoltenVK's 237) with the same
+texture usage (render targets `ShaderRead|ShaderWrite|RenderTarget|PixelFormatView` on both) and
+the same load/store actions (Load/Store; MoltenVK defers its store action, `Unknown` at encoder
+creation). The difference is **Metal's hazard tracking on two buffers every encoder uses**:
+
+| Experiment (metal-native, resources made untracked, rendering unsynchronised) | FPS |
+|---|---|
+| none (baseline) | 88.25 |
+| all textures | 87.4 |
+| guest arena only / fault buffer only / BDA page table only / DeviceLocal staging rings only | 89.5 / 88.1 / 89.0 / 89.1 |
+| guest arena **and** fault buffer | 109.9, 110.0 (GPU 8.88 ms/frame) |
+| guest arena, fault buffer and page table | 110.0 |
+| every DeviceLocal buffer | 119.7 (the game's ~120 FPS limit; GPU busy 94-98%) |
+| every buffer | 118.0 |
+
+The guest arena (bound to nearly every draw and dispatch as `device` memory and declared
+read/write on compute encoders) and the fault buffer (bound writable to every shader that reads
+guest memory by address) are tracked: any encoder that may write them waits for every earlier
+encoder that uses them, and every later one waits for it, so adjacent encoders stop
+overlapping. Either buffer alone keeps the serialisation; with both untracked the frame takes
+8.9 ms, 11% *less* GPU time than 0.4.0 (MoltenVK places its memory in untracked placement heaps,
+103 `MTLHeapTypePlacement` heaps with `MTLHazardTrackingModeUntracked` in this scene, and
+orders work by Vulkan barriers). Untracked buffers need explicit ordering (fences or barriers
+for the encoders that really write guest memory, the fault processing kernel's atomics): that
+is the M5 Task 11 fix (`docs/MACOS_BACKLOG.md`, Performance). Object motion's +3.2 ms (Task 5
+above) declares its positions buffer read/write at the vertex stage on every motion pass: also
+worth re-measuring once the buffers are untracked.
+
+- The Metal-native GPU profiler (`BB_GPU_PROFILE=1`, encoder-boundary timestamps) costs about
+  3% (85.5 FPS) and shows the serialisation: the encoders' start-to-end times sum to 21 ms per
+  11.7 ms frame tracked, 103 ms per 9.2 ms frame untracked (encoders start early and overlap).
+  0.4.0's profiler reads the same timestamp everywhere but at submissions (all 10.1 ms/frame in
+  "between submissions"), so the per-pass comparison with MoltenVK is not possible there.
+- Metal System Trace (`xctrace record --template 'Metal System Trace' --attach <bbgpu-host>`,
+  or `--instrument GPU`) slows both builds to 64-81 FPS and serialises encoders (0.4.0 then shows
+  12.3 ms/frame of GPU time against 10.45 for metal-native): useful for the shape of a frame, not
+  for comparing the two renderers' GPU time.
+- `BB_GPU_CAPTURE=<s>` with `METAL_CAPTURE_ENABLED=1` now captures the renderer's own device:
+  with the default 16 GiB arena Apple's capture tool crashes in `stopCapture` while writing;
+  with `BB_ARENA_GIB=4` it writes the file (884 MB, city).

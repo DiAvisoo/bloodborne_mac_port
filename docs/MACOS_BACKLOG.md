@@ -329,6 +329,18 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 2. Performance
 
+- **Metal-native (M5): hazard tracking on the guest arena and the fault buffer costs ~2.3 ms of
+  GPU time per frame** (city, 1080p, upscaler off: 88.3 FPS / 11.2 ms; both buffers untracked
+  110 FPS / 8.9 ms, every DeviceLocal buffer untracked 120; 0.4.0: 98.8 FPS / 9.9 ms; FINDINGS
+  2026-10-17 Task 10). Both are tracked `MTLBuffer`s bound writable to nearly every encoder, so
+  Metal serialises adjacent encoders. Fix (M5 Task 11): make them (and the other DeviceLocal
+  buffers: page table, staging rings) untracked and order the real writers explicitly: GPU writes
+  to guest memory (blits and compute into the arena, storage-writing pipelines) with an
+  `MTLFence` or `memoryBarrier` before the encoders that read them, the fault buffer's
+  processing kernel with an atomic exchange (bits set meanwhile are handled at the next
+  submission). Re-measure object motion's +3.2 ms afterwards (its positions buffer is declared
+  read/write at the vertex stage).
+
 - **Metal-native (M4): the second frame waits ~344 ms for the preloaded pipelines.** `WarmUp`
   hands the stored pipelines to the build pool and returns at once, so the first frames' draws
   wait for them (first 5 s window: 55 FPS, worst ~410 ms; 0.4.0 preloads before the first frame:
