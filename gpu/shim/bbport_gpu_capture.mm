@@ -9,7 +9,7 @@
 
 namespace BbGpuCapture {
 
-void OnPresent() {
+void OnPresent(void* device) {
     static const double delay = [] {
         const char* env = std::getenv("BB_GPU_CAPTURE");
         return env ? std::atof(env) : -1.0;
@@ -42,8 +42,7 @@ void OnPresent() {
         NSString* path = [NSString stringWithUTF8String:file ? file : "frame.gputrace"];
         [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
         MTLCaptureDescriptor* descriptor = [[MTLCaptureDescriptor alloc] init];
-        // MoltenVK uses the system default device on single-GPU Macs.
-        descriptor.captureObject = MTLCreateSystemDefaultDevice();
+        descriptor.captureObject = (__bridge id<MTLDevice>)device;
         descriptor.destination = MTLCaptureDestinationGPUTraceDocument;
         descriptor.outputURL = [NSURL fileURLWithPath:path];
         NSError* error = nil;

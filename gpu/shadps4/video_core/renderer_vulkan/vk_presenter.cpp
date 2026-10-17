@@ -405,7 +405,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         last_present.submitted = NowNs();
         last_present.presented = last_present.submitted;
     });
-    BbGpuCapture::OnPresent(); // bbport: BB_GPU_CAPTURE one-frame Metal capture
+    BbGpuCapture::OnPresent(device.NativeDevice()); // bbport: BB_GPU_CAPTURE one-frame capture
 
     if (!is_reusing_frame) {
         std::scoped_lock lock{pool->mutex};

@@ -77,6 +77,19 @@ struct Scissor {
     u32 x{}, y{}, width{}, height{};
 };
 
+/// Where Encoder samples GPU timestamps (the GPU profiler, BB_GPU_PROFILE). Called on the
+/// encoding thread whenever the Encoder opens a Metal encoder.
+class TimestampSink {
+public:
+    /// Room for `count` samples in `sample_buffer` (id<MTLCounterSampleBuffer>) from `index`;
+    /// false: this encoder is not sampled. Render encoders take 3 (start of the vertex stage,
+    /// start and end of the fragment stage), compute and blit encoders 2 (start, end).
+    virtual bool Reserve(void*& sample_buffer, u32& index, u32 count) = 0;
+
+protected:
+    ~TimestampSink() = default;
+};
+
 class Encoder {
 public:
     explicit Encoder(Device& device);
@@ -177,6 +190,9 @@ public:
     /// Stops declaring `buffer` on encoders opened from now on (before it is released; the
     /// open encoder keeps it until it ends).
     void RemoveIndirect(void* buffer);
+    /// Samples GPU timestamps at the start and end of every Metal encoder opened from now on
+    /// into `sink` (null: stops). Sampling may keep the GPU from overlapping adjacent encoders.
+    void SetTimestampSink(TimestampSink* sink);
     /// True while any slot, pipeline or render state is set (Submit clears all of it).
     [[nodiscard]] bool HasBindings() const noexcept;
 

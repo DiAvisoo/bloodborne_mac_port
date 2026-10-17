@@ -1,91 +1,154 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <limits>
 
+#include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
 
-void GpuProfiler::Init(const Instance& instance, Scheduler& scheduler) {
+namespace {
+/// Samples in the counter buffer (all slices); the device may allow fewer.
+constexpr u32 WantedSamples = 32768;
+} // namespace
+
+void GpuProfiler::Init(Metal::Device& device, Scheduler& scheduler) {
     const char* env = std::getenv("BB_GPU_PROFILE");
     if (!env || env[0] != '1' || instance_ptr) {
         return;
     }
-    instance_ptr = new GpuProfiler(instance, scheduler);
+    auto* profiler = new GpuProfiler(device, scheduler);
+    if (!profiler->samples.Valid()) {
+        std::printf("GPU profile: off (no GPU timestamps at encoder boundaries)\n");
+        delete profiler;
+        return;
+    }
+    instance_ptr = profiler;
+    scheduler.Record([profiler](Metal::Encoder& e) { e.SetTimestampSink(profiler); });
 }
 
-GpuProfiler::GpuProfiler(const Instance& instance, Scheduler& scheduler_)
-    : device{instance.GetDevice()}, scheduler{scheduler_} {
-    const vk::QueryPoolCreateInfo info = {
-        .queryType = vk::QueryType::eTimestamp,
-        .queryCount = NumSlices * SliceQueries,
-    };
-    pool = Check<"create timestamp query pool">(device.createQueryPoolUnique(info));
-    device.resetQueryPool(*pool, 0, NumSlices * SliceQueries);
-    period_ns = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
-    for (auto& k : keys) {
-        k.reserve(SliceQueries);
+GpuProfiler::GpuProfiler(Metal::Device& device_, Scheduler& scheduler_)
+    : device{device_}, scheduler{scheduler_}, samples{device_, WantedSamples} {
+    slice_samples = samples.Count() / NumSlices;
+    for (auto& s : slices) {
+        s.encoders.reserve(slice_samples / 2);
     }
-    std::printf("GPU profile: on (timestamp period %.2f ns)\n", period_ns);
+    Metal::TimestampBuffer::Correlate(device, cpu_ns0, gpu_ticks0);
+    if (samples.Valid()) {
+        std::printf("GPU profile: on (%u timestamps per frame, encoder boundaries)\n",
+                    slice_samples);
+    }
 }
 
-void GpuProfiler::WriteTimestamp(u64 key) {
-    if (used[slice] + 1 >= SliceQueries) {
-        return; // the frame's slice is full: the rest of the frame goes to the last label
-    }
-    // Outside render passes: radv_CmdWriteTimestamp2 crashed inside some. Marks sit where a
-    // pass, dispatch or submission ends anyway.
+void GpuProfiler::Label(u64 key, std::string name) {
+    // Outside render passes: a pass ends where a new one starts anyway; a dispatch or transfer
+    // gets encoders of its own.
     scheduler.EndRendering();
-    const u32 query = slice * SliceQueries + used[slice]++;
-    keys[slice].push_back(key);
     current = key;
-    scheduler.Record([pool = *pool, query](vk::CommandBuffer cmdbuf) {
-        cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, query);
+    scheduler.Record([this, key, name = std::move(name)](Metal::Encoder& e) {
+        if (!name.empty()) {
+            names.emplace(key, name);
+        }
+        label = key;
+        if (!e.InRenderPass()) {
+            e.EndEncoding();
+        }
     });
 }
 
+bool GpuProfiler::Reserve(void*& sample_buffer, u32& index, u32 count) {
+    Slice& s = slices[slice];
+    if (s.used + count > slice_samples) {
+        ++s.unsampled;
+        return false;
+    }
+    sample_buffer = samples.Native();
+    index = slice * slice_samples + s.used;
+    s.encoders.push_back({label, index, count});
+    s.used += count;
+    return true;
+}
+
 void GpuProfiler::BeginFrame() {
-    // Close the frame: one more timestamp without a label.
-    if (used[slice] > 0 && used[slice] < SliceQueries) {
-        scheduler.EndRendering();
-        const u32 query = slice * SliceQueries + used[slice]++;
-        scheduler.Record([pool = *pool, query](vk::CommandBuffer cmdbuf) {
-            cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, query);
-        });
-        pending[slice] = true;
+    // Commands recorded now go into the submission that signals the current tick: the frame's
+    // encoders are all in it or before it.
+    scheduler.Record([this, tick = scheduler.CurrentTick()](Metal::Encoder&) { EndFrame(tick); });
+}
+
+void GpuProfiler::EndFrame(u64 tick) {
+    Slice& done = slices[slice];
+    done.tick = tick;
+    done.pending = !done.encoders.empty();
+    ++frames_ended;
+    // GPU ticks -> ns from the pair taken at the start (the longer the span, the better).
+    u64 cpu_ns = 0, gpu_ticks = 0;
+    Metal::TimestampBuffer::Correlate(device, cpu_ns, gpu_ticks);
+    if (gpu_ticks > gpu_ticks0 + 1'000'000 && cpu_ns > cpu_ns0) {
+        ns_per_tick = double(cpu_ns - cpu_ns0) / double(gpu_ticks - gpu_ticks0);
     }
     slice = (slice + 1) % NumSlices;
     // The oldest slice: its frame was submitted four frames ago.
-    if (pending[slice]) {
-        Collect(slice);
+    Slice& next = slices[slice];
+    if (next.pending) {
+        if (device.IsFree(next.tick)) {
+            Collect(slice);
+        } else {
+            ++dropped; // the GPU lags four frames: skip rather than wait
+        }
     }
-    if (used[slice]) {
-        device.resetQueryPool(*pool, slice * SliceQueries, used[slice]);
-    }
-    used[slice] = 0;
-    keys[slice].clear();
-    pending[slice] = false;
+    unsampled += next.unsampled;
+    next.encoders.clear();
+    next.used = 0;
+    next.pending = false;
+    next.unsampled = 0;
     Print();
 }
 
 void GpuProfiler::Collect(u32 which) {
-    const u32 count = used[which];
-    std::vector<u64> stamps(count);
-    // Four frames on this is complete unless the GPU lags that far: then wait for it.
-    const auto result = device.getQueryPoolResults(
-        *pool, which * SliceQueries, count, count * sizeof(u64), stamps.data(), sizeof(u64),
-        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
-    if (result != vk::Result::eSuccess) {
-        return;
+    const Slice& s = slices[which];
+    std::vector<u64> t;
+    samples.Resolve(which * slice_samples, s.used, t);
+    const u32 base = which * slice_samples;
+    u64 first = std::numeric_limits<u64>::max(), last = 0;
+    // Segments: from the start of a label's first encoder to the start of the next label's
+    // (the Vulkan profiler's timestamps on MoltenVK measured the same).
+    u64 segment_key = 0, segment_start = 0;
+    for (const Sampled& enc : s.encoders) {
+        const u32 i = enc.index - base;
+        u64 start = t[i], end = t[i + 1];
+        if (enc.count == 3) {
+            // A render encoder with no draws runs no vertex stage.
+            const u64 fs_start = t[i + 1];
+            start = start && fs_start ? std::min(start, fs_start) : (start ? start : fs_start);
+            end = t[i + 2];
+        }
+        if (!start || !end || end < start) {
+            ++unsampled;
+            continue;
+        }
+        auto& total = totals[enc.key];
+        total.encoder_ms += double(end - start) * ns_per_tick / 1e6;
+        ++total.encoders;
+        if (segment_start == 0) {
+            segment_key = enc.key;
+            segment_start = start;
+        } else if (enc.key != segment_key && start >= segment_start) {
+            totals[segment_key].ms += double(start - segment_start) * ns_per_tick / 1e6;
+            segment_key = enc.key;
+            segment_start = start;
+        }
+        first = std::min(first, start);
+        last = std::max(last, end);
     }
-    for (u32 i = 0; i + 1 < count; ++i) {
-        const double ms = double(stamps[i + 1] - stamps[i]) * period_ns / 1e6;
-        auto& total = totals[keys[which][i]];
-        total.ms += ms;
-        ++total.segments;
+    if (segment_start != 0 && last > segment_start) {
+        totals[segment_key].ms += double(last - segment_start) * ns_per_tick / 1e6;
+    }
+    if (last > first) {
+        span_ms += double(last - first) * ns_per_tick / 1e6;
     }
     ++frames;
 }
@@ -96,21 +159,39 @@ void GpuProfiler::Print() {
         return;
     }
     window = now;
+    const u64 busy = device.GpuBusyNs();
+    const u64 busy_frames = std::max<u64>(1, frames_ended - window_frames);
+    const double busy_ms = double(busy - window_busy_ns) / 1e6 / double(busy_frames);
+    window_busy_ns = busy;
+    window_frames = frames_ended;
     std::vector<std::pair<u64, Total>> sorted(totals.begin(), totals.end());
     std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
-    double sum = 0;
+    double sum = 0, encoder_sum = 0, encoders = 0;
     for (const auto& [key, total] : sorted) {
         sum += total.ms;
+        encoder_sum += total.encoder_ms;
+        encoders += double(total.encoders);
     }
-    std::printf("GPU profile: %.2f ms/frame over %llu frames, %zu labels\n", sum / frames,
-                static_cast<unsigned long long>(frames), sorted.size());
+    std::printf("GPU profile: %.2f ms/frame first encoder start to last end (segments %.2f), "
+                "command buffers busy %.2f; %.0f sampled encoders/frame summing %.2f ms "
+                "(overlapping) over %llu frames; %zu labels, %llu frames skipped, %llu encoders "
+                "unsampled\n",
+                span_ms / frames, sum / frames, busy_ms, encoders / frames, encoder_sum / frames,
+                static_cast<unsigned long long>(frames), sorted.size(),
+                static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(unsampled));
+    std::printf("  segment ms/frame (encoder ms) encoders/frame  label\n");
     for (size_t i = 0; i < std::min<size_t>(sorted.size(), 30); ++i) {
         const auto& [key, total] = sorted[i];
-        std::printf("  %6.3f ms/frame %5.1f/frame  %s\n", total.ms / frames,
-                    double(total.segments) / frames, described[key].c_str());
+        const auto name = names.find(key);
+        std::printf("  %6.3f (%6.3f) %5.1f  %s\n", total.ms / frames, total.encoder_ms / frames,
+                    double(total.encoders) / frames,
+                    name != names.end() ? name->second.c_str() : "(before the first mark)");
     }
     totals.clear();
     frames = 0;
+    dropped = 0;
+    unsampled = 0;
+    span_ms = 0;
 }
 
 } // namespace Vulkan

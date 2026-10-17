@@ -17,6 +17,7 @@
 #include <vector>
 #include "video_core/renderer_metal/mtl_blit_shaders.h"
 #include "video_core/renderer_metal/mtl_buffer.h"
+#include "video_core/renderer_metal/mtl_counters.h"
 #include "video_core/renderer_metal/mtl_object.h"
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
@@ -231,6 +232,62 @@ void TestGpuBusyTime() {
     encoder.SubmitUntracked();
     device.Wait(encoder.Submit()); // the queue completes in order: the untracked one is done
     Expect(device.GpuBusyNs() > after_tracked, "untracked command buffers count too");
+}
+
+/// The GPU profiler's sampling: every Metal encoder opened while a TimestampSink is set
+/// samples its start and end (render: vertex start, fragment start and end) into the sink's
+/// counter buffer; with no room the encoder is not sampled.
+struct TestSink final : Metal::TimestampSink {
+    Metal::TimestampBuffer& samples;
+    u32 used = 0, limit = 0;
+    std::vector<u32> counts; ///< samples reserved per encoder
+    explicit TestSink(Metal::TimestampBuffer& b, u32 max) : samples{b}, limit{max} {}
+    bool Reserve(void*& buffer, u32& index, u32 count) override {
+        if (used + count > limit) {
+            return false;
+        }
+        buffer = samples.Native();
+        index = used;
+        used += count;
+        counts.push_back(count);
+        return true;
+    }
+};
+
+void TestTimestampSampling() {
+    Metal::Device device;
+    Metal::TimestampBuffer samples{device, 4096};
+    Expect(samples.Valid() && samples.Count() >= 256, "this GPU samples timestamps at encoder boundaries");
+    if (!samples.Valid()) {
+        return;
+    }
+    Metal::Encoder encoder{device};
+    TestSink sink{samples, 7};
+    encoder.SetTimestampSink(&sink);
+    id<MTLBuffer> big = SharedBuffer(device, 16u << 20);
+    encoder.FillBuffer(Ref(big), 16u << 20, 0x33333333u); // blit: 2 samples
+    encoder.FillBuffer(Ref(big), 16u << 20, 0x01020304u); // compute kernel: 2 samples
+    id<MTLTexture> target = Texture(device, 64, 64);
+    Metal::RenderPassDesc pass{};
+    pass.colors[0].texture = (__bridge void*)target;
+    pass.colors[0].clear = true;
+    encoder.BeginRenderPass(pass); // a clear-only render encoder: 3 samples
+    encoder.EndRenderPass();
+    encoder.FillBuffer(Ref(big), 16u << 20, 0x44444444u); // no room left: not sampled
+    encoder.SetTimestampSink(nullptr);
+    device.Wait(encoder.Submit());
+    Expect(sink.counts == std::vector<u32>({2, 2, 3}), "blit, compute and render encoders reserve 2, 2, 3");
+    std::vector<u64> t;
+    samples.Resolve(0, 7, t);
+    Expect(t[0] != 0 && t[1] > t[0], "the blit encoder's end follows its start");
+    Expect(t[2] != 0 && t[3] > t[2], "the compute encoder's end follows its start");
+    Expect(t[6] != 0 && t[6] >= t[1], "the render encoder's fragment end is sampled, after the blit");
+    u64 cpu0, gpu0, cpu1, gpu1;
+    Metal::TimestampBuffer::Correlate(device, cpu0, gpu0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Metal::TimestampBuffer::Correlate(device, cpu1, gpu1);
+    Expect(gpu1 > gpu0 && cpu1 > cpu0, "CPU and GPU timestamps advance");
+    Expect(device.ErrorCount() == 0, "sampled encoders ran without errors");
 }
 
 void TestKeepAlive() {
@@ -1870,6 +1927,7 @@ int main() {
         TestDeviceLifetime();
         TestBlits();
         TestGpuBusyTime();
+        TestTimestampSampling();
         TestKeepAlive();
         TestWaitMeansCompleted();
         TestCompute();

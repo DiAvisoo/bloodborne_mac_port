@@ -529,8 +529,8 @@ u64 Scheduler::SubmitExecution() {
 
     EndRendering();
     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
-        // Until the next submission's first timestamp: mostly the GPU waiting for it.
-        profiler->Mark(0x5B317ull, [] { return std::string{"(between submissions: GPU idle)"}; });
+        // Encoders of the next submission before its first mark.
+        profiler->Mark(0x5B317ull, [] { return std::string{"(after a submission, unmarked)"}; });
     }
     SyncRecording();
     // Guest memory copies into staging read by this submission (copy threads).

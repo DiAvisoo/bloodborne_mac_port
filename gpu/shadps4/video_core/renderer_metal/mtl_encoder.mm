@@ -387,13 +387,59 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
         }
     }
 
+    TimestampSink* sink{}; ///< SetTimestampSink
+
+    /// Fills `a` (MTL{Compute,Blit}PassSampleBufferAttachmentDescriptor) when the sink has room.
+    template <typename Attachment>
+    bool SampleEncoder(Attachment* a) {
+        void* buffer = nullptr;
+        u32 index = 0;
+        if (!sink || !sink->Reserve(buffer, index, 2)) {
+            return false;
+        }
+        a.sampleBuffer = (__bridge id<MTLCounterSampleBuffer>)buffer;
+        a.startOfEncoderSampleIndex = index;
+        a.endOfEncoderSampleIndex = index + 1;
+        return true;
+    }
+
+    /// A new compute encoder on the command buffer (sampled when a sink is set).
+    id<MTLComputeCommandEncoder> NewCompute() {
+        if (sink) {
+            MTLComputePassDescriptor* d = [MTLComputePassDescriptor computePassDescriptor];
+            if (SampleEncoder(d.sampleBufferAttachments[0])) {
+                return [Cmd() computeCommandEncoderWithDescriptor:d];
+            }
+        }
+        return [Cmd() computeCommandEncoder];
+    }
+
+    /// Sets (or clears) the sample attachment of a render pass descriptor about to be encoded.
+    void SampleRenderPass(MTLRenderPassDescriptor* pass) {
+        MTLRenderPassSampleBufferAttachmentDescriptor* a = pass.sampleBufferAttachments[0];
+        void* buffer = nullptr;
+        u32 index = 0;
+        if (sink && sink->Reserve(buffer, index, 3)) {
+            a.sampleBuffer = (__bridge id<MTLCounterSampleBuffer>)buffer;
+            a.startOfVertexSampleIndex = index;
+            a.endOfVertexSampleIndex = MTLCounterDontSample;
+            a.startOfFragmentSampleIndex = index + 1;
+            a.endOfFragmentSampleIndex = index + 2;
+        } else if (a.sampleBuffer) {
+            a.sampleBuffer = nil;
+        }
+    }
+
     id<MTLBlitCommandEncoder> Blit() {
         if (!blit) {
             FlushPendingClear();
             EndRender();
             EndCompute();
             @autoreleasepool {
-                blit = [Cmd() blitCommandEncoder];
+                MTLBlitPassDescriptor* d = sink ? [MTLBlitPassDescriptor blitPassDescriptor] : nil;
+                blit = d && SampleEncoder(d.sampleBufferAttachments[0])
+                           ? [Cmd() blitCommandEncoderWithDescriptor:d]
+                           : [Cmd() blitCommandEncoder];
             }
         }
         return blit;
@@ -405,7 +451,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
             EndRender();
             EndBlit();
             @autoreleasepool {
-                compute = [Cmd() computeCommandEncoder];
+                compute = NewCompute();
             }
             DeclareOn(compute);
             compute_stage.Reapply();
@@ -445,8 +491,11 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
             EndCompute();
             EndBlit();
             @autoreleasepool {
-                render = [Cmd() renderCommandEncoderWithDescriptor:pass_opened ? pass_load
-                                                                               : pass_first];
+                MTLRenderPassDescriptor* pass = pass_opened ? pass_load : pass_first;
+                if (sink || pass.sampleBufferAttachments[0].sampleBuffer) {
+                    SampleRenderPass(pass);
+                }
+                render = [Cmd() renderCommandEncoderWithDescriptor:pass];
             }
             pass_opened = true;
             DeclareOn(render);
@@ -646,7 +695,7 @@ void Encoder::FillBuffer(BufferRef dst, u64 size, u32 pattern) {
     id<MTLComputePipelineState> pipeline = impl->FillPipeline();
     const u32 args[2] = {pattern, u32(size / 4)};
     @autoreleasepool {
-        id<MTLComputeCommandEncoder> e = [impl->Cmd() computeCommandEncoder];
+        id<MTLComputeCommandEncoder> e = impl->NewCompute();
         [e setComputePipelineState:pipeline];
         [e setBuffer:(__bridge id<MTLBuffer>)dst.buffer offset:dst.offset atIndex:0];
         [e setBytes:args length:sizeof(args) atIndex:1];
@@ -735,6 +784,10 @@ u64 Encoder::Submit() {
 
 void Encoder::SubmitUntracked() {
     impl->Finish(false);
+}
+
+void Encoder::SetTimestampSink(TimestampSink* sink) {
+    impl->sink = sink;
 }
 
 void Encoder::DeclareIndirect(void* buffer, IndirectUse use) {
@@ -1108,7 +1161,7 @@ void Encoder::DrawIndirectCount(Primitive primitive, BufferRef args, u32 stride,
     @autoreleasepool {
         scratch = [impl->dev newBufferWithLength:u64(max_count) * stride
                                          options:MTLResourceStorageModePrivate];
-        id<MTLComputeCommandEncoder> e = [impl->Cmd() computeCommandEncoder];
+        id<MTLComputeCommandEncoder> e = impl->NewCompute();
         [e setComputePipelineState:pipeline];
         [e setBuffer:(__bridge id<MTLBuffer>)args.buffer offset:args.offset atIndex:0];
         [e setBuffer:(__bridge id<MTLBuffer>)count.buffer offset:count.offset atIndex:1];

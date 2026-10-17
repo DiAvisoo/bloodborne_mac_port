@@ -425,13 +425,22 @@ Native AA fails to start ("no free provider frame").
 
 ### GPU profile (`BB_GPU_PROFILE=1`, `vk_gpu_profiler.h`)
 
-Timestamps where each render pass, dispatch, upscaler run and submission end starts; the time to
-the next one is charged to it (barriers and copies in between included; "between submissions"
-is mostly the GPU waiting for the CPU). Printed every 5 s, GPU ms per frame by label. Timestamps
-are written outside render passes (`radv_CmdWriteTimestamp2` crashed inside some) and only into
-the rasterizer's scheduler (the presenter has its own).
+**Metal-native renderer (M5):** each mark (render pass, dispatch, transfer, upscaler run,
+submission) labels the Metal encoders opened after it; every such encoder samples the GPU
+timestamp at its start and end (`Metal::TimestampSink` in `mtl_encoder.h`, an
+`MTLCounterSampleBuffer` from `mtl_counters.h`: Apple GPUs sample only at encoder boundaries).
+Printed every 5 s: per label the *segment* time (start of its first encoder to the start of the
+next label's, which is what the Vulkan timestamps measured) and, in brackets, its encoders'
+start-to-end times (these overlap, Apple GPUs run adjacent encoders concurrently), plus encoders
+per frame. The header line gives the first-start-to-last-end span and the command buffers' busy
+time (`Metal::Device::GpuBusyNs`, also in `BB_FRAME_STATS`' "GPU busy"); MetalFX, the present
+queue and hoisted uploads are only in the latter. A mark outside a render pass ends the open
+compute or blit encoder, and sampling costs about 3% (city, 88.2 → 85.5 FPS). On 0.4.0
+(MoltenVK) the timestamps all read the same value except across submissions, so its profile
+showed only "between submissions".
 
-Hunter's Nightmare, FSR 4 Ultra Performance, ~110 FPS (8.8 ms/frame):
+The table below is from the Vulkan renderer (before M5). Hunter's Nightmare, FSR 4 Ultra
+Performance, ~110 FPS (8.8 ms/frame):
 
 | label | ms/frame |
 |---|---|
