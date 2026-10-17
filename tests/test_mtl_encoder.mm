@@ -1963,32 +1963,212 @@ void TestComputeEncoderAccess() {
 void TestOrderTracker() {
     using Metal::Access;
     using Metal::HazardClass;
+    using Metal::Lane;
     using T = Metal::OrderTracker;
     const auto end = [](u32 k) { return T::SlotFence(HazardClass::Memory, k); };
     const auto vtx = [](u32 k) { return T::SlotFence(HazardClass::Memory, k, T::VertexDone); };
     const auto motion = [](u32 k) { return T::SlotFence(HazardClass::MotionHistory, k); };
     const T::Accesses read{Access::Read, Access::None}, write{Access::Write, Access::None};
+    // Waits on the slots' fences (not the uploads' one, which every Memory encoder waits for).
+    const auto slot_waits = [](const Metal::OrderPlan& p) {
+        return p.num_waits - (p.Waits(T::AheadFence) ? 1 : 0);
+    };
+    // A command `cmd` in one encoder of its own: opens it (with the waits requested for the
+    // command), closes it, and moves on to the next command.
+    const auto one = [](T& t, Lane lane, u64 cmd, u64 tick = 0, u64 completed = 0) {
+        const auto plan = t.Open({Access::Read, Access::None}, lane, tick, completed, cmd);
+        t.Close(cmd, cmd);
+        t.EndCommand();
+        return plan;
+    };
+    Metal::OrderRequest copy1, render12, vertex1, kinds123;
+    copy1.copy.Add(1, 1);
+    render12.render_end.Add(1, 2);
+    vertex1.render_vertex.Add(1, 1);
+    kinds123.copy.Add(1, 3);
     {
-        T t; // no barrier: encoders do not wait for each other (RAR, and caller-ordered accesses)
-        const auto a = t.Open(read), b = t.Open(read, Metal::Lane::Render);
-        Expect(a.num_waits == 0 && b.num_waits == 0, "order: encoders without a barrier do not wait");
+        T t; // no request, no barrier: encoders do not wait for each other (RAR, no conflict)
+        const auto a = t.Open(read), b = t.Open(read, Lane::Render);
+        Expect(slot_waits(a) == 0 && slot_waits(b) == 0,
+               "order: encoders without a request or barrier do not wait");
         Expect(a.Updates(end(0)) && a.num_updates == 1, "order: a compute or blit encoder updates its end");
         Expect(b.Updates(vtx(1)) && b.Updates(end(1)),
                "order: a render encoder updates its vertex stage and its end");
+        Expect(a.Waits(T::AheadFence) && b.Waits(T::AheadFence),
+               "order: every Memory encoder waits for the uploads ahead");
     }
+    // ---- Requests (per command) ----
+    {
+        T t; // a command that conflicts with no earlier command waits for nothing
+        one(t, Lane::Copy, 1);
+        one(t, Lane::Render, 2);
+        Expect(!t.Request(Metal::OrderRequest{}).end_open, "order: an empty request ends nothing");
+        Metal::OrderRequest unheld;
+        unheld.copy.Add(7, 9); // no encoder holds these commands
+        t.Request(unheld);
+        Expect(slot_waits(one(t, Lane::Compute, 10)) == 0,
+               "order: a command that conflicts with nothing held gets no wait");
+    }
+    {
+        T t; // RAW/WAW: exactly the writer's encoder
+        one(t, Lane::Copy, 1);    // slot 0: the writer
+        one(t, Lane::Copy, 2);    // slot 1: another copy
+        one(t, Lane::Render, 3);  // slot 2
+        Expect(!t.Request(copy1).end_open, "order: a request with no open encoder ends nothing");
+        const auto p = one(t, Lane::Render, 4);
+        Expect(p.Waits(end(0)) && slot_waits(p) == 1,
+               "order: a conflicting command waits for exactly the writer's encoder");
+        // A later command conflicting with the same writer asks again (no carried waits).
+        const auto q = one(t, Lane::Compute, 5);
+        Expect(slot_waits(q) == 0, "order: a command after it that does not conflict waits for nothing");
+        t.Request(copy1);
+        Expect(one(t, Lane::Compute, 6).Waits(end(0)), "order: ... one that does waits again");
+    }
+    {
+        T t; // WAR: exactly the readers' encoders, of the kind named
+        one(t, Lane::Render, 1); // slot 0: reader
+        one(t, Lane::Render, 2); // slot 1: reader
+        one(t, Lane::Render, 3); // slot 2: not a reader
+        t.Request(render12);
+        const auto p = one(t, Lane::Copy, 4);
+        Expect(p.Waits(end(0)) && p.Waits(end(1)) && !p.Waits(end(2)) && slot_waits(p) == 2,
+               "order: WAR waits for exactly the readers' ends");
+        t.Request(vertex1);
+        const auto v = one(t, Lane::Copy, 5);
+        Expect(v.Waits(vtx(0)) && !v.Waits(end(0)) && slot_waits(v) == 1,
+               "order: WAR on vertex-stage reads waits for that vertex stage only");
+    }
+    {
+        T t; // kinds: a window names commands of one kind of encoder
+        one(t, Lane::Render, 1);  // slot 0
+        one(t, Lane::Copy, 2);    // slot 1
+        one(t, Lane::Compute, 3); // slot 2
+        t.Request(kinds123);
+        const auto p = one(t, Lane::Render, 4);
+        Expect(p.Waits(end(1)) && !p.Waits(end(0)) && !p.Waits(vtx(0)) && !p.Waits(end(2)),
+               "order: a copy window waits for copy encoders only");
+    }
+    {
+        T t; // the open encoder holds the command: it ends, the next one waits for it
+        t.Open(read, Lane::Copy, 0, 0, 1); // slot 0, open, holds 1..2
+        Expect(t.Request(copy1, 0, 1, 2).end_open,
+               "order: a request naming the open encoder's command ends it");
+        t.Close(1, 2);
+        Expect(t.Open(read, Lane::Render, 0, 0, 3).Waits(end(0)),
+               "order: ... and the next encoder waits for it");
+    }
+    {
+        T t; // the open encoder goes on: it is ordered after the writer, or waits for it now
+        one(t, Lane::Copy, 1);                      // slot 0
+        t.Request(copy1);
+        t.Open(read, Lane::Render, 0, 0, 2);        // slot 1 waits for slot 0
+        {
+            const auto r = t.Request(copy1, 0, 2, 3);
+            Expect(!r.end_open && r.waits.num_waits == 0,
+                   "order: an open encoder that waited for the writer goes on, no new wait");
+        }
+        t.Close(2, 3);
+        t.EndCommand();
+        t.Open(read, Lane::Render, 0, 0, 4);        // slot 2: not ordered after slot 0
+        {
+            const auto r = t.Request(copy1, 0, 4, 4);
+            Expect(!r.end_open && r.waits.Waits(end(0)) && r.waits.num_waits == 1,
+                   "order: an open encoder not ordered after the writer waits for it now (no "
+                   "pass break)");
+            Expect(t.Request(copy1, 0, 4, 4).waits.num_waits == 0, "order: ... once");
+        }
+        t.Close(4, 4);
+        Expect(t.Open(read, Lane::Render, 0, 0, 4).Waits(end(0)),
+               "order: ... and another encoder of the command waits too");
+    }
+    {
+        T t; // transitive pruning: a wait for an encoder that waited for another stands for it
+        one(t, Lane::Copy, 1);  // slot 0
+        t.Request(copy1);
+        one(t, Lane::Render, 2); // slot 1, waits for slot 0
+        Metal::OrderRequest both;
+        both.copy.Add(1, 1);
+        both.render_end.Add(2, 2);
+        t.Request(both);
+        const auto p = one(t, Lane::Compute, 3);
+        Expect(p.Waits(end(1)) && !p.Waits(end(0)), "order: a wait implied by another is dropped");
+        // ... and a vertex stage stands for what its encoder waited for.
+        Metal::OrderRequest v2;
+        v2.copy.Add(1, 1);
+        v2.render_vertex.Add(2, 2);
+        t.Request(v2);
+        const auto q = one(t, Lane::Compute, 4);
+        Expect(q.Waits(vtx(1)) && !q.Waits(end(0)), "order: a vertex stage stands for its waits");
+    }
+    {
+        T t; // encoders of command buffers known complete are never waited for
+        one(t, Lane::Copy, 1, 5); // slot 0, tick 5
+        t.Request(copy1, 4);
+        Expect(one(t, Lane::Copy, 2, 6, 4).Waits(end(0)), "order: tick 5 not complete: waited");
+        t.Request(copy1, 5);
+        Expect(!one(t, Lane::Copy, 3, 6, 5).Waits(end(0)), "order: tick 5 complete: dropped");
+    }
+    {
+        T t; // more encoders than slots: the reused slot stands for both (conservative)
+        for (u32 i = 0; i < T::Slots; ++i) {
+            Expect(slot_waits(one(t, Lane::Copy, 1 + i)) == 0, "order: no chain while slots are free");
+        }
+        Expect(t.BusyReuses(HazardClass::Memory) == 0, "order: no busy reuse while slots are free");
+        const auto wrapped = one(t, Lane::Render, 1 + T::Slots);
+        Expect(wrapped.Updates(end(0)) && wrapped.Waits(end(0)),
+               "order: a slot still in flight is waited for before it is reused");
+        Expect(t.BusyReuses(HazardClass::Memory) == 1, "order: a busy reuse is counted");
+        // The first encoder's command is still found: through its slot, now the new encoder's.
+        t.Request(copy1);
+        const auto p = one(t, Lane::Compute, 2 + T::Slots);
+        Expect(p.Waits(end(0)) && !p.Waits(vtx(0)),
+               "order: a command of a reused slot is waited for through the slot's end");
+    }
+    {
+        T t; // the uploads ahead: the open encoder waits again only for uploads encoded after it opened
+        Metal::OrderRequest up;
+        up.ahead = true;
+        t.Open(read, Lane::Render, 0, 0, 1);
+        {
+            const auto r = t.Request(up, 0, 1, 1);
+            Expect(!r.end_open && r.waits.num_waits == 0,
+                   "order: the open encoder waited for the uploads before it");
+        }
+        t.OpenAhead();
+        {
+            const auto r = t.Request(up, 0, 1, 1);
+            Expect(!r.end_open && r.waits.Waits(T::AheadFence),
+                   "order: ... and waits now for an upload encoded since");
+            Expect(t.Request(up, 0, 1, 1).waits.num_waits == 0, "order: ... once");
+        }
+        t.Close(1, 1);
+        Expect(t.Open(read, Lane::Render, 0, 0, 2).Waits(T::AheadFence),
+               "order: ... the next waits for the uploads");
+    }
+    {
+        T t; // every encoder of the command waits; the next command does not
+        one(t, Lane::Copy, 1);
+        t.Request(copy1);
+        const auto a = t.Open(read, Lane::Compute, 0, 0, 2);
+        t.Close(2, 2);
+        const auto b = t.Open(read, Lane::Render, 0, 0, 2);
+        t.Close(2, 2);
+        t.EndCommand();
+        Expect(a.Waits(end(0)) && b.Waits(end(0)), "order: every encoder of the command waits");
+        Expect(!one(t, Lane::Compute, 3).Waits(end(0)), "order: ... the next command does not");
+    }
+    // ---- Barriers (what the renderer does not number) ----
     {
         T t; // a full barrier: the next encoders wait for the ends of every encoder before it
         t.Open(read);
-        t.Open(read, Metal::Lane::Render);
+        t.Open(read, Lane::Render);
         t.Barrier(HazardClass::Memory, Metal::ScopeAll);
         const auto c = t.Open(read), d = t.Open(read);
         Expect(c.Waits(end(0)) && c.Waits(end(1)) && d.Waits(end(0)) && d.Waits(end(1)),
                "order: after a full barrier every encoder waits for the encoders before");
         Expect(!c.Waits(vtx(1)), "order: ... for their ends, not their vertex stages");
         Expect(!d.Waits(c.updates[0]), "order: encoders after a barrier do not wait for each other");
-        Expect(c.Waits(T::AheadFence), "order: after a full barrier, Memory encoders wait for the "
-                                       "uploads ahead");
-        Expect(!c.Updates(end(0)) && !c.Updates(end(1)), "order: slots still waited on are not reused");
+        Expect(!c.Updates(end(0)) && !c.Updates(end(1)), "order: slots in flight are not reused");
         t.Barrier(HazardClass::Memory, Metal::ScopeAll);
         const auto e = t.Open(read);
         Expect(e.Waits(c.updates[0]) && e.Waits(d.updates[0]) && !e.Waits(end(0)),
@@ -1997,59 +2177,42 @@ void TestOrderTracker() {
     }
     {
         T t; // scoped barriers: a barrier on copies does not wait for render passes
-        t.Open(read, Metal::Lane::Render); // slot 0, render pass
-        t.Open(read, Metal::Lane::Copy);    // slot 1, copy
-        t.Open(read, Metal::Lane::Compute); // slot 2, dispatch
+        t.Open(read, Lane::Render);  // slot 0, render pass
+        t.Open(read, Lane::Copy);    // slot 1, copy
+        t.Open(read, Lane::Compute); // slot 2, dispatch
         t.Barrier(HazardClass::Memory, Metal::ScopeCopyEnd);
-        const auto a = t.Open(read, Metal::Lane::Copy); // slot 3
+        const auto a = t.Open(read, Lane::Copy); // slot 3
         Expect(a.Waits(end(1)) && !a.Waits(end(0)) && !a.Waits(vtx(0)),
-               "order: RAW/WAW on a copy waits for copy encoders only, not render passes");
+               "order: a barrier on copies waits for copy encoders only, not render passes");
         Expect(!a.Waits(end(2)), "order: ... nor compute dispatches");
-        // WAR against vertex-stage reads: render passes' vertex stages.
         t.Barrier(HazardClass::Memory, Metal::ScopeRenderVertex);
         const auto b = t.Open(read); // slot 4
         Expect(b.Waits(vtx(0)) && !b.Waits(end(0)), "order: a vertex barrier waits for vertex stages");
-        Expect(b.Waits(end(1)), "order: ... and still for the copy (slot 0 opened before the copy "
-                                "barrier, so its vertex stage does not stand for it)");
-        // A later barrier on render ends still waits for slot 0's end (only its vertex stage
-        // was waited for), and for none of the copies already waited for.
         t.Barrier(HazardClass::Memory, Metal::ScopeRenderEnd);
         const auto c = t.Open(read);
-        Expect(c.Waits(end(0)), "order: a render barrier waits for the render ends not yet waited for");
+        Expect(c.Waits(end(0)), "order: a render barrier waits for render ends");
         Expect(!c.Waits(end(3)) && !c.Waits(end(2)), "order: ... and not for copies or dispatches");
     }
     {
-        T t; // waits carry over until an encoder standing for them is waited for
-        t.Open(read, Metal::Lane::Copy);   // slot 0, copy
-        t.Open(read, Metal::Lane::Render); // slot 1, render
+        T t; // barrier waits are pruned once an encoder that waited for them is waited for
+        t.Open(read, Lane::Copy);   // slot 0, copy
+        t.Open(read, Lane::Render); // slot 1, render
         t.Barrier(HazardClass::Memory, Metal::ScopeCopyEnd);
-        t.Open(read, Metal::Lane::Render); // slot 2 waits for 0
-        t.Barrier(HazardClass::Memory, Metal::ScopeRenderVertex); // covers 1 and 2 (vertex)
-        const auto d = t.Open(read, Metal::Lane::Render);
+        t.Open(read, Lane::Render); // slot 2 waits for 0
+        t.Barrier(HazardClass::Memory, Metal::ScopeRenderVertex); // 1 and 2 (vertex)
+        const auto d = t.Open(read, Lane::Render);
         Expect(d.Waits(vtx(1)) && d.Waits(vtx(2)), "order: the vertex barrier waits for both passes");
         Expect(!d.Waits(end(0)), "order: slot 2 waited for slot 0 before its vertex stage: implied");
     }
     {
-        T t; // slots of command buffers known complete need no waiting
-        t.Open(read, Metal::Lane::Copy, 5, 0); // slot 0, tick 5
+        T t; // barrier waits end when their encoders complete
+        t.Open(read, Lane::Copy, 5, 0); // slot 0, tick 5
         t.Barrier(HazardClass::Memory, Metal::ScopeCopyEnd);
-        Expect(t.Open(read, Metal::Lane::Copy, 6, 4).Waits(end(0)), "order: tick 5 not complete: waited");
-        Expect(!t.Open(read, Metal::Lane::Copy, 6, 5).Waits(end(0)), "order: tick 5 complete: dropped");
+        Expect(t.Open(read, Lane::Copy, 6, 4).Waits(end(0)), "order: barrier, tick 5 not complete: waited");
+        Expect(!t.Open(read, Lane::Copy, 6, 5).Waits(end(0)), "order: barrier, tick 5 complete: dropped");
     }
     {
-        T t; // the uploads ahead: waited for after a barrier naming them, until implied
-        t.Open(read, Metal::Lane::Copy);
-        t.Barrier(HazardClass::Memory, Metal::ScopeCopyEnd);
-        Expect(!t.Open(read).Waits(T::AheadFence), "order: a copy barrier does not wait for uploads");
-        t.Barrier(HazardClass::Memory, Metal::ScopeAhead);
-        const auto a = t.Open(read, Metal::Lane::Copy);
-        Expect(a.Waits(T::AheadFence), "order: RAW on an upload's range waits for the uploads");
-        t.Barrier(HazardClass::Memory, Metal::ScopeCopyEnd);
-        Expect(!t.Open(read, Metal::Lane::Copy).Waits(T::AheadFence),
-               "order: ... until an encoder that waited for them is waited for");
-    }
-    {
-        T t; // an empty epoch keeps the waits of the one before
+        T t; // a barrier with nothing new keeps the waits
         t.Open(read);
         t.Barrier(HazardClass::Memory);
         t.Barrier(HazardClass::Memory);
@@ -2058,7 +2221,7 @@ void TestOrderTracker() {
     }
     {
         T t; // a write the caller does not order is isolated: after everything, before everything
-        t.Open(read, Metal::Lane::Render);
+        t.Open(read, Lane::Render);
         const auto w = t.Open(write);
         Expect(w.Waits(end(0)), "order: an isolated write waits for every encoder before it");
         const auto r = t.Open(read);
@@ -2066,36 +2229,39 @@ void TestOrderTracker() {
         Expect(!r.Waits(end(0)), "order: ... and not again for what the write already waited for");
     }
     {
-        T t; // more encoders than slots without a barrier: the reused slot stands for both
-        for (u32 i = 0; i < T::Slots; ++i) {
-            Expect(t.Open(read).num_waits == 0, "order: no chain while slots are free");
-        }
-        Expect(t.BusyReuses(HazardClass::Memory) == 0, "order: no busy reuse while slots are free");
-        const auto wrapped = t.Open(read);
-        Expect(wrapped.Updates(end(0)) && wrapped.Waits(end(0)),
-               "order: a slot reused before a barrier waited for it is waited on first");
-        Expect(t.BusyReuses(HazardClass::Memory) == 1, "order: a busy reuse is counted");
-    }
-    {
         T t; // classes are independent; no access, no plan
         t.Open(read);
         t.Barrier(HazardClass::Memory);
-        const auto m = t.Open({Access::None, Access::Read}, Metal::Lane::Render);
+        const auto m = t.Open({Access::None, Access::Read}, Lane::Render);
         Expect(m.num_waits == 0 && m.Updates(motion(0)) && m.num_updates == 1,
                "order: motion history has its own barriers (one fence per encoder)");
         Expect(t.Open({Access::None, Access::None}).Empty(), "order: no access, no fences");
-        t.Open({Access::None, Access::Read}, Metal::Lane::Render);
+        t.Open({Access::None, Access::Read}, Lane::Render);
         t.Barrier(HazardClass::MotionHistory);
-        const auto next = t.Open({Access::None, Access::Read}, Metal::Lane::Render);
+        const auto next = t.Open({Access::None, Access::Read}, Lane::Render);
         Expect(next.Waits(motion(0)) && next.Waits(motion(1)) && !next.Waits(T::AheadFence),
                "order: a motion barrier orders the next frame's motion passes");
     }
     {
         // Uploads committed ahead: chained among themselves.
-        const auto ahead = T::OpenAhead();
+        T t;
+        const auto ahead = t.OpenAhead();
         Expect(ahead.num_waits == 1 && ahead.Waits(T::AheadFence) &&
                    ahead.num_updates == 1 && ahead.Updates(T::AheadFence),
                "order: an upload ahead waits for the uploads before it, and updates their fence");
+    }
+    {
+        T t; // wait statistics
+        t.TakeWaitStats();
+        one(t, Lane::Copy, 1);
+        one(t, Lane::Copy, 2);
+        Metal::OrderRequest r;
+        r.copy.Add(1, 2);
+        t.Request(r);
+        one(t, Lane::Render, 3);
+        const auto stats = t.TakeWaitStats();
+        Expect(stats.encoders == 3 && stats.max == 3 && stats.waits == 5,
+               "order: wait statistics count the waits per encoder (uploads' fence included)");
     }
 }
 
@@ -2109,94 +2275,136 @@ u64 Footprint() {
 
 void TestBufferBarriers() {
     using Metal::ReadStage;
-    constexpr u8 render = Metal::EncoderRender, other = Metal::EncoderCopy;
+    using W = Metal::CommandWindow;
+    constexpr u8 render = Metal::EncoderRender, copy = Metal::EncoderCopy;
     Metal::BufferBarriers b;
     int arena_storage = 0, other_storage = 0;
     const void* arena = &arena_storage;
     const void* unregistered = &other_storage;
     b.Register(arena, 64ull << 20);
     Expect(b.Registered(arena) && !b.Registered(unregistered), "barriers: registered buffers only");
-    // RAW: the writer's kind
-    b.Mark(arena, 0x1000, 0x100, true, other);
-    Expect(b.Conflicts(arena, 0x1080, 4, false) == Metal::ScopeCopyEnd,
-           "barriers: RAW, a read of a copy's write waits for compute and blit encoders");
-    Expect(b.Conflicts(arena, 0x3000, 4, false) == Metal::ScopeNone, "barriers: a read elsewhere does not");
-    Expect(b.Barrier(Metal::ScopeCopyEnd) == Metal::ScopeCopyEnd,
-           "barriers: a barrier after accesses retires them");
-    Expect(b.Conflicts(arena, 0x1080, 4, false) == Metal::ScopeNone,
-           "barriers: accesses before a barrier are ordered");
-    Expect(b.Barrier(Metal::ScopeAll) == Metal::ScopeNone,
-           "barriers: no barrier without accesses since the last");
+    Expect(b.BeginCommand() == 1 && b.Command() == 1, "barriers: commands are numbered from 1");
+    // RAW: exactly the writer
+    b.Mark(arena, 0x1000, 0x100, true, copy); // command 1
+    {
+        const auto r = b.Conflicts(arena, 0x1080, 4, false);
+        Expect(r.copy.Span() == W{1, 1} && r.Scopes() == Metal::ScopeCopyEnd,
+               "barriers: RAW, a read of a copy's write waits for that command (copies)");
+    }
+    Expect(b.Conflicts(arena, 0x3000, 4, false).Empty(), "barriers: a read elsewhere waits for nothing");
+    b.BeginCommand(); // 2: a write somewhere else does not join the window
+    b.Mark(arena, 0x5000, 0x100, true, copy);
+    Expect(b.Conflicts(arena, 0x1080, 4, false).copy.Span() == W{1, 1},
+           "barriers: a non-overlapping write is not waited for");
+    Expect(b.Conflicts(arena, 0x1080, 4, false).copy.Span() == W{1, 1},
+           "barriers: nothing is retired by asking (a later command asks again)");
+    // WAW, and a later writer replaces the earlier one
+    Expect(b.Conflicts(arena, 0x1004, 8, true).copy.Span() == W{1, 1}, "barriers: WAW waits for the writer");
+    b.BeginCommand(); // 3: a render pass writes the block (after waiting for 1)
+    b.Mark(arena, 0x1000, 0x10, true, render);
+    {
+        const auto r = b.Conflicts(arena, 0x1000, 4, false);
+        Expect(r.render_end.Span() == W{3, 3} && r.copy.Empty(),
+               "barriers: a read waits for the last writer only (it waited for the one before)");
+    }
     // RAR, then WAR (late reads: render ends; vertex reads only: vertex stages)
-    b.Mark(arena, 0x8000, 0x2000, false, render);
-    Expect(b.Conflicts(arena, 0x8000, 0x10, false) == Metal::ScopeNone, "barriers: RAR, reads do not conflict");
-    Expect(b.Conflicts(arena, 0x9000, 0x10, true) == Metal::ScopeRenderEnd,
-           "barriers: WAR, a write over a fragment-stage read waits for render ends");
-    b.Barrier(Metal::ScopeAll);
-    b.Mark(arena, 0x8000, 0x2000, false, render, ReadStage::Vertex);
-    Expect(b.Conflicts(arena, 0x9000, 0x10, true) == Metal::ScopeRenderVertex,
-           "barriers: WAR, a write over vertex-stage reads waits for vertex stages");
-    b.Mark(arena, 0x20000, 8, true, other);
-    Expect(b.Barrier(Metal::ScopeRenderVertex) == Metal::ScopeRenderVertex,
-           "barriers: a vertex barrier retires vertex reads");
-    Expect(b.Conflicts(arena, 0x9000, 0x10, true) == Metal::ScopeNone,
-           "barriers: ... so the write is ordered after them");
-    Expect(b.Conflicts(arena, 0x20000, 8, false) == Metal::ScopeCopyEnd,
-           "barriers: ... but not other accesses");
-    // WAW; a tessellated draw's reads are in both kinds of encoder
-    Expect(b.Conflicts(arena, 0x20004, 8, true) == Metal::ScopeCopyEnd,
-           "barriers: WAW, a write over a copy's write waits for its kind");
-    b.Barrier(Metal::ScopeAll);
-    b.Mark(arena, 0x40000, 0x100, false, render | other, ReadStage::Vertex);
-    Expect(b.Conflicts(arena, 0x40000, 4, true) == (Metal::ScopeRenderVertex | Metal::ScopeCopyEnd),
-           "barriers: a read in kernels and a render pass needs both");
+    b.BeginCommand(); // 4 (a whole page, then blocks of the next)
+    b.Mark(arena, 0x8000, 0x1f00, false, render);
+    Expect(b.Conflicts(arena, 0x8000, 0x10, false).Empty(), "barriers: RAR, reads do not conflict");
+    b.BeginCommand(); // 5
+    b.Mark(arena, 0x9000, 0x100, false, copy);
+    {
+        const auto r = b.Conflicts(arena, 0x9000, 0x10, true);
+        Expect(r.render_end.Span() == W{4, 5} && r.copy.Span() == W{4, 5} && r.render_vertex.Empty(),
+               "barriers: WAR waits for the readers since the last write (their window, kinds)");
+        Expect(b.Conflicts(arena, 0x8000, 0x10, true).render_end.Span() == W{4, 4} &&
+                   b.Conflicts(arena, 0x8000, 0x10, true).copy.Empty(),
+               "barriers: ... of that block only");
+    }
+    b.BeginCommand(); // 6: a write over the readers (it waited for them)
+    b.Mark(arena, 0x9000, 0x100, true, copy);
+    {
+        const auto r = b.Conflicts(arena, 0x9000, 0x10, true);
+        Expect(r.copy.Span() == W{6, 6} && r.render_end.Empty(),
+               "barriers: a write replaces the readers before it (WAW on it stands for them)");
+    }
+    b.BeginCommand(); // 7: reads at the vertex stage only
+    b.Mark(arena, 0xa000, 0x100, false, render, ReadStage::Vertex);
+    {
+        const auto r = b.Conflicts(arena, 0xa000, 0x10, true);
+        Expect(r.render_vertex.Span() == W{7, 7} && r.render_end.Empty(),
+               "barriers: WAR, a write over vertex-stage reads waits for vertex stages");
+    }
+    // A tessellated draw reads in kernels and its render pass; one command reads and writes.
+    b.BeginCommand(); // 8
+    b.Mark(arena, 0x40000, 0x100, false, render | Metal::EncoderCompute, ReadStage::Vertex);
+    b.Mark(arena, 0x40000, 0x100, true, Metal::EncoderCompute);
+    {
+        const auto r = b.Conflicts(arena, 0x40000, 4, true);
+        Expect(r.compute.Span() == W{8, 8} && r.render_vertex.Span() == W{8, 8},
+               "barriers: a command's reads stay beside its own write");
+    }
+    // Retired commands are never waited for
+    b.Retire(5);
+    Expect(b.Conflicts(arena, 0x8000, 0x10, true).Empty(), "barriers: retired readers are not waited for");
+    Expect(b.Conflicts(arena, 0x40000, 4, true).compute.Span() == W{8, 8}, "barriers: ... live ones are");
     // Large ranges (whole chunks) and a page inside one
-    b.Barrier(Metal::ScopeAll);
-    b.Mark(arena, 0, 8ull << 20, false, other);
-    Expect(b.Conflicts(arena, (5ull << 20) + 12, 4, true) == Metal::ScopeCopyEnd,
+    b.BeginCommand(); // 9
+    b.Mark(arena, 0, 8ull << 20, false, copy);
+    Expect(b.Conflicts(arena, (5ull << 20) + 12, 4, true).copy.Span() == W{9, 9},
            "barriers: a write inside a range read as whole chunks conflicts");
-    Expect(b.Conflicts(arena, 9ull << 20, 4, true) == Metal::ScopeNone, "barriers: ... and outside it does not");
-    b.Barrier(Metal::ScopeAll);
-    b.Mark(arena, (3ull << 20) + 0x4000, 4, true, render);
-    Expect(b.Conflicts(arena, 0, 16ull << 20, false) == Metal::ScopeRenderEnd,
+    Expect(b.Conflicts(arena, 9ull << 20, 4, true).Empty(), "barriers: ... and outside it does not");
+    b.BeginCommand(); // 10
+    b.Mark(arena, (12ull << 20) + 0x4000, 4, true, render);
+    Expect(b.Conflicts(arena, 9ull << 20, 16ull << 20, false).render_end.Span() == W{10, 10},
            "barriers: a read over many chunks sees one written page");
-    Expect(b.Conflicts(arena, 0, 3ull << 20, false) == Metal::ScopeNone, "barriers: ... only where it is");
-    // Copies and dispatches are separate kinds
-    b.Barrier(Metal::ScopeAll);
+    Expect(b.Conflicts(arena, 9ull << 20, 3ull << 20, false).Empty(), "barriers: ... only where it is");
+    // Whole pages are one tag; a query over whole pages sees their blocks together.
+    b.BeginCommand(); // 11
+    b.Mark(arena, 0x200000, 0x3000, true, copy);
+    Expect(b.Conflicts(arena, 0x201080, 4, false).copy.Span() == W{11, 11},
+           "barriers: a read inside a page written as a whole waits for that write");
+    b.BeginCommand(); // 12
+    b.Mark(arena, 0x204000, 4, true, copy);
+    b.BeginCommand(); // 13
+    b.Mark(arena, 0x204f00, 4, true, Metal::EncoderCompute);
+    {
+        const auto r = b.Conflicts(arena, 0x204000, 0x1000, false);
+        Expect(r.copy.Span() == W{12, 13} && r.compute.Span() == W{12, 13},
+               "barriers: a read of a whole page waits for its blocks' writes (their window)");
+        Expect(b.Conflicts(arena, 0x204100, 0x100, false).Empty(),
+               "barriers: ... a read of one block only for that block's");
+    }
+    // Copies and dispatches are separate kinds; uploads ahead are their own
+    b.BeginCommand(); // 14
     b.Mark(arena, 0x50000, 0x100, true, Metal::EncoderCompute);
-    Expect(b.Conflicts(arena, 0x50000, 4, false) == Metal::ScopeComputeEnd,
+    Expect(b.Conflicts(arena, 0x50000, 4, false).Scopes() == Metal::ScopeComputeEnd,
            "barriers: a read of a dispatch's write waits for dispatches only");
-    // Copies and draws: a draw reading a copy's write waits for copies
-    b.Barrier(Metal::ScopeAll);
-    b.Mark(arena, 0x80000, 0x40, true, other);
-    Expect(b.Conflicts(arena, 0x80000, 4, false) == Metal::ScopeCopyEnd,
-           "barriers: a read of a copy's write waits for the copies");
-    // Uploads hoisted ahead are their own kind
-    b.Barrier(Metal::ScopeAll);
+    b.BeginCommand(); // 15
     b.Mark(arena, 0x60000, 0x40, true, Metal::EncoderAhead);
-    Expect(b.Conflicts(arena, 0x60010, 4, false) == Metal::ScopeAhead,
+    Expect(b.Conflicts(arena, 0x60010, 4, false).Scopes() == Metal::ScopeAhead,
            "barriers: a read of an upload's range waits for the uploads ahead");
-    // 256-byte blocks: neighbours in one page do not conflict
-    b.Barrier(Metal::ScopeAll);
+    // 256-byte blocks: neighbours in one page do not conflict (the chunk-wide reads before
+    // are retired)
+    b.Retire(15);
+    b.BeginCommand(); // 16
     b.Mark(arena, 0x70000, 0x40, false, render);
-    Expect(b.Conflicts(arena, 0x70100, 0x40, true) == Metal::ScopeNone,
+    Expect(b.Conflicts(arena, 0x70100, 0x40, true).Empty(),
            "barriers: a write to another 256-byte block of the page does not conflict");
-    Expect(b.Conflicts(arena, 0x700c0, 0x80, true) == Metal::ScopeRenderEnd,
+    Expect(b.Conflicts(arena, 0x700c0, 0x80, true).render_end.Span() == W{16, 16},
            "barriers: ... a write to the same block does");
     // Whole-buffer accesses (direct memory access) are one tag, and seen by any range.
-    b.Barrier(Metal::ScopeAll);
+    b.BeginCommand(); // 17
     b.Mark(arena, 0, 64ull << 20, false, render);
-    Expect(b.Conflicts(arena, 0x123400, 4, true) == Metal::ScopeRenderEnd,
+    Expect(b.Conflicts(arena, 0x123400, 4, true).render_end.Span() == W{17, 17},
            "barriers: a write anywhere conflicts with a whole-buffer read");
-    b.Barrier(Metal::ScopeAll);
-    b.Mark(arena, 0x9000, 4, true, other);
-    Expect(b.Conflicts(arena, 0, 64ull << 20, false) == Metal::ScopeCopyEnd,
+    b.BeginCommand(); // 18
+    b.Mark(arena, 0x9000, 4, true, copy);
+    Expect(b.Conflicts(arena, 0, 64ull << 20, false).copy.Meets(18, 18),
            "barriers: a whole-buffer read sees one written block");
-    Expect(b.Conflicts(arena, 0, 64ull << 20, true) == Metal::ScopeCopyEnd,
-           "barriers: ... as does a whole-buffer write");
-    b.Barrier(Metal::ScopeAll);
-    Expect(b.Conflicts(arena, 0, 64ull << 20, true) == Metal::ScopeNone,
-           "barriers: ... and nothing after a barrier");
+    b.Retire(18);
+    Expect(b.Conflicts(arena, 0, 64ull << 20, true).Empty(),
+           "barriers: ... and nothing once every command is retired");
     // Registering is free: the tag arrays are committed only where accesses touch them.
     {
         const u64 before = Footprint();
@@ -2207,19 +2415,35 @@ void TestBufferBarriers() {
         Expect(after < before + (8ull << 20),
                "barriers: registering a 16 GiB buffer commits (almost) no memory");
         // A buffer whose tags cannot be allocated is ordered conservatively: every access
-        // conflicts with everything.
+        // waits for every live command.
         int huge_storage = 0;
         big.Register(&huge_storage, 1ull << 62);
         Expect(big.Registered(&huge_storage), "barriers: a buffer without tags is still tracked");
-        Expect(big.Conflicts(&huge_storage, 0, 4, false) == Metal::ScopeAll,
-               "barriers: ... and every access to it waits for everything");
+        big.BeginCommand();
         big.Mark(&huge_storage, 0, 4, false, render);
-        Expect(big.Barrier(Metal::ScopeAll) != Metal::ScopeNone,
-               "barriers: ... and its accesses give the barrier something to order");
+        big.BeginCommand();
+        const auto r = big.Conflicts(&huge_storage, 0, 4, false);
+        Expect(r.render_end.Span() == W{1, 2} && r.copy.Span() == W{1, 2} && r.compute.Span() == W{1, 2} && r.ahead,
+               "barriers: ... and every access to it waits for every live command");
+    }
+    // Writers are named exactly: a read over the blocks of two writers does not name the
+    // commands between them.
+    {
+        Metal::BufferBarriers x;
+        int storage = 0;
+        x.Register(&storage, 1u << 20);
+        x.BeginCommand(); // 1
+        x.Mark(&storage, 0x1000, 4, true, copy);
+        x.BeginCommand(); // 2, elsewhere
+        x.Mark(&storage, 0x5000, 4, true, copy);
+        x.BeginCommand(); // 3
+        x.Mark(&storage, 0x1100, 4, true, copy);
+        const auto r = x.Conflicts(&storage, 0x1000, 0x200, false);
+        Expect(r.copy.Meets(1, 1) && r.copy.Meets(3, 3) && !r.copy.Meets(2, 2),
+               "barriers: the writers are named exactly, not the commands between them");
     }
     // Unregistered buffers: the Encoder orders them itself
-    Expect(b.Conflicts(unregistered, 0, 4, true) == Metal::ScopeNone,
-           "barriers: unregistered buffers never conflict");
+    Expect(b.Conflicts(unregistered, 0, 4, true).Empty(), "barriers: unregistered buffers never conflict");
 }
 
 constexpr const char* kOrderShaders = R"(
@@ -2380,6 +2604,87 @@ void TestUntrackedOrdering() {
         encoder.CopyBuffer(Ref(arena), Ref(chain_out), kBytes);
         device.Wait(encoder.Submit());
         Expect(AllEqual(chain_out, 7 + round), "untracked: a barrier on copies orders a copy's write");
+    }
+    // Per-command ordering (the renderer's requests, mtl_buffer_barriers.h) on caller-ordered
+    // memory: a command waits for the commands it names, across encoders and command buffers.
+    const auto StoreArena = [&](u32 value, u32 spins) {
+        const u32 args[2] = {value, spins};
+        encoder.SetComputePipeline((__bridge void*)store, Metal::Access::Read);
+        encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(arena));
+        encoder.SetBytes(Metal::Stage::Compute, 1, args, sizeof(args));
+        encoder.Dispatch({kOrderThreads / 64, 1, 1}, {64, 1, 1});
+    };
+    const auto ReadArena = [&](id<MTLBuffer> out, u32 spins) {
+        const u32 args[2] = {0, spins};
+        encoder.SetComputePipeline((__bridge void*)copy, Metal::Access::Read);
+        encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(arena));
+        encoder.SetBuffer(Metal::Stage::Compute, 1, Ref(out));
+        encoder.SetBytes(Metal::Stage::Compute, 2, args, sizeof(args));
+        encoder.Dispatch({kOrderThreads / 64, 1, 1}, {64, 1, 1});
+    };
+    const auto Ask = [](u64 first, u64 last) {
+        Metal::OrderRequest r;
+        r.compute.Add(first, last);
+        return r;
+    };
+    {
+        id<MTLBuffer> raw_out = SharedBuffer(device, kBytes);
+        for (u32 round = 0; round < 3; ++round) {
+            const u64 base = 1000 + round * 10;
+            encoder.SetOrderCommand(base); // a slow write
+            StoreArena(40 + round, kOrderSpins);
+            encoder.SetOrderCommand(base + 1); // a blit read of it, in the same command buffer
+            encoder.OrderWait(Ask(base, base));
+            encoder.CopyBuffer(Ref(arena), Ref(raw_out), kBytes);
+            device.Wait(encoder.Submit());
+            Expect(AllEqual(raw_out, 40 + round),
+                   "untracked: a command waits for the write it asks for (RAW)");
+        }
+    }
+    {
+        // The open encoder is not ordered after the write it asks for: it waits for it now and
+        // goes on (no pass break).
+        id<MTLBuffer> mid_out = SharedBuffer(device, kBytes), other = SharedBuffer(device, kBytes);
+        for (u32 round = 0; round < 3; ++round) {
+            const u64 base = 3000 + round * 10;
+            encoder.SetOrderCommand(base); // a slow write, in an encoder of its own
+            StoreArena(70 + round, kOrderSpins);
+            encoder.EndEncoding();
+            encoder.SetOrderCommand(base + 1); // an unrelated read opens the next encoder
+            ReadArena(other, 0);
+            void* const open = encoder.ComputeEncoder(Metal::Access::Read);
+            encoder.SetOrderCommand(base + 2); // a read asking for the write, in that encoder
+            encoder.OrderWait(Ask(base, base));
+            ReadArena(mid_out, 0);
+            Expect(encoder.ComputeEncoder(Metal::Access::Read) == open,
+                   "untracked: a request the open encoder can wait for keeps it open");
+            device.Wait(encoder.Submit());
+            Expect(AllEqual(mid_out, 70 + round),
+                   "untracked: an open encoder that waits for a write mid-way sees it");
+        }
+    }
+    {
+        id<MTLBuffer> old_value = SharedBuffer(device, kBytes), new_value = SharedBuffer(device, kBytes);
+        for (u32 round = 0; round < 3; ++round) {
+            const u64 base = 2000 + round * 10;
+            encoder.SetOrderCommand(base);
+            StoreArena(50 + round, 0);
+            device.Wait(encoder.Submit());
+            encoder.SetOrderCommand(base + 1); // a slow read, committed and not waited for
+            ReadArena(old_value, kOrderSpins * 4);
+            encoder.Submit();
+            encoder.SetOrderCommand(base + 2); // a write in the next command buffer (WAR)
+            encoder.OrderWait(Ask(base + 1, base + 1));
+            StoreArena(60 + round, 0);
+            encoder.SetOrderCommand(base + 3); // a read of it (RAW)
+            encoder.OrderWait(Ask(base + 2, base + 2));
+            ReadArena(new_value, 0);
+            device.Wait(encoder.Submit());
+            Expect(AllEqual(old_value, 50 + round),
+                   "untracked: a write asking for a slow read in an earlier command buffer does "
+                   "not overtake it (WAR)");
+            Expect(AllEqual(new_value, 60 + round), "untracked: ... and the read after it sees it");
+        }
     }
     Expect(device.ErrorCount() == 0, "untracked ordering ran without errors");
 }

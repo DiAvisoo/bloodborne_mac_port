@@ -552,9 +552,10 @@ class RecordChunk {
 public:
     static constexpr size_t Capacity = 128 * 1024;
 
-    /// Returns false (and leaves `func` untouched) when the chunk has no room.
+    /// Returns false (and leaves `func` untouched) when the chunk has no room. `order_command`:
+    /// the renderer's command it encodes (Metal::Encoder::SetOrderCommand).
     template <typename Func>
-    bool Push(Func&& func) {
+    bool Push(Func&& func, u64 order_command) {
         using Command = TypedCommand<std::decay_t<Func>>;
         static_assert(sizeof(Command) <= Capacity, "recorded command is too large");
         const size_t offset = (used + alignof(Command) - 1) & ~(alignof(Command) - 1);
@@ -562,6 +563,7 @@ public:
             return false;
         }
         auto* command = new (storage + offset) Command(std::forward<Func>(func));
+        command->order_command = order_command;
         if (last) {
             last->next = command;
         } else {
@@ -587,6 +589,7 @@ public:
     void Execute(Metal::Encoder& encoder) {
         for (CommandBase* command = first; command;) {
             CommandBase* const next = command->next;
+            encoder.SetOrderCommand(command->order_command);
             command->Execute(encoder);
             command->~CommandBase();
             command = next;
@@ -618,6 +621,7 @@ private:
         virtual ~CommandBase() = default;
         virtual void Execute(Metal::Encoder& encoder) = 0;
         CommandBase* next{};
+        u64 order_command{};
     };
     template <typename Func>
     struct TypedCommand final : CommandBase {
@@ -702,6 +706,7 @@ public:
             direct_recordings.fetch_add(1, std::memory_order_relaxed);
             TraceDirectRecording(__builtin_return_address(0));
         }
+        encoder.SetOrderCommand(order_command);
         return encoder;
     }
 
@@ -747,23 +752,36 @@ private:
     template <typename Func>
     void RecordCommand(Func&& func) {
         if (!recorder_running || direct_mode) {
+            encoder.SetOrderCommand(order_command);
             func(encoder);
             return;
         }
         if (BbToggle::Disabled(BbToggle::ThreadedRecording)) {
             SyncRecording();
             direct_mode = true;
+            encoder.SetOrderCommand(order_command);
             func(encoder);
             return;
         }
         const ChunkGuard guard{*this, __builtin_return_address(0)};
-        if (!record_chunk->Push(std::forward<Func>(func))) {
+        if (!record_chunk->Push(std::forward<Func>(func), order_command)) {
             full_chunks.push_back(std::move(record_chunk));
             record_chunk = AcquireChunk();
-            const bool pushed = record_chunk->Push(std::forward<Func>(func));
+            const bool pushed = record_chunk->Push(std::forward<Func>(func), order_command);
             ASSERT(pushed);
         }
     }
+
+public:
+    /// bbport: the renderer's command (Metal::BufferBarriers::BeginCommand) that the commands
+    /// recorded from now on encode: the Encoder learns it with each (SetOrderCommand), so it
+    /// knows which Metal encoders hold which command (Metal::OrderTracker).
+    void SetOrderCommand(u64 command) noexcept {
+        order_command = command;
+    }
+
+private:
+    u64 order_command{};
 
     /// Records the end of the waiting tessellation run (Runs::Flush).
     void EndDrawRun() {

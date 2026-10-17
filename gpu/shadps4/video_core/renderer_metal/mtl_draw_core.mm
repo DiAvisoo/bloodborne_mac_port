@@ -458,6 +458,7 @@ void Runs::Flush(Encoder& e) {
         e.SetBuffer(Stage::Vertex, kTessFactorBuffer, d.patch.factors);
         e.DrawPatches(d.patch.output_control_points, 0, d.patch.patches, {}, 1, 0);
     }
+    e.ReleaseOrderCommand();
 }
 
 void Runs::EndRenderPass(Encoder& e) {

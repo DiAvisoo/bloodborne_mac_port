@@ -7,7 +7,11 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -154,9 +158,8 @@ bool Covers(const OrderTracker::Accesses& open, const OrderTracker::Accesses& ne
 }
 
 void WaitFences(id<MTLRenderCommandEncoder> e, const OrderPlan& plan, const id<MTLFence>* fences) {
-    for (u32 i = 0; i < plan.num_waits; ++i) {
-        [e waitForFence:fences[plan.waits[i]] beforeStages:MTLRenderStageVertex];
-    }
+    plan.ForEachWait(
+        [&](u32 f) { [e waitForFence:fences[f] beforeStages:MTLRenderStageVertex]; });
 }
 /// Render encoders: a slot's vertex fence after the vertex stage, its end fence after the
 /// fragment stage; motion history after the vertex stage (only vertex shaders use it, so the
@@ -173,9 +176,7 @@ void UpdateFences(id<MTLRenderCommandEncoder> e, const OrderPlan& plan, const id
 }
 template <typename E> // compute and blit encoders
 void WaitFences(E e, const OrderPlan& plan, const id<MTLFence>* fences) {
-    for (u32 i = 0; i < plan.num_waits; ++i) {
-        [e waitForFence:fences[plan.waits[i]]];
-    }
+    plan.ForEachWait([&](u32 f) { [e waitForFence:fences[f]]; });
 }
 template <typename E>
 void UpdateFences(E e, const OrderPlan& plan, const id<MTLFence>* fences) {
@@ -195,6 +196,110 @@ MTLBlitOption BlitOptions(BlitAspect aspect) {
     }
     UNREACHABLE();
 }
+
+/// BB_METAL_FENCE_CHECK (default 1, 0 = off): checks every fence wait on the CPU before the GPU
+/// sees it. A wait on a fence whose pending update belongs to another command buffer not committed
+/// yet can stop the GPU (and with it WindowServer); a wait on a fence the same encoder updates is
+/// counted separately. Violations are counted and the first ones logged.
+class FenceCheck {
+public:
+    static FenceCheck& Get() {
+        static FenceCheck check;
+        return check;
+    }
+    bool On() const noexcept {
+        return on;
+    }
+    /// `cmd` encodes waits for `waits.waits` in an encoder that will update `own.updates`.
+    void Waits(const void* cmd, const OrderPlan& waits, const OrderPlan& own, const char* where) {
+        std::scoped_lock lock{mutex};
+        waits.ForEachWait([&](u32 f) {
+            for (u32 i = 0; i < own.num_updates; ++i) {
+                if (own.updates[i] == f) {
+                    // OpenAhead waits for and updates AheadFence by design; slot fences should not.
+                    if (f == OrderTracker::AheadFence) {
+                        ++self_waits;
+                    } else {
+                        Report(self_waits, "waits for a slot fence its own encoder updates", f,
+                               where);
+                    }
+                }
+            }
+            const auto it = owner.find(f);
+            if (it != owner.end() && it->second != cmd) {
+                // Fine if that command buffer is committed first (Committed checks).
+                ++cross_waits;
+                if (f != OrderTracker::AheadFence) {
+                    Report(slot_cross, "waits for a slot fence another uncommitted command buffer "
+                                       "updates", f, where);
+                }
+                deps[cmd].push_back({f, it->second});
+            }
+        });
+    }
+    /// `cmd` will update `plan.updates` (when its encoder ends).
+    void Updates(const void* cmd, const OrderPlan& plan) {
+        if (plan.num_updates == 0) {
+            return;
+        }
+        std::scoped_lock lock{mutex};
+        auto& list = pending[cmd];
+        for (u32 i = 0; i < plan.num_updates; ++i) {
+            owner[plan.updates[i]] = cmd;
+            list.push_back(plan.updates[i]);
+        }
+    }
+    /// `cmd` is committed: its updates are on the queue.
+    void Committed(const void* cmd) {
+        std::scoped_lock lock{mutex};
+        if (const auto d = deps.find(cmd); d != deps.end()) {
+            for (const auto& [f, other] : d->second) {
+                if (pending.contains(other)) {
+                    Report(inversions, "commit-order inversion: committed before the command "
+                                       "buffer that updates a fence it waits for", f, "commit");
+                }
+            }
+            deps.erase(d);
+        }
+        const auto it = pending.find(cmd);
+        if (it == pending.end()) {
+            return;
+        }
+        for (const u32 f : it->second) {
+            if (const auto o = owner.find(f); o != owner.end() && o->second == cmd) {
+                owner.erase(o);
+            }
+        }
+        pending.erase(it);
+    }
+
+private:
+    FenceCheck() {
+        const char* env = std::getenv("BB_METAL_FENCE_CHECK");
+        on = !env || std::strcmp(env, "0") != 0;
+    }
+    void Report(u64& count, const char* what, u32 fence, const char* where) {
+        if (++count <= 8 || (count & (count - 1)) == 0) {
+            std::fprintf(stderr,
+                         "Metal fence check: %s (fence %u, %s): %llu times; so far %llu "
+                         "inversions, %llu slot-fence cross waits, %llu cross waits, %llu waits "
+                         "on own fences\n",
+                         what, fence, where, static_cast<unsigned long long>(count),
+                         static_cast<unsigned long long>(inversions),
+                         static_cast<unsigned long long>(slot_cross),
+                         static_cast<unsigned long long>(cross_waits),
+                         static_cast<unsigned long long>(self_waits));
+        }
+    }
+
+    bool on{};
+    std::mutex mutex;
+    std::unordered_map<u32, const void*> owner;                ///< fence -> command buffer
+    std::unordered_map<const void*, std::vector<u32>> pending; ///< command buffer -> fences
+    /// command buffer -> (fence, uncommitted command buffer that updates it) it waits for
+    std::unordered_map<const void*, std::vector<std::pair<u32, const void*>>> deps;
+    u64 cross_waits{}, self_waits{}, slot_cross{}, inversions{};
+};
 
 } // namespace
 
@@ -222,6 +327,10 @@ struct Encoder::Impl {
     Access render_access{Access::Write}, compute_access{Access::Write}; ///< of the pipelines
     Lane compute_lane{Lane::Compute}; ///< of the compute pipeline
     Lane open_lane{};                 ///< of the open encoder
+    // The renderer's commands (SetOrderCommand): the current one, the oldest held (0: none),
+    // those the open encoder holds, and whether the current one made a request.
+    u64 command{}, held{}, open_first{}, open_last{};
+    bool asked{};
 
     /// What a command needs (nothing with hazard tracking).
     OrderTracker::Accesses Need(Access memory, Access motion = Access::None) const {
@@ -239,15 +348,28 @@ struct Encoder::Impl {
             if (need[u32(HazardClass::Memory)] == Access::None) {
                 return {};
             }
-            return OrderTracker::OpenAhead();
+            return order->OpenAhead();
         }
-        return order->Open(need, lane, device.CurrentTick(), device.KnownGpuTick());
+        open_first = held ? std::min(held, command) : command;
+        open_last = command;
+        return order->Open(need, lane, device.CurrentTick(), device.KnownGpuTick(), open_first);
+    }
+    /// The open encoder encodes work of the current command (and of the held ones).
+    void Touch() {
+        open_last = command;
+        if (held && held < open_first) {
+            open_first = held;
+        }
     }
     template <typename E>
     void BeginOrdered(E e, const OrderTracker::Accesses& need, Lane lane) {
         open_access = need;
         open_lane = lane;
         open_plan = Plan(need, lane);
+        if (FenceCheck::Get().On() && !open_plan.Empty()) {
+            FenceCheck::Get().Waits((__bridge void*)cmd, open_plan, open_plan, "encoder open");
+            FenceCheck::Get().Updates((__bridge void*)cmd, open_plan);
+        }
         WaitFences(e, open_plan, fences);
     }
     /// After a command: an isolated write ends its encoder, so the next command opens another
@@ -262,6 +384,9 @@ struct Encoder::Impl {
     template <typename E>
     void EndOrdered(E e) {
         UpdateFences(e, open_plan, fences);
+        if (order && !ahead && !open_plan.Empty()) {
+            order->Close(open_first, open_last);
+        }
         open_plan = {};
         open_access = {};
     }
@@ -449,6 +574,9 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
         [c addCompletedHandler:^(id<MTLCommandBuffer>) {
             delete held;
         }];
+        if (FenceCheck::Get().On()) {
+            FenceCheck::Get().Committed((__bridge void*)c);
+        }
         u64 tick = 0;
         if (tracked) {
             tick = device.Commit((__bridge void*)c);
@@ -562,6 +690,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
             }
             BeginOrdered(blit, need, Lane::Copy);
         }
+        Touch();
         return blit;
     }
 
@@ -583,6 +712,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
             compute_stage.Reapply();
             compute_pipeline_dirty = compute_pipeline != nullptr;
         }
+        Touch();
         return compute;
     }
 
@@ -639,6 +769,9 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
             render_dirty = render_used; // incl. the scissor, clamped to this pass's target
             vertex.Reapply();
             fragment.Reapply();
+        }
+        if (draw) {
+            Touch();
         }
         return render;
     }
@@ -972,6 +1105,59 @@ void Encoder::OrderBarrier(HazardClass c, BarrierScopes scopes) {
         impl->EndBlit();
     }
     impl->order->Barrier(c, scopes);
+}
+
+void Encoder::SetOrderCommand(u64 command) {
+    if (command == impl->command) {
+        return;
+    }
+    if (impl->asked) {
+        impl->order->EndCommand();
+        impl->asked = false;
+    }
+    impl->command = command;
+}
+
+u64 Encoder::OrderCommand() const noexcept {
+    return impl->command;
+}
+
+void Encoder::HoldOrderCommand() {
+    if (!impl->held) {
+        impl->held = impl->command;
+    }
+}
+
+void Encoder::ReleaseOrderCommand() {
+    impl->held = 0;
+}
+
+void Encoder::OrderWait(const OrderRequest& request) {
+    if (!impl->order || impl->ahead || request.Empty()) {
+        return;
+    }
+    impl->asked = true;
+    const OrderTracker::RequestPlan plan = impl->order->Request(
+        request, impl->device.KnownGpuTick(), impl->open_first, impl->open_last);
+    if (plan.end_open) {
+        // The next Metal encoder waits (a pass continues with Load, as after a blit).
+        impl->EndRender();
+        impl->EndCompute();
+        impl->EndBlit();
+    } else if (plan.waits.num_waits) {
+        // The open encoder waits before the command's work (a pass goes on).
+        if (FenceCheck::Get().On()) {
+            FenceCheck::Get().Waits((__bridge void*)impl->cmd, plan.waits, impl->open_plan,
+                                    "mid-encoder");
+        }
+        if (impl->render) {
+            WaitFences(impl->render, plan.waits, impl->fences);
+        } else if (impl->compute) {
+            WaitFences(impl->compute, plan.waits, impl->fences);
+        } else if (impl->blit) {
+            WaitFences(impl->blit, plan.waits, impl->fences);
+        }
+    }
 }
 
 bool Encoder::HasBindings() const noexcept {

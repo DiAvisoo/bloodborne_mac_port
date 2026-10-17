@@ -335,6 +335,14 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 2. Performance
 
+- **Metal-native: GPU ~12% slower than 0.4.0 in the city (11.2 vs 9.9 ms/frame; 2026-10-17).**
+  Caps 120 FPS at 89-94 against 0.4.0's ~100. Task 10c's per-command ordering is in; an unsafe
+  probe without ordering waits reached 108 FPS, so the waits (or encoder splits they force) are
+  the suspect. Measure in Task 11 (fence waits per frame, encoder count vs 0.4.0's).
+- **Metal-native: intermittent guest-flip wobble at the 60 FPS cap** (2 of 5 launches: spread
+  0.6 ms, flips up to 18.3 ms for the whole run; 0.4.0 never). Per launch, so suspect a phase
+  between the 480 Hz vblank ticks, the frame limiter and the display's vsync. FINDINGS 2026-10-17.
+
 - **Metal-native (M5): the city at 1080p (upscaler off) runs 95.4 FPS, 0.4.0 98.8.** Task 10b
   made device-local buffers untracked with explicit ordering (88.3 -> 95.4 FPS; FINDINGS
   2026-10-17 Task 10b). What remains is the barriers' reach: ~80 barriers per frame (copy-shader

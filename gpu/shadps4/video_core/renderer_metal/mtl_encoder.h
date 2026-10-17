@@ -217,10 +217,24 @@ public:
     /// into `sink` (null: stops). Sampling may keep the GPU from overlapping adjacent encoders.
     void SetTimestampSink(TimestampSink* sink);
     /// Every command touching untracked memory of class `c` from now on waits for what `scopes`
-    /// names among the commands before (OrderTracker::Barrier): the renderer's arena barriers
-    /// (mtl_buffer_barriers.h) and object motion's frame start. Ends the open Metal encoder when
-    /// it touches `c`. No-op with hazard tracking and on Ahead encoders.
+    /// names among the commands before (OrderTracker::Barrier): staging round trips within one
+    /// command and object motion's frame start. Ends the open Metal encoder when it touches `c`.
+    /// No-op with hazard tracking and on Ahead encoders.
     void OrderBarrier(HazardClass c, BarrierScopes scopes = ScopeAll);
+    /// The renderer's command whose work is encoded from now on (BufferBarriers::BeginCommand;
+    /// Scheduler::SetOrderCommand): the Metal encoders that hold a command are known by it.
+    /// Commands only grow.
+    void SetOrderCommand(u64 command);
+    [[nodiscard]] u64 OrderCommand() const noexcept;
+    /// Draws of the current command are deferred (patch draws, Draw::Runs): the encoders that
+    /// encode work until ReleaseOrderCommand also hold the oldest command held.
+    void HoldOrderCommand();
+    void ReleaseOrderCommand();
+    /// The current command waits for the earlier commands `request` names (the renderer's
+    /// conflicts on the guest arena, mtl_buffer_barriers.h): every Metal encoder it opens waits
+    /// for the encoders holding them; the open one ends unless it already does
+    /// (OrderTracker::Request). No-op with hazard tracking and on Ahead encoders.
+    void OrderWait(const OrderRequest& request);
     /// True while any slot, pipeline or render state is set (Submit clears all of it).
     [[nodiscard]] bool HasBindings() const noexcept;
 

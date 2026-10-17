@@ -72,13 +72,10 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     }
     scheduler.EndRendering();
     const u64 src_size = src_max - src_min, dst_size = dst_max - dst_min;
-    // The arena's ordering (Runtime::IsBufferAccessed): a barrier when the ranges were used.
-    // (Exact ranges: the batch spans up to 64 KiB of scattered table entries.)
-    Metal::BarrierScopes need = Metal::ScopeNone;
+    // The arena's ordering (Runtime::IsBufferAccessed): waits for the commands that used the
+    // ranges. (Exact ranges: the batch spans up to 64 KiB of scattered table entries.)
+    Metal::OrderRequest need;
     for (const auto& copy : copies) {
-        if ((need & Metal::ScopeAll) == Metal::ScopeAll) {
-            break; // nothing more to find
-        }
         need |= runtime.IsBufferAccessed(src, copy.src_offset, copy.size) |
                 runtime.IsBufferAccessed(dst, copy.dst_offset, copy.size, true);
     }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: which accesses to the guest arena need a barrier (mtl_buffer_barriers.h).
+// bbport: which earlier commands an access to the guest arena must wait for
+// (mtl_buffer_barriers.h).
 
 #include <algorithm>
 #include <cstdlib>
@@ -10,17 +11,10 @@ namespace Metal {
 
 namespace {
 constexpr u64 PageSize = 1ull << BufferBarriers::PageBits;
+constexpr u64 BlockSize = 1ull << BufferBarriers::BlockBits;
 constexpr u64 ChunkSize = 1ull << BufferBarriers::ChunkBits;
-constexpr u64 PagesPerChunkBits = BufferBarriers::ChunkBits - BufferBarriers::PageBits;
-static_assert(PageSize >> BufferBarriers::BlockBits == 16, "a u16 block mask per page");
-
-/// The blocks of page `page` that [offset, end) covers.
-u16 BlockMask(u64 page, u64 offset, u64 end) {
-    const u64 page_begin = page << BufferBarriers::PageBits;
-    const u64 lo = (std::max(offset, page_begin) - page_begin) >> BufferBarriers::BlockBits;
-    const u64 hi = (std::min(end, page_begin + PageSize) - 1 - page_begin) >> BufferBarriers::BlockBits;
-    return u16(((2u << hi) - 1) & ~((1u << lo) - 1));
-}
+constexpr u64 BlocksPerPage = PageSize / BlockSize;
+static_assert(BlocksPerPage == 16);
 } // namespace
 
 void BufferBarriers::FreeDeleter::operator()(void* p) const noexcept {
@@ -32,20 +26,18 @@ void BufferBarriers::Register(const void* buffer, u64 size) {
     const u64 chunks = (size + ChunkSize - 1) >> ChunkBits;
     Tags t;
     t.size = size;
-    // calloc: zero (epoch 0, never accessed); arrays this large are fresh zero-filled pages
-    // the OS commits only as accesses touch them (make_unique<T[]> would write every byte).
+    // calloc: zero (never accessed); arrays this large are fresh zero-filled pages the OS
+    // commits only as accesses touch them (make_unique<T[]> would write every byte).
     const auto zero = []<typename T>(ZeroArray<T>& array, u64 count) {
         array.reset(static_cast<T*>(std::calloc(count, sizeof(T))));
     };
-    bool allocated = true;
-    for (u32 k = 0; k < NumKinds && allocated; ++k) {
-        zero(t.page[k], pages);
-        zero(t.blocks[k], pages);
-        zero(t.any[k], chunks);
-        zero(t.whole[k], chunks);
-        allocated = t.page[k] && t.blocks[k] && t.any[k] && t.whole[k];
-    }
-    if (!allocated) {
+    zero(t.blocks, pages * BlocksPerPage);
+    zero(t.page, pages);
+    zero(t.summary, pages);
+    zero(t.page_touch, pages);
+    zero(t.chunk, chunks);
+    zero(t.chunk_touch, chunks);
+    if (!t.blocks || !t.page || !t.summary || !t.page_touch || !t.chunk || !t.chunk_touch) {
         LOG_ERROR(Render, "Buffer ordering: no memory for the access tags of a {:#x}-byte buffer; "
                           "every access to it waits for all work before it",
                   size);
@@ -56,165 +48,232 @@ void BufferBarriers::Register(const void* buffer, u64 size) {
     buffers[buffer] = std::move(t);
 }
 
-bool BufferBarriers::Overlaps(const Tags& t, Kind kind, u64 offset, u64 end) const {
-    const u32 current = epoch[GroupOf(kind)];
-    if (t.whole_buffer[kind] == current) {
-        return true;
-    }
-    if (offset == 0 && end >= t.size) {
-        return t.any_buffer[kind] == current; // a whole-buffer query: no walk either
-    }
-    const u32* page = t.page[kind].get();
-    const u16* blocks = t.blocks[kind].get();
-    const u64 first_page = offset >> PageBits, last_page = (end - 1) >> PageBits;
-    for (u64 chunk = offset >> ChunkBits; chunk <= (end - 1) >> ChunkBits; ++chunk) {
-        if (t.whole[kind][chunk] == current) {
-            return true;
+OrderRequest BufferBarriers::Everything() const {
+    OrderRequest r;
+    if (command > retired) {
+        for (CommandSet* set : {&r.render_end, &r.copy, &r.compute}) {
+            set->window = {retired + 1, command};
         }
-        if (t.any[kind][chunk] != current) {
-            continue;
-        }
-        const u64 lo = std::max(first_page, chunk << PagesPerChunkBits);
-        const u64 hi = std::min(last_page, ((chunk + 1) << PagesPerChunkBits) - 1);
-        for (u64 p = lo; p <= hi; ++p) {
-            if (page[p] == current && (blocks[p] & BlockMask(p, offset, end))) {
-                return true;
-            }
-        }
+        r.ahead = true;
     }
-    return false;
+    return r;
 }
 
-BarrierScopes BufferBarriers::Conflicts(const void* buffer, u64 offset, u64 size,
-                                        bool write) const {
+void BufferBarriers::AddWrites(u8 kinds, u64 lo, u64 hi, OrderRequest& r) {
+    if (kinds & EncoderRender) {
+        r.render_end.Add(lo, hi);
+    }
+    if (kinds & EncoderCopy) {
+        r.copy.Add(lo, hi);
+    }
+    if (kinds & EncoderCompute) {
+        r.compute.Add(lo, hi);
+    }
+    r.ahead |= (kinds & EncoderAhead) != 0;
+}
+
+void BufferBarriers::AddReads(u8 kinds, u64 lo, u64 hi, OrderRequest& r) {
+    if (kinds & ReadRenderLate) {
+        r.render_end.Add(lo, hi);
+    } else if (kinds & ReadRenderVertex) {
+        r.render_vertex.Add(lo, hi);
+    }
+    if (kinds & ReadCopy) {
+        r.copy.Add(lo, hi);
+    }
+    if (kinds & ReadCompute) {
+        r.compute.Add(lo, hi);
+    }
+    r.ahead |= (kinds & ReadAhead) != 0;
+}
+
+u8 BufferBarriers::ReadKinds(u8 encoders, ReadStage stage) {
+    u8 kinds = 0;
+    if (encoders & EncoderRender) {
+        kinds |= stage == ReadStage::Vertex ? ReadRenderVertex : ReadRenderLate;
+    }
+    kinds |= (encoders & EncoderCopy) ? ReadCopy : 0;
+    kinds |= (encoders & EncoderCompute) ? ReadCompute : 0;
+    kinds |= (encoders & EncoderAhead) ? ReadAhead : 0;
+    return kinds;
+}
+
+void BufferBarriers::Collect(const Block& b, bool write, OrderRequest& r) const {
+    // RAW and WAW: the last write (the earlier ones and their readers are ordered before it).
+    if (const u64 w = Expand(b.write); w > retired) {
+        AddWrites(b.write_kinds, w, w, r);
+    }
+    if (!write || b.read_kinds == 0) {
+        return; // RAR: nothing more
+    }
+    // WAR: the reads since, their ends (or vertex stages for render reads made only there).
+    const u64 hi = Expand(b.read_hi);
+    if (hi <= retired) {
+        return;
+    }
+    u64 lo = Expand(b.read_lo);
+    if (lo <= retired || lo > hi) {
+        lo = retired + 1; // (a tag 2^32 commands old expands past `hi`: every live command)
+    }
+    AddReads(b.read_kinds, lo, hi, r);
+}
+
+void BufferBarriers::Collect(const Summary& s, bool write, OrderRequest& r) const {
+    if (const u64 hi = Expand(s.write_hi); hi > retired) {
+        u64 lo = Expand(s.write_lo);
+        if (lo <= retired || lo > hi) {
+            lo = retired + 1;
+        }
+        AddWrites(s.write_kinds, lo, hi, r);
+    }
+    if (!write || s.read_kinds == 0) {
+        return;
+    }
+    if (const u64 hi = Expand(s.read_hi); hi > retired) {
+        u64 lo = Expand(s.read_lo);
+        if (lo <= retired || lo > hi) {
+            lo = retired + 1;
+        }
+        AddReads(s.read_kinds, lo, hi, r);
+    }
+}
+
+void BufferBarriers::MarkBlock(Block& b, bool write, u8 encoders, ReadStage stage) const {
+    const u32 tag = u32(command);
+    if (write) {
+        if (b.write != tag) {
+            // The write waited for the reads since the last one (WAR): they are ordered before
+            // it, and a later conflict with it stands for them. Its own reads stay.
+            if (b.read_hi == tag) {
+                b.read_lo = tag;
+            } else {
+                b.read_lo = b.read_hi = 0;
+                b.read_kinds = 0;
+            }
+            b.write = tag;
+            b.write_kinds = 0;
+        }
+        b.write_kinds |= encoders;
+        return;
+    }
+    if (b.read_kinds == 0 || !Live(b.read_hi)) {
+        b.read_lo = tag;
+        b.read_kinds = 0;
+    }
+    b.read_hi = tag;
+    b.read_kinds |= ReadKinds(encoders, stage);
+}
+
+void BufferBarriers::MarkSummary(Summary& s, bool write, u8 encoders, ReadStage stage) const {
+    const u32 tag = u32(command);
+    if (write) {
+        if (s.write_kinds == 0 || !Live(s.write_hi)) {
+            s.write_lo = tag;
+            s.write_kinds = 0;
+        }
+        s.write_hi = tag;
+        s.write_kinds |= encoders;
+        return;
+    }
+    if (s.read_kinds == 0 || !Live(s.read_hi)) {
+        s.read_lo = tag;
+        s.read_kinds = 0;
+    }
+    s.read_hi = tag;
+    s.read_kinds |= ReadKinds(encoders, stage);
+}
+
+OrderRequest BufferBarriers::Conflicts(const void* buffer, u64 offset, u64 size,
+                                       bool write) const {
     const auto it = buffers.find(buffer);
     if (it == buffers.end() || size == 0 || offset >= it->second.size) {
-        return ScopeNone;
+        return {};
     }
     const Tags& t = it->second;
     if (t.conservative) {
-        return ScopeAll;
+        return Everything();
+    }
+    OrderRequest r;
+    if (!Live(t.touch)) {
+        return r; // nothing since the last complete command buffer
     }
     const u64 end = std::min(offset + size, t.size);
-    const auto has = [&](Kind kind) { return marked[GroupOf(kind)] && Overlaps(t, kind, offset, end); };
-    BarrierScopes scopes = ScopeNone;
-    // RAW and WAW: the writers' ends.
-    if (has(RenderWrite)) {
-        scopes |= ScopeRenderEnd;
-    }
-    if (has(CopyWrite)) {
-        scopes |= ScopeCopyEnd;
-    }
-    if (has(ComputeWrite)) {
-        scopes |= ScopeComputeEnd;
-    }
-    if (has(AheadWrite)) {
-        scopes |= ScopeAhead;
-    }
-    if (!write) {
-        return scopes; // RAR: nothing more
-    }
-    // WAR: the readers' ends, or the vertex stage of render passes that read only there.
-    if (!(scopes & ScopeRenderEnd)) {
-        if (has(RenderLateRead)) {
-            scopes |= ScopeRenderEnd;
-        } else if (has(RenderVertexRead)) {
-            scopes |= ScopeRenderVertex;
-        }
-    }
-    if (!(scopes & ScopeCopyEnd) && has(CopyRead)) {
-        scopes |= ScopeCopyEnd;
-    }
-    if (!(scopes & ScopeComputeEnd) && has(ComputeRead)) {
-        scopes |= ScopeComputeEnd;
-    }
-    if (!(scopes & ScopeAhead) && has(AheadRead)) {
-        scopes |= ScopeAhead;
-    }
-    return scopes;
-}
-
-void BufferBarriers::MarkKind(Tags& t, Kind kind, u64 offset, u64 end) {
-    const Group g = GroupOf(kind);
-    marked[g] = true;
-    const u32 current = epoch[g];
-    t.any_buffer[kind] = current;
     if (offset == 0 && end >= t.size) {
-        t.whole_buffer[kind] = current; // one tag, not a walk over every chunk
-        return;
+        return Everything(); // a whole-buffer access (direct memory access): no walk
     }
-    u32* page = t.page[kind].get();
-    u16* blocks = t.blocks[kind].get();
+    Collect(t.whole, write, r);
     const u64 first_page = offset >> PageBits, last_page = (end - 1) >> PageBits;
     for (u64 chunk = offset >> ChunkBits; chunk <= (end - 1) >> ChunkBits; ++chunk) {
-        t.any[kind][chunk] = current;
-        const u64 chunk_begin = chunk << ChunkBits;
-        if (offset <= chunk_begin && end >= std::min(chunk_begin + ChunkSize, t.size)) {
-            t.whole[kind][chunk] = current;
+        if (!Live(t.chunk_touch[chunk])) {
             continue;
         }
-        const u64 lo = std::max(first_page, chunk << PagesPerChunkBits);
-        const u64 hi = std::min(last_page, ((chunk + 1) << PagesPerChunkBits) - 1);
+        Collect(t.chunk[chunk], write, r);
+        const u64 lo = std::max(first_page, chunk << (ChunkBits - PageBits));
+        const u64 hi = std::min(last_page, ((chunk + 1) << (ChunkBits - PageBits)) - 1);
         for (u64 p = lo; p <= hi; ++p) {
-            const u16 mask = BlockMask(p, offset, end);
-            blocks[p] = page[p] == current ? u16(blocks[p] | mask) : mask;
-            page[p] = current;
+            if (!Live(t.page_touch[p])) {
+                continue;
+            }
+            Collect(t.page[p], write, r);
+            const u64 page_begin = p << PageBits;
+            if (offset <= page_begin && end >= page_begin + PageSize) {
+                Collect(t.summary[p], write, r); // the whole page: its blocks together
+                continue;
+            }
+            const u64 b0 = (std::max(offset, page_begin) - page_begin) >> BlockBits;
+            const u64 b1 = (std::min(end, page_begin + PageSize) - 1 - page_begin) >> BlockBits;
+            const Block* blocks = &t.blocks[p * BlocksPerPage];
+            for (u64 b = b0; b <= b1; ++b) {
+                Collect(blocks[b], write, r);
+            }
         }
     }
+    return r;
 }
 
 void BufferBarriers::Mark(const void* buffer, u64 offset, u64 size, bool write, u8 encoders,
                           ReadStage stage) {
     const auto it = buffers.find(buffer);
-    if (it == buffers.end() || size == 0 || offset >= it->second.size) {
+    if (it == buffers.end() || size == 0 || offset >= it->second.size || command == 0) {
         return;
     }
     Tags& t = it->second;
     if (t.conservative) {
-        for (bool& m : marked) {
-            m = true; // the next barrier has something to order
-        }
+        return; // every access waits for everything live
+    }
+    const u32 tag = u32(command);
+    t.touch = tag;
+    const u64 end = std::min(offset + size, t.size);
+    if (offset == 0 && end >= t.size) {
+        MarkBlock(t.whole, write, encoders, stage); // one tag, not a walk over every chunk
         return;
     }
-    const u64 end = std::min(offset + size, t.size);
-    if (encoders & EncoderRender) {
-        MarkKind(t,
-                 write                        ? RenderWrite
-                 : stage == ReadStage::Vertex ? RenderVertexRead
-                                              : RenderLateRead,
-                 offset, end);
-    }
-    if (encoders & EncoderCopy) {
-        MarkKind(t, write ? CopyWrite : CopyRead, offset, end);
-    }
-    if (encoders & EncoderCompute) {
-        MarkKind(t, write ? ComputeWrite : ComputeRead, offset, end);
-    }
-    if (encoders & EncoderAhead) {
-        MarkKind(t, write ? AheadWrite : AheadRead, offset, end);
-    }
-}
-
-BarrierScopes BufferBarriers::Barrier(BarrierScopes scopes) {
-    if (scopes & ScopeRenderEnd) {
-        scopes |= ScopeRenderVertex;
-    }
-    BarrierScopes done = ScopeNone;
-    for (u32 g = 0; g < NumGroups; ++g) {
-        if ((scopes & (1u << g)) && marked[g]) {
-            marked[g] = false;
-            // Epoch 0 means "never"; after 2^32 barriers (days of play) a stale tag could match
-            // again, which only adds a barrier.
-            if (++epoch[g] == 0) {
-                epoch[g] = 1;
+    const u64 first_page = offset >> PageBits, last_page = (end - 1) >> PageBits;
+    for (u64 chunk = offset >> ChunkBits; chunk <= (end - 1) >> ChunkBits; ++chunk) {
+        t.chunk_touch[chunk] = tag;
+        const u64 chunk_begin = chunk << ChunkBits;
+        if (offset <= chunk_begin && end >= std::min(chunk_begin + ChunkSize, t.size)) {
+            MarkBlock(t.chunk[chunk], write, encoders, stage);
+            continue;
+        }
+        const u64 lo = std::max(first_page, chunk << (ChunkBits - PageBits));
+        const u64 hi = std::min(last_page, ((chunk + 1) << (ChunkBits - PageBits)) - 1);
+        for (u64 p = lo; p <= hi; ++p) {
+            t.page_touch[p] = tag;
+            const u64 page_begin = p << PageBits;
+            if (offset <= page_begin && end >= page_begin + PageSize) {
+                MarkBlock(t.page[p], write, encoders, stage); // the whole page: one tag
+                continue;
             }
-            done |= BarrierScopes(1u << g);
+            const u64 b0 = (std::max(offset, page_begin) - page_begin) >> BlockBits;
+            const u64 b1 = (std::min(end, page_begin + PageSize) - 1 - page_begin) >> BlockBits;
+            Block* blocks = &t.blocks[p * BlocksPerPage];
+            for (u64 b = b0; b <= b1; ++b) {
+                MarkBlock(blocks[b], write, encoders, stage);
+            }
+            MarkSummary(t.summary[p], write, encoders, stage);
         }
     }
-    if (done) {
-        ++barriers;
-    }
-    return done;
 }
 
 } // namespace Metal

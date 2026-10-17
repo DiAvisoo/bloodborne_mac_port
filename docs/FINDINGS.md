@@ -1150,3 +1150,29 @@ front); compare only runs made the same way.
   inversion and no encoder waiting on its own slot fence. Cross-buffer waits seen are all on
   `AheadFence` with the hoisted-upload buffer committed first.
 - Test runs: an outer watchdog in the run script KILLs the game when frame stats stop for 15 s.
+
+## 2026-10-17: Task 10c closed at a measured state; frame pacing vs 0.4.0 at 60/90/120
+
+Task 10c (per-command ordering: each wait narrowed to the encoders that conflict) ends below its
+gate: city spawn, 1080p, upscaler off, uncapped, `BB_PRESENT_MODE=Immediate`: **88.8 FPS against
+0.4.0's 98.8** (GPU 11.2 vs 9.9 ms/frame). Images checked (cages, lamps, fog, motion blur while
+turning). Closed at this state per the plan; the GPU gap carries into Task 11.
+
+Pacing (same scene and ini, windowed, display vsync, stand 40 s then turn 20 s; FPS / worst frame
+standing / spread of guest flip intervals):
+
+| Cap | 0.4.0 (MoltenVK) | Metal-native, two drawables | Metal-native, after the fix |
+|---|---|---|---|
+| 60 | 60.0 / 16.7 ms / 0.01 ms | 60.0 / 16.7 ms / 0.01 ms (3 of 5 runs) | same |
+| 90 | 90.0 / 11.1 ms / 0.00 ms | **60.0** / 29.7 ms | 89.2 / 12.5 ms / 0.34 ms |
+| 120 | 98-102 / 13.1 ms / 0.24 ms | **60.0** / 24.2 ms | 89-94 / 29.9 ms / 0.94 ms |
+
+- **90 and 120 locked at 60:** with two drawables on the 120 Hz display, `nextDrawable` blocked
+  16-17 ms every frame (a frame longer than one refresh waits a whole extra refresh for a
+  drawable). Fix: three drawables when the frame limit is above 60 or off, two up to 60 (two keep
+  the lower latency measured 2026-10-14). The presenter now prints its drawables and frame limit.
+- **Intermittent 60-cap wobble:** 2 of 5 Metal runs at the 60 cap had a spread of 0.55-0.72 ms
+  for the whole run (guest flips up to 18.3 ms, p99 18.2), the others 0.01 ms; 0.4.0 0 of 3.
+  Present-to-present gaps stayed under 25 ms. Per launch, not per scene: backlog.
+- Pacing script notes: the game's stdout is block-buffered into a file, so a log-silence
+  watchdog needs a pty (`script -q /dev/null bash run.sh`) or a long limit.

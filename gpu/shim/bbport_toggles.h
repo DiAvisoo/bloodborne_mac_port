@@ -99,10 +99,13 @@ inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0}, flips
 inline std::atomic<std::uint64_t> hoisted_copies{0};
 /// bbport: copy-shader copies recorded ahead of their submission, and those that could not be.
 inline std::atomic<std::uint64_t> hoisted_shader_copies{0}, inline_shader_copies{0};
-/// bbport: arena barriers recorded (Runtime::FlushBarriers: those waiting for render passes,
-/// and the others), and uploads not hoisted because their ranges were in use by a submission
-/// in flight.
+/// bbport: arena ordering requests recorded (Runtime::FlushBarriers: commands waiting for
+/// render passes, and the others), and uploads not hoisted because their ranges were in use by
+/// a submission in flight.
 inline std::atomic<std::uint64_t> arena_barriers{0}, arena_other_barriers{0}, hoists_in_flight{0};
+/// bbport: ordering fence waits encoded at encoder opens, those encoders, and the most on one
+/// encoder (Metal::OrderTracker::TakeWaitStats).
+inline std::atomic<std::uint64_t> order_waits{0}, order_encoders{0}, order_max_waits{0};
 /// bbport: encoders that found every ordering slot busy (Metal::OrderTracker::BusyReuses), for
 /// guest memory and object motion's history.
 inline std::atomic<std::uint64_t> busy_slot_reuses{0}, busy_motion_slot_reuses{0};

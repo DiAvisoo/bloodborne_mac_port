@@ -112,6 +112,17 @@ Runtime::Runtime(Metal::Device& device_, Scheduler& scheduler_)
     blit_helper = std::make_unique<VideoCore::BlitHelper>(device, scheduler);
 }
 
+namespace {
+/// The rest of the current command waits for its own copies so far: the uploads of a staging
+/// round trip read what its downloads wrote (staging is ordered by the Runtime; tracked
+/// buffers: Metal orders the encoders).
+void WaitForOwnCopies(Metal::Encoder& e) {
+    Metal::OrderRequest own;
+    own.copy.Add(e.OrderCommand());
+    e.OrderWait(own);
+}
+} // namespace
+
 // 1 KiB pages; the tag is the low 16 bits of the submission tick. A tag that wraps around can only
 // make a page look used (no hoist), never unused.
 static constexpr u64 HoistPageBits = 10;
@@ -147,24 +158,43 @@ void Runtime::EndStagingRoundTrip(const VideoCore::Buffer* staging, u64 offset, 
     AccessBuffer(staging, offset, size, false);
 }
 
-Metal::BarrierScopes Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset,
-                                               u64 size, bool write) const {
-    return ordering ? barriers.Conflicts(handle, offset, size, write) : Metal::ScopeNone;
+Metal::OrderRequest Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset,
+                                              u64 size, bool write) const {
+    return ordering ? barriers.Conflicts(handle, offset, size, write) : Metal::OrderRequest{};
 }
 
-void Runtime::FlushBarriers(Metal::BarrierScopes scopes) {
-    if (!ordering || scopes == Metal::ScopeNone) {
+u64 Runtime::BeginCommand() {
+    // Commands numbered while the scheduler's tick was `command_tick` are in that submission.
+    const u64 tick = scheduler.CurrentTick();
+    if (tick != command_tick) {
+        if (barriers.Command()) {
+            submitted_commands.emplace_back(command_tick, barriers.Command());
+        }
+        command_tick = tick;
+    }
+    const u64 known = scheduler.KnownGpuTick();
+    while (!submitted_commands.empty() && submitted_commands.front().first <= known) {
+        barriers.Retire(submitted_commands.front().second);
+        submitted_commands.pop_front();
+    }
+    const u64 command = barriers.BeginCommand();
+    scheduler.SetOrderCommand(command);
+    return command;
+}
+
+void Runtime::FlushBarriers(const Metal::OrderRequest& need) {
+    if (!ordering) {
         return;
     }
-    const Metal::BarrierScopes done = barriers.Barrier(scopes);
-    if (done == Metal::ScopeNone) {
+    BeginCommand();
+    if (need.Empty()) {
         return;
     }
-    ((done & (Metal::ScopeRenderEnd | Metal::ScopeRenderVertex)) ? BbStats::arena_barriers
-                                                                  : BbStats::arena_other_barriers)
+    ((need.Scopes() & (Metal::ScopeRenderEnd | Metal::ScopeRenderVertex))
+         ? BbStats::arena_barriers
+         : BbStats::arena_other_barriers)
         .fetch_add(1, std::memory_order_relaxed);
-    scheduler.Record(
-        [done](Metal::Encoder& e) { e.OrderBarrier(Metal::HazardClass::Memory, done); });
+    scheduler.Record([need](Metal::Encoder& e) { e.OrderWait(need); });
 }
 
 bool Runtime::UsedInFlight(const VideoCore::Buffer* buffer,
@@ -266,6 +296,10 @@ bool Runtime::HoistCopy(const VideoCore::Buffer* src, const VideoCore::Buffer* d
     }
     scheduler.RecordHoistedCopy(src->Ref(), dst->Ref(), copies, shader_copy);
     if (ordering) {
+        // A number of this submission's (the uploads run before it, and retire with it). No
+        // command is between its FlushBarriers and its marks here: hoisting is decided while
+        // a command's resources are bound, before its FlushBarriers.
+        BeginCommand();
         for (const auto& copy : copies) {
             barriers.Mark(dst, copy.dst_offset, copy.size, true, Metal::EncoderAhead);
             barriers.Mark(src, copy.src_offset, copy.size, false, Metal::EncoderAhead);
@@ -285,11 +319,8 @@ void Runtime::CopyBuffer(const VideoCore::Buffer& src, const VideoCore::Buffer& 
                          std::span<const VideoCore::BufferCopy> copies,
                          std::source_location where) {
     scheduler.EndRendering(where);
-    Metal::BarrierScopes need = Metal::ScopeNone;
+    Metal::OrderRequest need;
     for (const auto& copy : copies) {
-        if ((need & Metal::ScopeAll) == Metal::ScopeAll) {
-            break; // nothing more to find
-        }
         need |= IsBufferAccessed(&src, copy.src_offset, copy.size) |
                 IsBufferAccessed(&dst, copy.dst_offset, copy.size, true);
     }
@@ -530,7 +561,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     const TransferMark mark{*this, "image upload", *dst};
     AccessImage(dst, true);
 
-    Metal::BarrierScopes need = Metal::ScopeNone;
+    Metal::OrderRequest need;
     for (const auto& copy : upload_copies) {
         const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
         need |= IsBufferAccessed(src, copy.bufferOffset, copy_size);
@@ -553,7 +584,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     const TransferMark mark{*this, "image download", *src};
     AccessImage(src, false);
 
-    Metal::BarrierScopes need = Metal::ScopeNone;
+    Metal::OrderRequest need;
     for (const auto& copy : download_copies) {
         const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
         need |= IsBufferAccessed(dst, copy.bufferOffset, copy_size, true);
@@ -682,7 +713,7 @@ void Runtime::CopyRegions(VideoCore::Image* src, VideoCore::Image* dst,
         // The uploads read what the downloads wrote: another encoder, after them (staging is
         // ordered by this Runtime; tracked buffers: Metal orders the encoders).
         e.EndEncoding();
-        e.OrderBarrier(Metal::HazardClass::Memory, Metal::ScopeCopyEnd);
+        WaitForOwnCopies(e);
         for (const auto& c : copies) {
             e.CopyBufferToTexture({staging.buffer, staging.offset + c.offset}, c.bytes_per_row,
                                   c.bytes_per_image, dst_texture, c.dst_level, c.dst_slice,
@@ -806,7 +837,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         // The uploads read what the downloads wrote: another encoder, after them (staging is
         // ordered by this Runtime; tracked buffers: Metal orders the encoders).
         e.EndEncoding();
-        e.OrderBarrier(Metal::HazardClass::Memory, Metal::ScopeCopyEnd);
+        WaitForOwnCopies(e);
         for (u32 layer = 0; layer < layers; ++layer) {
             e.CopyBufferToTexture({ref.buffer, ref.offset + u64(layer) * dst_image * size.depth},
                                   dst_row, dst_image, dst_texture, 0, layer, {}, size,
@@ -938,7 +969,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
         // The uploads read what the downloads wrote: another encoder, after them (staging is
         // ordered by this Runtime; tracked buffers: Metal orders the encoders).
         e.EndEncoding();
-        e.OrderBarrier(Metal::HazardClass::Memory, Metal::ScopeCopyEnd);
+        WaitForOwnCopies(e);
         each([&](const Aspect& aspect, u32 layer, Metal::BufferRef at) {
             e.CopyBufferToTexture(at, size.width * aspect.bytes, u32(pixels * aspect.bytes),
                                   dst_texture, 0, layer, {}, size, aspect.dst);

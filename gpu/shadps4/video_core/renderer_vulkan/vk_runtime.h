@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <deque>
 #include <memory>
 #include <span>
 #include <unordered_map>
@@ -110,15 +111,16 @@ public:
 
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
 
-    /// bbport: ordering of the untracked arena (as the Vulkan renderer's barrier tracker):
-    /// right before a command is recorded, IsBufferAccessed for each range it reads or writes,
-    /// then FlushBarriers with the scopes they give; after recording it, AccessBuffer marks its
-    /// ranges (and the hoisting bookkeeping). Unregistered buffers are not tracked here: tracked
-    /// ones Metal orders, untracked ones the Encoder (an isolated write, mtl_order.h).
-    /// What a barrier before the access must wait for (RAW, WAR, WAW; ScopeNone: no barrier).
-    [[nodiscard]] Metal::BarrierScopes IsBufferAccessed(const VideoCore::Buffer* handle,
-                                                        u64 offset, u64 size,
-                                                        bool write = false) const;
+    /// bbport: ordering of the untracked arena, per command (mtl_buffer_barriers.h): right
+    /// before a command is recorded, IsBufferAccessed for each range it reads or writes, then
+    /// FlushBarriers with the requests they give (it numbers the command); after recording it,
+    /// AccessBuffer marks its ranges (and the hoisting bookkeeping). Unregistered buffers are not
+    /// tracked here: tracked ones Metal orders, untracked ones the Encoder (an isolated write,
+    /// mtl_order.h).
+    /// The earlier commands the access must wait for (RAW, WAR, WAW; empty: none).
+    [[nodiscard]] Metal::OrderRequest IsBufferAccessed(const VideoCore::Buffer* handle,
+                                                       u64 offset, u64 size,
+                                                       bool write = false) const;
     /// The access is made by `encoders` (Metal::EncoderKinds: copies EncoderCopy, dispatches
     /// EncoderCompute, draws EncoderRender), reads in render passes at `stage`.
     void AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size, bool write = false,
@@ -144,13 +146,9 @@ public:
     /// the barrier before it, and its marks after it (the command orders its two halves).
     void BeginStagingRoundTrip(const VideoCore::Buffer* staging, u64 offset, u64 size);
     void EndStagingRoundTrip(const VideoCore::Buffer* staging, u64 offset, u64 size);
-    /// Records a barrier waiting for `scopes` (Metal::Encoder::OrderBarrier), when anything is
-    /// to be ordered.
-    void FlushBarriers(Metal::BarrierScopes scopes);
-    /// Barriers recorded so far (BB_FRAME_STATS).
-    [[nodiscard]] u64 BarrierCount() const noexcept {
-        return barriers.Barriers();
-    }
+    /// Numbers the command recorded next (its marks and the Encoder's encoders), and records
+    /// its wait for what `need` names (Metal::Encoder::OrderWait), when anything.
+    void FlushBarriers(const Metal::OrderRequest& need);
 
     /// bbport: runs before this thread records commands on an image or changes its backing:
     /// the rasterizer joins its texture binding helper there (BindHelper).
@@ -191,8 +189,14 @@ private:
     /// waits for all work before it).
     bool UsedInFlight(const VideoCore::Buffer* buffer,
                       std::span<const VideoCore::BufferCopy> copies, bool source) const;
-    Metal::BufferBarriers barriers; ///< the arena's accesses since the last barrier
+    /// Numbers the next command (BufferBarriers::BeginCommand, Scheduler::SetOrderCommand) and
+    /// retires the commands of submissions known complete.
+    u64 BeginCommand();
+    Metal::BufferBarriers barriers; ///< the arena's accesses, per command
     bool ordering;                  ///< the arena is untracked (no BB_METAL_HAZARD_TRACKING)
+    /// The last command numbered in each submission not known complete (tick, command).
+    std::deque<std::pair<u64, u64>> submitted_commands;
+    u64 command_tick{}; ///< the scheduler tick of the commands numbered last
 
     void (*image_access_hook)(void*) = nullptr;
     void* image_access_context = nullptr;

@@ -200,6 +200,8 @@ bool Runs::DrawTessellated(Encoder& e, const TessellationPipeline& t, Access buf
     patch.patches = plan.patches;
     patch.output_control_points = t.output_control_points;
     QueuePatchDraw(view, s, r, patch);
+    // Its render pass reads come with the run's end: the encoders until then hold this command.
+    e.HoldOrderCommand();
     ++counters.draws;
     return true;
 }

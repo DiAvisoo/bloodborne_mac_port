@@ -556,7 +556,14 @@ u64 Scheduler::SubmitExecution() {
     BbStats::queue_submit_ns.fetch_add(bbport::CyclesToNs(bbport::CpuCycles() - submit_start),
                                        std::memory_order_relaxed);
     BbStats::queue_submits.fetch_add(1, std::memory_order_relaxed);
-    if (const auto* order = device.Order(); order && BbStats::enabled) {
+    if (auto* order = device.Order(); order && BbStats::enabled) {
+        const auto waits = order->TakeWaitStats();
+        BbStats::order_waits.fetch_add(waits.waits, std::memory_order_relaxed);
+        BbStats::order_encoders.fetch_add(waits.encoders, std::memory_order_relaxed);
+        u64 max = BbStats::order_max_waits.load(std::memory_order_relaxed);
+        while (waits.max > max && !BbStats::order_max_waits.compare_exchange_weak(
+                                      max, waits.max, std::memory_order_relaxed)) {
+        }
         static u64 last_memory = 0, last_motion = 0;
         const u64 memory = order->BusyReuses(Metal::HazardClass::Memory);
         const u64 motion = order->BusyReuses(Metal::HazardClass::MotionHistory);

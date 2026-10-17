@@ -1940,7 +1940,7 @@ void Rasterizer::SetDrawEncoders(const Pipeline& pipeline, bool indirect) {
 void Rasterizer::OrderAccesses() {
     // Checked now, right before the command is recorded: the uploads and copies recorded while
     // its resources were bound are among the accesses it is checked against.
-    Metal::BarrierScopes need = Metal::ScopeNone;
+    Metal::OrderRequest need;
     for (const auto& b : bound_buffers) {
         need |= runtime.IsBufferAccessed(b.buffer, b.offset, b.size, b.is_written);
     }
