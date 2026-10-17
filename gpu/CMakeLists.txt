@@ -148,17 +148,11 @@ list(FILTER VIDEO_CORE EXCLUDE REGEX "renderdoc\\.cpp$")
 # The Metal renderer (renderer_metal/) is added in the APPLE block below.
 list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_metal/")
 # Metal-native renderer (docs/superpowers/plans/2026-10-16-metal-native-roadmap.md): the milestone
-# the renderer sources are converted to. Files of later milestones leave the build; their headers
-# include gpu/shim/stubs_m3.h instead (header-only stand-ins with the same API).
+# the renderer sources are converted to. Files of later milestones leave the build.
 set(BB_METAL_NATIVE_STAGE 5 CACHE STRING "Metal-native renderer milestone the sources are converted to (5-7)")
 if (BB_METAL_NATIVE_STAGE LESS 5)
-    message(FATAL_ERROR "BB_METAL_NATIVE_STAGE below 5 is gone (the M5 stand-ins are selected by BB_M5_PENDING)")
+    message(FATAL_ERROR "BB_METAL_NATIVE_STAGE below 5 is gone (M5 converted every renderer file)")
 endif()
-# Stage 5 (M5) files that are still Vulkan: left out of the build one by one, each with the
-# stand-in class of the same name in stubs_m3.h (BB_M5_PENDING_<NAME> selects it). Converting a
-# file removes its name from this list, and its stand-in in the same task. (The names are the
-# files under renderer_vulkan/.)
-set(BB_M5_PENDING)
 set(BB_UNCONVERTED_6 host_passes/fsr_pass)
 set(BB_UNCONVERTED_7 vk_instance vk_platform)
 foreach(stage 6 7)
@@ -166,11 +160,6 @@ foreach(stage 6 7)
         foreach(source IN LISTS BB_UNCONVERTED_${stage})
             list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_vulkan/${source}\\.cpp$")
         endforeach()
-    endif()
-endforeach()
-foreach(source IN LISTS BB_M5_PENDING)
-    if (source MATCHES "^vk_")
-        list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_vulkan/${source}\\.cpp$")
     endif()
 endforeach()
 set(BB_DECODER "")
@@ -196,12 +185,8 @@ add_dependencies(bbgpu host_shaders)
 # below), and an embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp)
-# PUBLIC: the gated headers (stubs_m3.h) must see the same stage in the tests that include them.
+# PUBLIC: the gated headers must see the same stage in the tests that include them.
 target_compile_definitions(bbgpu PUBLIC BB_METAL_NATIVE_STAGE=${BB_METAL_NATIVE_STAGE})
-foreach(source IN LISTS BB_M5_PENDING)
-    string(TOUPPER "${source}" pending_name)
-    target_compile_definitions(bbgpu PUBLIC BB_M5_PENDING_${pending_name})
-endforeach()
 target_include_directories(bbgpu PRIVATE third_party/imgui third_party/imgui/backends)
 target_compile_definitions(bbgpu PRIVATE
     BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
@@ -359,14 +344,12 @@ target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(taa-shader-test PRIVATE bbgpu)
 target_link_options(taa-shader-test PRIVATE -Wl,-export_dynamic)
 add_dependencies(taa-shader-test host_shaders)
-if (NOT "vk_camera_motion" IN_LIST BB_M5_PENDING)
-    add_executable(camera-motion-test EXCLUDE_FROM_ALL ../tests/test_camera_motion.cpp ../tests/test_gpu_runtime_stubs.cpp)
-    target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
-    target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
-    target_link_libraries(camera-motion-test PRIVATE bbgpu)
-    target_link_options(camera-motion-test PRIVATE -Wl,-export_dynamic)
-    add_dependencies(camera-motion-test host_shaders)
-endif()
+add_executable(camera-motion-test EXCLUDE_FROM_ALL ../tests/test_camera_motion.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
+target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(camera-motion-test PRIVATE bbgpu)
+target_link_options(camera-motion-test PRIVATE -Wl,-export_dynamic)
+add_dependencies(camera-motion-test host_shaders)
 
 # The depth attachment rule shared by the render pass and the pipeline key (header only).
 add_executable(depth-attachment-test EXCLUDE_FROM_ALL ../tests/test_depth_attachment.cpp)
