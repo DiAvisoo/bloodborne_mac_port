@@ -335,17 +335,22 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 2. Performance
 
-- **Metal-native (M5): hazard tracking on the guest arena and the fault buffer costs ~2.3 ms of
-  GPU time per frame** (city, 1080p, upscaler off: 88.3 FPS / 11.2 ms; both buffers untracked
-  110 FPS / 8.9 ms, every DeviceLocal buffer untracked 120; 0.4.0: 98.8 FPS / 9.9 ms; FINDINGS
-  2026-10-17 Task 10). Both are tracked `MTLBuffer`s bound writable to nearly every encoder, so
-  Metal serialises adjacent encoders. Fix (M5 Task 11): make them (and the other DeviceLocal
-  buffers: page table, staging rings) untracked and order the real writers explicitly: GPU writes
-  to guest memory (blits and compute into the arena, storage-writing pipelines) with an
-  `MTLFence` or `memoryBarrier` before the encoders that read them, the fault buffer's
-  processing kernel with an atomic exchange (bits set meanwhile are handled at the next
-  submission). Re-measure object motion's +3.2 ms afterwards (its positions buffer is declared
-  read/write at the vertex stage).
+- **Metal-native (M5): the city at 1080p (upscaler off) runs 95.4 FPS, 0.4.0 98.8.** Task 10b
+  made device-local buffers untracked with explicit ordering (88.3 -> 95.4 FPS; FINDINGS
+  2026-10-17 Task 10b). What remains is the barriers' reach: ~80 barriers per frame (copy-shader
+  copies rewriting tables between draws), and each makes every later encoder of the scope wait,
+  while only the conflicting command needs to (measured: 108 FPS when only the next encoder
+  waits, unsafe). Next: per-command ordering, each command waiting for exactly the encoders it
+  conflicts with: the renderer records which commands' accesses conflict (command ids per
+  256-byte block), the Encoder maps command ids to slot fences; needs more than 64 slots (a
+  frame and a half in flight is ~450 encoders) and transitive pruning of waits (an encoder
+  that waited stands for what it waited for, across encoder kinds). A first try retiring per
+  waiting kind ran out of slots (87.7 FPS).
+- **Metal-native (M5): with object motion on, untracked buffers gain nothing** (city, TAA,
+  1440p: 50.7 FPS untracked against 51.0 tracked; off: 71.7 against 62.1), so object motion
+  now costs +5.8 ms instead of +3.5. The motion passes' history buffer is ordered per frame
+  (one barrier at frame start, vertex-stage fences); find what serialises the motion frame
+  (GPU profile per pass, `BB_GPU_PROFILE=1`).
 
 - **Metal-native (M4): the second frame waits ~344 ms for the preloaded pipelines.** `WarmUp`
   hands the stored pipelines to the build pool and returns at once, so the first frames' draws

@@ -1032,3 +1032,72 @@ worth re-measuring once the buffers are untracked.
 - `BB_GPU_CAPTURE=<s>` with `METAL_CAPTURE_ENABLED=1` now captures the renderer's own device:
   with the default 16 GiB arena Apple's capture tool crashes in `stopCapture` while writing;
   with `BB_ARENA_GIB=4` it writes the file (884 MB, city).
+
+## 2026-10-17: Metal-native M5 Task 10b, untracked guest buffers with explicit ordering
+
+Device-local buffers (guest arena, page table, fault buffer, device-local staging, camera and
+object motion buffers) are now created untracked (`mtl_buffer.mm`) and ordered explicitly;
+`BB_METAL_HAZARD_TRACKING=1` restores tracked buffers and no ordering (logged once). Design:
+`mtl_buffer_barriers.h` (the renderer's range barriers), `mtl_order.h` (the fences),
+`mtl_encoder.h` (how commands declare what they touch).
+
+- **The renderer orders the arena like the Vulkan renderer did** (0.4.0's barrier tracker): it
+  records each command's ranges (bound buffers with their written flag, vertex, index and
+  indirect-argument ranges, copies, fills, image uploads and downloads, tiling) per 256-byte
+  block since the last barrier, with the kind of encoder (render pass, copy, compute dispatch,
+  hoisted upload) and, for render passes, the stage of a read. A conflicting command (RAW, WAR,
+  WAW, never RAR) gets a barrier that waits for the conflicting kind only: render-pass ends,
+  their vertex stages only (WAR against vertex fetch and vertex-stage shaders), copies, compute
+  dispatches or the hoisted uploads. Other kinds keep overlapping.
+- **The Encoder implements a barrier with MTLFences**: every Metal encoder that touches untracked
+  memory updates a fence of its own (64 slots; render encoders one more after their vertex
+  stage); after a barrier, new encoders wait for the named encoders' fences. Fences are evaluated
+  in commit order, so this holds across command buffers; hoisted uploads (the command buffer
+  committed ahead) are chained through one fence and waited for after a barrier on them; uploads
+  whose ranges a submission in flight still uses are no longer hoisted. Writes to untracked
+  buffers the renderer does not track are isolated (barriers before and after).
+- **Fault buffer:** the processing kernel takes the bits with `atomicExchange` (bits set by
+  shaders still running stay for the next processing).
+
+City, cages save, standing, `upscaler=off preset=0 output_res=1920x1080`, uncapped
+(`fps_cap=0 BB_VBLANK_HZ=480 BB_PRESENT_MODE=Immediate`), mean of the last six `Frame stats`
+lines per run (`t10-run.sh`, as Task 10):
+
+| Build | FPS (runs) | GPU ms/frame |
+|---|---|---|
+| 0.4.0 (MoltenVK, Task 10) | 98.83 (98.50 / 98.93 / 99.05) | 9.94 |
+| metal-native before (Task 10) | 88.25 (88.23 / 88.27 / 88.25) | 11.21 |
+| **untracked + explicit ordering** | **95.40** (95.42 / 95.87 / 94.92) | 10.48 |
+| the same, `BB_METAL_HAZARD_TRACKING=1` | 86.95 (87.32 / 87.12 / 86.42) | 11.50 |
+
++9.7% over tracked buffers, 3.5% short of 0.4.0. (Two more runs are left out: one where the
+game window was being played, 969 draws/frame instead of 883; one at 94.4 FPS with lower GPU
+busy, 94-96%, possibly disturbed too.) About 80 barriers per frame, nearly all on copies (the
+copy-shader HLE copies rewrite table entries between the draws that read them).
+
+What the ordering costs, by experiment (each one unsafe, measured once, same scene):
+
+| Change | FPS |
+|---|---|
+| no fences at all | 120 (the game's limit) |
+| a barrier's waits only for the next encoder (the conflicting one), not every later one | 108 |
+| tracking per 4 KiB page instead of 256-byte blocks | 85-88 (most render-pass barriers came from neighbouring draws' constants sharing a page) |
+| hoisted uploads never waited for | +0.9 |
+| barriers wait for the latest encoder of a kind only | +1 |
+| copy encoders chained in order instead of copy barriers | 94-95 (slower) |
+| barriers retired and waited per waiting kind of encoder (render / copy / compute) | 87.7 (slots run out: kinds that rarely wait keep them busy) |
+
+So the remaining time is the barriers' reach: a barrier makes every later encoder wait, while
+only the conflicting command needs to. Ordering per command (each command waits for exactly
+the encoders it conflicts with) is the next step (`docs/MACOS_BACKLOG.md`).
+
+**Object motion** (Task 5's +3.2 ms; city, `upscaler=taa preset=0 output_res=2560x1440`,
+uncapped, alternating runs):
+
+| Mode | object_motion=0 | object_motion=1 | Cost |
+|---|---|---|---|
+| untracked + ordering (3 runs each) | 71.73 FPS (70.60 / 72.77 / 71.82), 13.94 ms | 50.71 (50.90 / 50.55 / 50.68), 19.71 ms | +5.77 ms |
+| `BB_METAL_HAZARD_TRACKING=1` (1 run each) | 62.07, 16.11 ms | 51.00, 19.61 ms | +3.50 ms |
+
+With object motion on, untracked buffers gain nothing (50.7 against 51.0): the motion frame is
+as slow as before, so its cost in milliseconds grows. Not explained yet (backlog).
