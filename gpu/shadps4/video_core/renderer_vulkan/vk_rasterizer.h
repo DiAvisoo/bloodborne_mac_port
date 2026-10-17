@@ -372,8 +372,27 @@ private:
         const VideoCore::Buffer* buffer;
         u64 offset;
         u32 size;
+        bool is_written;
+        Metal::ReadStage stage; ///< when its reads happen (vertex: pre-rasterisation stages)
+        u8 encoders;            ///< Metal::EncoderKinds that make the access
     };
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
+    /// bbport: the arena's ordering (Runtime::IsBufferAccessed). The draw's or dispatch's other
+    /// reads (vertex, index and indirect-argument ranges), marked with bound_buffers after it is
+    /// recorded; `needs_barrier`: one of its accesses conflicts, FlushBarriers before recording.
+    boost::container::small_vector<BoundBuffer, 8> read_ranges;
+    Metal::BarrierScopes needs_barrier{};
+    /// The encoders the draw or dispatch being bound runs in (Metal::EncoderKinds: a
+    /// tessellated or geometry draw runs its pre-rasterisation stages in compute kernels): the
+    /// kinds of its accesses and the lanes of its barriers.
+    u8 draw_encoders{Metal::EncoderRender};
+    /// Sets draw_encoders for `pipeline` (`indirect`: an indirect draw).
+    void SetDrawEncoders(const Pipeline& pipeline, bool indirect = false);
+    /// Notes a read of the draw or dispatch being bound (read_ranges, needs_barrier).
+    void NoteRead(const VideoCore::Buffer* buffer, u64 offset, u64 size,
+                  Metal::ReadStage stage = Metal::ReadStage::Vertex);
+    /// Before recording the draw or dispatch: the barrier its accesses need, if any.
+    void OrderAccesses();
 
     /// The resources of the draw or dispatch being bound, by the shaders' unified binding
     /// (Shader::Backend::Bindings::unified; array elements contiguous), for

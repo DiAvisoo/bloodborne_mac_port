@@ -49,7 +49,7 @@ void DrawFullscreen(Vulkan::Scheduler& scheduler, const Metal::RenderPassDesc& p
         void* const texture = source.Get();
         e.KeepAlive(std::move(source));
         e.BeginRenderPass(pass);
-        e.SetRenderPipeline(pipeline);
+        e.SetRenderPipeline(pipeline, Metal::Access::None); // textures only
         e.SetDepthStencil(depth_stencil);
         e.SetCullMode(Metal::CullMode::None);
         e.SetDepthBias(0.0f, 0.0f, 0.0f);

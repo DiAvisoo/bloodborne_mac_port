@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "video_core/renderer_metal/mtl_device_impl.h"
@@ -16,6 +19,20 @@ void RaiseTo(std::atomic<u64>& value, u64 tick) {
     while (known < tick &&
            !value.compare_exchange_weak(known, tick, std::memory_order_acq_rel)) {
     }
+}
+
+/// BB_METAL_HAZARD_TRACKING=1: tracked buffers, no fences (read once, logged once).
+bool HazardTrackingRequested() {
+    static const bool requested = [] {
+        const char* env = std::getenv("BB_METAL_HAZARD_TRACKING");
+        const bool on = env && std::strcmp(env, "1") == 0;
+        if (on) {
+            std::printf("Metal: hazard tracking on every buffer (BB_METAL_HAZARD_TRACKING=1); "
+                        "no explicit ordering\n");
+        }
+        return on;
+    }();
+    return requested;
 }
 
 } // namespace
@@ -38,6 +55,21 @@ Device::Device(void* mtl_device, void* mtl_queue) : impl{std::make_unique<Impl>(
         name = impl->device.name.UTF8String;
         limits.max_buffer_length = impl->device.maxBufferLength;
         limits.recommended_working_set = impl->device.recommendedMaxWorkingSetSize;
+        hazard_tracking = HazardTrackingRequested();
+        if (!hazard_tracking) {
+            // Every fence gets one update before any wait, so waits never depend on whether a
+            // fence was used yet (OrderTracker::OpenAhead waits on all of them).
+            id<MTLCommandBuffer> prime = [impl->queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [prime blitCommandEncoder];
+            for (u32 i = 0; i < OrderTracker::NumFences; ++i) {
+                impl->fences[i] = [impl->device newFence];
+                ASSERT_MSG(impl->fences[i], "No Metal fence");
+                [blit updateFence:impl->fences[i]];
+            }
+            [blit endEncoding];
+            [prime commit];
+            [prime waitUntilCompleted];
+        }
     }
 }
 

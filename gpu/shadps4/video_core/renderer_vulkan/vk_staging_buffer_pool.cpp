@@ -88,6 +88,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
             .last_used_frame = frame,
         });
         ring.current = ring.blocks.size() - 1;
+        Notify(*best->buffer, true);
         best_offset = *best->buffer->Reserve(size, alignment, false);
     }
 
@@ -130,6 +131,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
             .last_used_frame = frame,
             .held = false,
         });
+        Notify(*best->buffer, true);
     }
 
     best->tick = scheduler.CurrentTick();
@@ -178,6 +180,7 @@ void StagingBufferPool::TrimRing(Ring& ring) {
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }
+        Notify(*block.buffer, false);
         blocks.erase(blocks.begin() + i);
         if (i < ring.current) {
             --ring.current;
@@ -192,8 +195,12 @@ void StagingBufferPool::TrimRing(Ring& ring) {
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
     std::erase_if(cache, [this](const LargeBuffer& entry) {
-        return !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
-               scheduler.IsFree(entry.tick);
+        const bool idle = !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
+                          scheduler.IsFree(entry.tick);
+        if (idle) {
+            Notify(*entry.buffer, false);
+        }
+        return idle;
     });
 }
 

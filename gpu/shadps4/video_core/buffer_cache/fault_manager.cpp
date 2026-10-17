@@ -61,7 +61,9 @@ void FaultManager::ProcessFaultBuffer() {
                       download_slot = fault_process.buffer_slot[1], fault = fault_buffer.Ref(),
                       download = download_buffer.Ref(offset), num_workgroups,
                       group_size](Metal::Encoder& e) {
-        e.SetComputePipeline(pipeline);
+        // Takes the bits with an atomic exchange (not a write in the ordering's sense: bits set
+        // by work still running are processed next time) and writes the tracked download buffer.
+        e.SetComputePipeline(pipeline, Metal::Access::Read);
         e.SetBuffer(Metal::Stage::Compute, fault_slot, fault);
         e.SetBuffer(Metal::Stage::Compute, download_slot, download);
         e.Dispatch({num_workgroups, 1, 1}, {group_size, 1, 1});

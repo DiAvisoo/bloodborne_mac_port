@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -44,6 +45,12 @@ public:
     /// Releases idle memory.
     void TickFrame();
 
+    /// bbport: called with every device-local buffer the pool creates (`alive`) and before it
+    /// releases one (the Runtime orders them: Runtime::RegisterOrdered).
+    void SetDeviceLocalHook(std::function<void(const VideoCore::Buffer*, u64, bool)> hook) {
+        device_local_hook = std::move(hook);
+    }
+
 private:
     struct Block {
         std::unique_ptr<VideoCore::StreamBuffer> buffer;
@@ -75,6 +82,12 @@ private:
 
     Metal::Device& device;
     Scheduler& scheduler;
+    std::function<void(const VideoCore::Buffer*, u64, bool)> device_local_hook;
+    void Notify(const VideoCore::Buffer& buffer, bool alive) const {
+        if (device_local_hook && buffer.mem_type == VideoCore::MemoryType::DeviceLocal) {
+            device_local_hook(&buffer, buffer.SizeBytes(), alive);
+        }
+    }
 
     std::array<Ring, NUM_TYPES> rings;
     u64 keep_blocks = 0; ///< bbport: ring blocks never trimmed

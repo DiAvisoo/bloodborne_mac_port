@@ -11,10 +11,12 @@ namespace Metal {
 
 namespace {
 
-MTLResourceOptions OptionsFor(VideoCore::MemoryType type) {
+MTLResourceOptions OptionsFor(const Device& device, VideoCore::MemoryType type) {
     switch (type) {
     case VideoCore::MemoryType::DeviceLocal:
-        return MTLResourceStorageModePrivate;
+        // Untracked: the Encoder orders them (mtl_order.h); shared buffers stay tracked.
+        return MTLResourceStorageModePrivate |
+               (device.HazardTracking() ? 0 : MTLResourceHazardTrackingModeUntracked);
     case VideoCore::MemoryType::HostUncached:
         return MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined;
     case VideoCore::MemoryType::HostCached:
@@ -31,7 +33,7 @@ Object CreateBuffer(Device& device, u64 size, VideoCore::MemoryType type, std::s
     *gpu_address = 0;
     *contents = nullptr;
     id<MTLDevice> mtl_device = (__bridge id<MTLDevice>)device.NativeDevice();
-    id<MTLBuffer> buffer = [mtl_device newBufferWithLength:size options:OptionsFor(type)];
+    id<MTLBuffer> buffer = [mtl_device newBufferWithLength:size options:OptionsFor(device, type)];
     if (buffer == nil) {
         return {};
     }

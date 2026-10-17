@@ -227,7 +227,7 @@ bool Prepare(Encoder& e, const DrawPipeline& p, const DrawState& s) {
     if (CheckDraw(e, p, s) != Skip::None) {
         return false;
     }
-    e.SetRenderPipeline(p.state);
+    e.SetRenderPipeline(p.state, p.buffers);
     e.SetFillMode(p.fill);
     e.SetDepthClip(p.depth_clip);
     e.SetCullMode(s.cull);
@@ -481,7 +481,7 @@ bool Runs::Dispatch(Encoder& e, const ComputeView& c, std::span<const Bound> bou
         ++counters.skipped_no_pipeline;
         return false;
     }
-    e.SetComputePipeline(c.state);
+    e.SetComputePipeline(c.state, c.buffers);
     BindStage(e, Stage::Compute, *c.shader, bound, push, nulls);
     e.Dispatch(groups, c.threads_per_group);
     ++counters.dispatches;
@@ -495,7 +495,7 @@ bool Runs::DispatchIndirect(Encoder& e, const ComputeView& c, std::span<const Bo
         ++counters.skipped_no_pipeline;
         return false;
     }
-    e.SetComputePipeline(c.state);
+    e.SetComputePipeline(c.state, c.buffers);
     BindStage(e, Stage::Compute, *c.shader, bound, push, nulls);
     e.DispatchIndirect(args, c.threads_per_group);
     ++counters.dispatches;

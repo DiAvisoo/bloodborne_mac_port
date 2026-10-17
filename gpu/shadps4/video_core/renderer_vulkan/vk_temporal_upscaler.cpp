@@ -485,7 +485,7 @@ bool TemporalUpscaler::RecordReactive(void* color) {
     scheduler.Record([kernel = &reactive_kernel, opaque = opaque_image.Get(), color,
                       mask = reactive_image.Get(), params, w = width,
                       h = height](Metal::Encoder& e) {
-        e.SetComputePipeline(kernel->pipeline.Get());
+        e.SetComputePipeline(kernel->pipeline.Get(), Metal::Access::None); // textures only
         e.SetTexture(Metal::Stage::Compute, kernel->texture_slot[0], opaque);
         e.SetTexture(Metal::Stage::Compute, kernel->texture_slot[1], color);
         e.SetTexture(Metal::Stage::Compute, kernel->texture_slot[2], mask);
@@ -515,7 +515,7 @@ void TemporalUpscaler::RecordMerge(void* scene, bool has_reactive) {
     scheduler.Record([kernel = &merge_kernel, output = output_image.Get(), scene,
                       mask = reactive_image.Get(), motion, objects, mode, w = out_width,
                       h = out_height](Metal::Encoder& e) {
-        e.SetComputePipeline(kernel->pipeline.Get());
+        e.SetComputePipeline(kernel->pipeline.Get(), Metal::Access::None); // textures only
         e.SetTexture(Metal::Stage::Compute, kernel->texture_slot[0], output);
         e.SetTexture(Metal::Stage::Compute, kernel->texture_slot[1], scene);
         e.SetTexture(Metal::Stage::Compute, kernel->texture_slot[2], mask);

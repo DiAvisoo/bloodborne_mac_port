@@ -17,8 +17,10 @@
 #include <vector>
 #include "video_core/renderer_metal/mtl_blit_shaders.h"
 #include "video_core/renderer_metal/mtl_buffer.h"
+#include "video_core/renderer_metal/mtl_buffer_barriers.h"
 #include "video_core/renderer_metal/mtl_counters.h"
 #include "video_core/renderer_metal/mtl_object.h"
+#include "video_core/renderer_metal/mtl_order.h"
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
 #include "video_core/renderer_metal/mtl_depth_stencil.h"
@@ -1156,6 +1158,12 @@ void TestBufferCreation() {
     Expect(stream_contents != nullptr, "Stream buffer has CPU contents");
     Expect(private_contents == nullptr, "DeviceLocal buffer has no CPU contents");
     Expect(stream_address != 0 && private_address != 0, "both buffers have a GPU address");
+    Expect(([(__bridge id<MTLBuffer>)priv.Get() hazardTrackingMode] ==
+            MTLHazardTrackingModeUntracked) != device.HazardTracking(),
+           "DeviceLocal buffers are untracked (the Encoder orders them) unless "
+           "BB_METAL_HAZARD_TRACKING=1");
+    Expect([(__bridge id<MTLBuffer>)stream.Get() hazardTrackingMode] != MTLHazardTrackingModeUntracked,
+           "shared buffers stay tracked");
 }
 
 void TestTextures() {
@@ -1949,6 +1957,371 @@ void TestComputeEncoderAccess() {
     Expect(device.ErrorCount() == 0, "compute encoder access ran without errors");
 }
 
+// ---- Explicit ordering of untracked buffers (mtl_order.h) ----
+
+void TestOrderTracker() {
+    using Metal::Access;
+    using Metal::HazardClass;
+    using T = Metal::OrderTracker;
+    const auto end = [](u32 k) { return T::SlotFence(HazardClass::Memory, k); };
+    const auto vtx = [](u32 k) { return T::SlotFence(HazardClass::Memory, k, T::VertexDone); };
+    const auto motion = [](u32 k) { return T::SlotFence(HazardClass::MotionHistory, k); };
+    const T::Accesses read{Access::Read, Access::None}, write{Access::Write, Access::None};
+    {
+        T t; // no barrier: encoders do not wait for each other (RAR, and caller-ordered accesses)
+        const auto a = t.Open(read), b = t.Open(read, Metal::Lane::Render);
+        Expect(a.num_waits == 0 && b.num_waits == 0, "order: encoders without a barrier do not wait");
+        Expect(a.Updates(end(0)) && a.num_updates == 1, "order: a compute or blit encoder updates its end");
+        Expect(b.Updates(vtx(1)) && b.Updates(end(1)),
+               "order: a render encoder updates its vertex stage and its end");
+    }
+    {
+        T t; // a full barrier: the next encoders wait for the ends of every encoder before it
+        t.Open(read);
+        t.Open(read, Metal::Lane::Render);
+        t.Barrier(HazardClass::Memory, Metal::ScopeAll);
+        const auto c = t.Open(read), d = t.Open(read);
+        Expect(c.Waits(end(0)) && c.Waits(end(1)) && d.Waits(end(0)) && d.Waits(end(1)),
+               "order: after a full barrier every encoder waits for the encoders before");
+        Expect(!c.Waits(vtx(1)), "order: ... for their ends, not their vertex stages");
+        Expect(!d.Waits(c.updates[0]), "order: encoders after a barrier do not wait for each other");
+        Expect(c.Waits(T::AheadFence), "order: after a full barrier, Memory encoders wait for the "
+                                       "uploads ahead");
+        Expect(!c.Updates(end(0)) && !c.Updates(end(1)), "order: slots still waited on are not reused");
+        t.Barrier(HazardClass::Memory, Metal::ScopeAll);
+        const auto e = t.Open(read);
+        Expect(e.Waits(c.updates[0]) && e.Waits(d.updates[0]) && !e.Waits(end(0)),
+               "order: the next barrier waits for the encoders after the last (earlier ones "
+               "transitively)");
+    }
+    {
+        T t; // scoped barriers: a barrier on copies does not wait for render passes
+        t.Open(read, Metal::Lane::Render); // slot 0, render pass
+        t.Open(read, Metal::Lane::Copy);    // slot 1, copy
+        t.Open(read, Metal::Lane::Compute); // slot 2, dispatch
+        t.Barrier(HazardClass::Memory, Metal::ScopeCopyEnd);
+        const auto a = t.Open(read, Metal::Lane::Copy); // slot 3
+        Expect(a.Waits(end(1)) && !a.Waits(end(0)) && !a.Waits(vtx(0)),
+               "order: RAW/WAW on a copy waits for copy encoders only, not render passes");
+        Expect(!a.Waits(end(2)), "order: ... nor compute dispatches");
+        // WAR against vertex-stage reads: render passes' vertex stages.
+        t.Barrier(HazardClass::Memory, Metal::ScopeRenderVertex);
+        const auto b = t.Open(read); // slot 4
+        Expect(b.Waits(vtx(0)) && !b.Waits(end(0)), "order: a vertex barrier waits for vertex stages");
+        Expect(b.Waits(end(1)), "order: ... and still for the copy (slot 0 opened before the copy "
+                                "barrier, so its vertex stage does not stand for it)");
+        // A later barrier on render ends still waits for slot 0's end (only its vertex stage
+        // was waited for), and for none of the copies already waited for.
+        t.Barrier(HazardClass::Memory, Metal::ScopeRenderEnd);
+        const auto c = t.Open(read);
+        Expect(c.Waits(end(0)), "order: a render barrier waits for the render ends not yet waited for");
+        Expect(!c.Waits(end(3)) && !c.Waits(end(2)), "order: ... and not for copies or dispatches");
+    }
+    {
+        T t; // waits carry over until an encoder standing for them is waited for
+        t.Open(read, Metal::Lane::Copy);   // slot 0, copy
+        t.Open(read, Metal::Lane::Render); // slot 1, render
+        t.Barrier(HazardClass::Memory, Metal::ScopeCopyEnd);
+        t.Open(read, Metal::Lane::Render); // slot 2 waits for 0
+        t.Barrier(HazardClass::Memory, Metal::ScopeRenderVertex); // covers 1 and 2 (vertex)
+        const auto d = t.Open(read, Metal::Lane::Render);
+        Expect(d.Waits(vtx(1)) && d.Waits(vtx(2)), "order: the vertex barrier waits for both passes");
+        Expect(!d.Waits(end(0)), "order: slot 2 waited for slot 0 before its vertex stage: implied");
+    }
+    {
+        T t; // slots of command buffers known complete need no waiting
+        t.Open(read, Metal::Lane::Copy, 5, 0); // slot 0, tick 5
+        t.Barrier(HazardClass::Memory, Metal::ScopeCopyEnd);
+        Expect(t.Open(read, Metal::Lane::Copy, 6, 4).Waits(end(0)), "order: tick 5 not complete: waited");
+        Expect(!t.Open(read, Metal::Lane::Copy, 6, 5).Waits(end(0)), "order: tick 5 complete: dropped");
+    }
+    {
+        T t; // the uploads ahead: waited for after a barrier naming them, until implied
+        t.Open(read, Metal::Lane::Copy);
+        t.Barrier(HazardClass::Memory, Metal::ScopeCopyEnd);
+        Expect(!t.Open(read).Waits(T::AheadFence), "order: a copy barrier does not wait for uploads");
+        t.Barrier(HazardClass::Memory, Metal::ScopeAhead);
+        const auto a = t.Open(read, Metal::Lane::Copy);
+        Expect(a.Waits(T::AheadFence), "order: RAW on an upload's range waits for the uploads");
+        t.Barrier(HazardClass::Memory, Metal::ScopeCopyEnd);
+        Expect(!t.Open(read, Metal::Lane::Copy).Waits(T::AheadFence),
+               "order: ... until an encoder that waited for them is waited for");
+    }
+    {
+        T t; // an empty epoch keeps the waits of the one before
+        t.Open(read);
+        t.Barrier(HazardClass::Memory);
+        t.Barrier(HazardClass::Memory);
+        t.Barrier(HazardClass::Memory, Metal::ScopeRenderVertex);
+        Expect(t.Open(read).Waits(end(0)), "order: a barrier with nothing since keeps the waits");
+    }
+    {
+        T t; // a write the caller does not order is isolated: after everything, before everything
+        t.Open(read, Metal::Lane::Render);
+        const auto w = t.Open(write);
+        Expect(w.Waits(end(0)), "order: an isolated write waits for every encoder before it");
+        const auto r = t.Open(read);
+        Expect(r.Waits(w.updates[0]), "order: the encoder after an isolated write waits for it");
+        Expect(!r.Waits(end(0)), "order: ... and not again for what the write already waited for");
+    }
+    {
+        T t; // more encoders than slots without a barrier: the reused slot stands for both
+        for (u32 i = 0; i < T::Slots; ++i) {
+            Expect(t.Open(read).num_waits == 0, "order: no chain while slots are free");
+        }
+        const auto wrapped = t.Open(read);
+        Expect(wrapped.Updates(end(0)) && wrapped.Waits(end(0)),
+               "order: a slot reused before a barrier waited for it is waited on first");
+    }
+    {
+        T t; // classes are independent; no access, no plan
+        t.Open(read);
+        t.Barrier(HazardClass::Memory);
+        const auto m = t.Open({Access::None, Access::Read}, Metal::Lane::Render);
+        Expect(m.num_waits == 0 && m.Updates(motion(0)) && m.num_updates == 1,
+               "order: motion history has its own barriers (one fence per encoder)");
+        Expect(t.Open({Access::None, Access::None}).Empty(), "order: no access, no fences");
+        t.Open({Access::None, Access::Read}, Metal::Lane::Render);
+        t.Barrier(HazardClass::MotionHistory);
+        const auto next = t.Open({Access::None, Access::Read}, Metal::Lane::Render);
+        Expect(next.Waits(motion(0)) && next.Waits(motion(1)) && !next.Waits(T::AheadFence),
+               "order: a motion barrier orders the next frame's motion passes");
+    }
+    {
+        // Uploads committed ahead: chained among themselves.
+        const auto ahead = T::OpenAhead();
+        Expect(ahead.num_waits == 1 && ahead.Waits(T::AheadFence) &&
+                   ahead.num_updates == 1 && ahead.Updates(T::AheadFence),
+               "order: an upload ahead waits for the uploads before it, and updates their fence");
+    }
+}
+
+void TestBufferBarriers() {
+    using Metal::ReadStage;
+    constexpr u8 render = Metal::EncoderRender, other = Metal::EncoderCopy;
+    Metal::BufferBarriers b;
+    int arena_storage = 0, other_storage = 0;
+    const void* arena = &arena_storage;
+    const void* unregistered = &other_storage;
+    b.Register(arena, 64ull << 20);
+    Expect(b.Registered(arena) && !b.Registered(unregistered), "barriers: registered buffers only");
+    // RAW: the writer's kind
+    b.Mark(arena, 0x1000, 0x100, true, other);
+    Expect(b.Conflicts(arena, 0x1080, 4, false) == Metal::ScopeCopyEnd,
+           "barriers: RAW, a read of a copy's write waits for compute and blit encoders");
+    Expect(b.Conflicts(arena, 0x3000, 4, false) == Metal::ScopeNone, "barriers: a read elsewhere does not");
+    Expect(b.Barrier(Metal::ScopeCopyEnd) == Metal::ScopeCopyEnd,
+           "barriers: a barrier after accesses retires them");
+    Expect(b.Conflicts(arena, 0x1080, 4, false) == Metal::ScopeNone,
+           "barriers: accesses before a barrier are ordered");
+    Expect(b.Barrier(Metal::ScopeAll) == Metal::ScopeNone,
+           "barriers: no barrier without accesses since the last");
+    // RAR, then WAR (late reads: render ends; vertex reads only: vertex stages)
+    b.Mark(arena, 0x8000, 0x2000, false, render);
+    Expect(b.Conflicts(arena, 0x8000, 0x10, false) == Metal::ScopeNone, "barriers: RAR, reads do not conflict");
+    Expect(b.Conflicts(arena, 0x9000, 0x10, true) == Metal::ScopeRenderEnd,
+           "barriers: WAR, a write over a fragment-stage read waits for render ends");
+    b.Barrier(Metal::ScopeAll);
+    b.Mark(arena, 0x8000, 0x2000, false, render, ReadStage::Vertex);
+    Expect(b.Conflicts(arena, 0x9000, 0x10, true) == Metal::ScopeRenderVertex,
+           "barriers: WAR, a write over vertex-stage reads waits for vertex stages");
+    b.Mark(arena, 0x20000, 8, true, other);
+    Expect(b.Barrier(Metal::ScopeRenderVertex) == Metal::ScopeRenderVertex,
+           "barriers: a vertex barrier retires vertex reads");
+    Expect(b.Conflicts(arena, 0x9000, 0x10, true) == Metal::ScopeNone,
+           "barriers: ... so the write is ordered after them");
+    Expect(b.Conflicts(arena, 0x20000, 8, false) == Metal::ScopeCopyEnd,
+           "barriers: ... but not other accesses");
+    // WAW; a tessellated draw's reads are in both kinds of encoder
+    Expect(b.Conflicts(arena, 0x20004, 8, true) == Metal::ScopeCopyEnd,
+           "barriers: WAW, a write over a copy's write waits for its kind");
+    b.Barrier(Metal::ScopeAll);
+    b.Mark(arena, 0x40000, 0x100, false, render | other, ReadStage::Vertex);
+    Expect(b.Conflicts(arena, 0x40000, 4, true) == (Metal::ScopeRenderVertex | Metal::ScopeCopyEnd),
+           "barriers: a read in kernels and a render pass needs both");
+    // Large ranges (whole chunks) and a page inside one
+    b.Barrier(Metal::ScopeAll);
+    b.Mark(arena, 0, 8ull << 20, false, other);
+    Expect(b.Conflicts(arena, (5ull << 20) + 12, 4, true) == Metal::ScopeCopyEnd,
+           "barriers: a write inside a range read as whole chunks conflicts");
+    Expect(b.Conflicts(arena, 9ull << 20, 4, true) == Metal::ScopeNone, "barriers: ... and outside it does not");
+    b.Barrier(Metal::ScopeAll);
+    b.Mark(arena, (3ull << 20) + 0x4000, 4, true, render);
+    Expect(b.Conflicts(arena, 0, 16ull << 20, false) == Metal::ScopeRenderEnd,
+           "barriers: a read over many chunks sees one written page");
+    Expect(b.Conflicts(arena, 0, 3ull << 20, false) == Metal::ScopeNone, "barriers: ... only where it is");
+    // Copies and dispatches are separate kinds
+    b.Barrier(Metal::ScopeAll);
+    b.Mark(arena, 0x50000, 0x100, true, Metal::EncoderCompute);
+    Expect(b.Conflicts(arena, 0x50000, 4, false) == Metal::ScopeComputeEnd,
+           "barriers: a read of a dispatch's write waits for dispatches only");
+    // Copies and draws: a draw reading a copy's write waits for copies
+    b.Barrier(Metal::ScopeAll);
+    b.Mark(arena, 0x80000, 0x40, true, other);
+    Expect(b.Conflicts(arena, 0x80000, 4, false) == Metal::ScopeCopyEnd,
+           "barriers: a read of a copy's write waits for the copies");
+    // Uploads hoisted ahead are their own kind
+    b.Barrier(Metal::ScopeAll);
+    b.Mark(arena, 0x60000, 0x40, true, Metal::EncoderAhead);
+    Expect(b.Conflicts(arena, 0x60010, 4, false) == Metal::ScopeAhead,
+           "barriers: a read of an upload's range waits for the uploads ahead");
+    // 256-byte blocks: neighbours in one page do not conflict
+    b.Barrier(Metal::ScopeAll);
+    b.Mark(arena, 0x70000, 0x40, false, render);
+    Expect(b.Conflicts(arena, 0x70100, 0x40, true) == Metal::ScopeNone,
+           "barriers: a write to another 256-byte block of the page does not conflict");
+    Expect(b.Conflicts(arena, 0x700c0, 0x80, true) == Metal::ScopeRenderEnd,
+           "barriers: ... a write to the same block does");
+    // Unregistered buffers: the Encoder orders them itself
+    Expect(b.Conflicts(unregistered, 0, 4, true) == Metal::ScopeNone,
+           "barriers: unregistered buffers never conflict");
+}
+
+constexpr const char* kOrderShaders = R"(
+#include <metal_stdlib>
+using namespace metal;
+// Spins, then stores `args.x` (spins keep the store late enough that an unordered reader in the
+// next encoder overtakes it).
+kernel void slow_store(device uint* buf [[buffer(0)]], constant uint2& args [[buffer(1)]],
+                       uint i [[thread_position_in_grid]]) {
+    uint x = i;
+    for (uint s = 0; s < args.y; ++s) x = x * 1664525u + 1013904223u;
+    buf[i] = x == 0xdeadbeefu && args.y == 3u ? 0u : args.x;
+}
+kernel void slow_copy(device const uint* buf [[buffer(0)]], device uint* out [[buffer(1)]],
+                      constant uint2& args [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    uint x = i;
+    for (uint s = 0; s < args.y; ++s) x = x * 1664525u + 1013904223u;
+    out[i] = x == 0xdeadbeefu && args.y == 3u ? 0u : buf[i];
+}
+)";
+
+constexpr u32 kOrderThreads = 16384;
+constexpr u32 kOrderSpins = 1u << 16;
+
+bool AllEqual(id<MTLBuffer> b, u32 value) {
+    for (u32 i = 0; i < kOrderThreads; ++i) {
+        if (static_cast<const u32*>(b.contents)[i] != value) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void TestUntrackedOrdering() {
+    Metal::Device device;
+    if (device.HazardTracking()) {
+        return; // BB_METAL_HAZARD_TRACKING=1: no explicit ordering to test
+    }
+    Metal::Encoder encoder{device};
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)device.NativeDevice();
+    NSError* error = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:@(kOrderShaders) options:nil error:&error];
+    if (!lib) {
+        std::printf("FAIL: order shaders: %s\n", error.localizedDescription.UTF8String);
+        ++failures;
+        return;
+    }
+    id<MTLComputePipelineState> store = Kernel(device, lib, @"slow_store");
+    id<MTLComputePipelineState> copy = Kernel(device, lib, @"slow_copy");
+    constexpr u32 kBytes = kOrderThreads * 4;
+    id<MTLBuffer> buf = [dev newBufferWithLength:kBytes
+                                         options:MTLResourceStorageModePrivate |
+                                                 MTLResourceHazardTrackingModeUntracked];
+    // `buf` is not ordered by the caller: the store is an isolated write (Access::Write, the
+    // default), the copy a read.
+    const auto Store = [&](Metal::Encoder& e, u32 value, u32 spins) {
+        const u32 args[2] = {value, spins};
+        e.SetComputePipeline((__bridge void*)store);
+        e.SetBuffer(Metal::Stage::Compute, 0, Ref(buf));
+        e.SetBytes(Metal::Stage::Compute, 1, args, sizeof(args));
+        e.Dispatch({kOrderThreads / 64, 1, 1}, {64, 1, 1});
+        e.EndEncoding(); // the next command opens another Metal encoder
+    };
+    const auto Copy = [&](Metal::Encoder& e, id<MTLBuffer> out, u32 spins) {
+        const u32 args[2] = {0, spins};
+        e.SetComputePipeline((__bridge void*)copy, Metal::Access::Read);
+        e.SetBuffer(Metal::Stage::Compute, 0, Ref(buf));
+        e.SetBuffer(Metal::Stage::Compute, 1, Ref(out));
+        e.SetBytes(Metal::Stage::Compute, 2, args, sizeof(args));
+        e.Dispatch({kOrderThreads / 64, 1, 1}, {64, 1, 1});
+        e.EndEncoding();
+    };
+    id<MTLBuffer> raw = SharedBuffer(device, kBytes), raw_cb = SharedBuffer(device, kBytes),
+                  war_old = SharedBuffer(device, kBytes), war_new = SharedBuffer(device, kBytes),
+                  ahead_out = SharedBuffer(device, kBytes), src = SharedBuffer(device, kBytes);
+    // RAW in one command buffer: a slow store, then a read in the next encoder.
+    Store(encoder, 1, kOrderSpins);
+    Copy(encoder, raw, 0);
+    device.Wait(encoder.Submit());
+    Expect(AllEqual(raw, 1), "untracked: a read in the next encoder sees a compute write");
+    // RAW across command buffers (the first is not waited for).
+    Store(encoder, 2, kOrderSpins);
+    encoder.Submit();
+    Copy(encoder, raw_cb, 0);
+    device.Wait(encoder.Submit());
+    Expect(AllEqual(raw_cb, 2), "untracked: a read in the next command buffer sees a compute write");
+    // WAR: a slow read, then a write in the next encoder must not overtake it.
+    Copy(encoder, war_old, kOrderSpins);
+    Store(encoder, 3, 0);
+    Copy(encoder, war_new, 0);
+    device.Wait(encoder.Submit());
+    Expect(AllEqual(war_old, 2), "untracked: a write does not overtake the read before it");
+    Expect(AllEqual(war_new, 3), "untracked: the write lands before the next read");
+    // Hoisted upload, as the scheduler records one: its range is not in use by work in flight
+    // (the store before it completed), and a read recorded after it behind a barrier on the
+    // uploads (as the renderer records one before a read of an uploaded range) sees it.
+    for (u32 i = 0; i < kOrderThreads; ++i) static_cast<u32*>(src.contents)[i] = 5;
+    Metal::Encoder upload{device, Metal::Ordering::Ahead};
+    Store(encoder, 4, kOrderSpins);
+    device.Wait(encoder.Submit());
+    upload.CopyBuffer(Ref(src), Ref(buf), kBytes);
+    encoder.OrderBarrier(Metal::HazardClass::Memory, Metal::ScopeAhead);
+    Copy(encoder, ahead_out, 0);
+    upload.SubmitUntracked();
+    device.Wait(encoder.Submit());
+    Expect(AllEqual(ahead_out, 5),
+           "untracked: a read after a barrier on the uploads sees the upload committed ahead");
+    // A buffer the caller orders: its writes are plain accesses, ordered by OrderBarrier.
+    id<MTLBuffer> arena = [dev newBufferWithLength:kBytes
+                                           options:MTLResourceStorageModePrivate |
+                                                   MTLResourceHazardTrackingModeUntracked];
+    device.OrderByCaller((__bridge void*)arena);
+    id<MTLBuffer> ordered_out = SharedBuffer(device, kBytes);
+    {
+        const u32 args[2] = {6, kOrderSpins};
+        encoder.SetComputePipeline((__bridge void*)store, Metal::Access::Read);
+        encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(arena));
+        encoder.SetBytes(Metal::Stage::Compute, 1, args, sizeof(args));
+        encoder.Dispatch({kOrderThreads / 64, 1, 1}, {64, 1, 1});
+        encoder.EndEncoding();
+        encoder.OrderBarrier(Metal::HazardClass::Memory);
+        const u32 copy_args[2] = {0, 0};
+        encoder.SetComputePipeline((__bridge void*)copy, Metal::Access::Read);
+        encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(arena));
+        encoder.SetBuffer(Metal::Stage::Compute, 1, Ref(ordered_out));
+        encoder.SetBytes(Metal::Stage::Compute, 2, copy_args, sizeof(copy_args));
+        encoder.Dispatch({kOrderThreads / 64, 1, 1}, {64, 1, 1});
+        device.Wait(encoder.Submit());
+    }
+    Expect(AllEqual(ordered_out, 6), "untracked: a barrier orders a caller-ordered write and read");
+    // A barrier on copies: a slow copy-lane kernel write, then a blit read of the same
+    // caller-ordered memory in the next encoder.
+    id<MTLBuffer> chain_out = SharedBuffer(device, kBytes);
+    for (u32 round = 0; round < 3; ++round) {
+        const u32 args[2] = {7 + round, kOrderSpins};
+        encoder.SetComputePipeline((__bridge void*)store, Metal::Access::Read, Metal::Lane::Copy);
+        encoder.SetBuffer(Metal::Stage::Compute, 0, Ref(arena));
+        encoder.SetBytes(Metal::Stage::Compute, 1, args, sizeof(args));
+        encoder.Dispatch({kOrderThreads / 64, 1, 1}, {64, 1, 1});
+        encoder.OrderBarrier(Metal::HazardClass::Memory, Metal::ScopeCopyEnd);
+        encoder.CopyBuffer(Ref(arena), Ref(chain_out), kBytes);
+        device.Wait(encoder.Submit());
+        Expect(AllEqual(chain_out, 7 + round), "untracked: a barrier on copies orders a copy's write");
+    }
+    Expect(device.ErrorCount() == 0, "untracked ordering ran without errors");
+}
+
 int main() {
     @autoreleasepool {
         TestObject();
@@ -1999,6 +2372,9 @@ int main() {
         TestTextureSlot100();
         TestDebugGroups();
         TestComputeEncoderAccess();
+        TestOrderTracker();
+        TestBufferBarriers();
+        TestUntrackedOrdering();
     }
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

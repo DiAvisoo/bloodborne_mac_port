@@ -5,6 +5,14 @@
 // clears or resolves costs nothing), blits and dispatches inside a pass end the render encoder
 // and the pass reopens with Load actions, and state reaches the Metal encoder only when it changed.
 // One thread uses an Encoder at a time.
+//
+// Untracked buffers (device-local ones, mtl_buffer.mm) are ordered by the Encoder with fences,
+// per Metal encoder and per hazard class (mtl_order.h has the rule): each Metal encoder it opens
+// declares what it does to untracked buffers (None, Read or Write) from the command that opens
+// it, and a later command that needs more (a write in an encoder opened to read) ends it and
+// opens another. Writes are blits into an untracked buffer and draws or dispatches whose
+// pipeline was set with Access::Write; every draw and dispatch reads (shaders reach guest memory
+// by address). Inside one Metal encoder nothing is ordered, as with hazard tracking.
 
 #pragma once
 
@@ -13,6 +21,7 @@
 #include <string_view>
 #include "common/types.h"
 #include "video_core/renderer_metal/mtl_object.h"
+#include "video_core/renderer_metal/mtl_order.h"
 
 namespace Metal {
 
@@ -26,6 +35,12 @@ enum class BlitAspect : u8 { All, Depth, Stencil };
 enum class Winding : u8 { Clockwise, CounterClockwise };
 enum class FillMode : u8 { Fill, Lines };
 enum class DepthClip : u8 { Clip, Clamp };
+/// Which stream of the queue an Encoder's command buffers belong to (mtl_order.h).
+enum class Ordering : u8 {
+    InOrder, ///< committed in the order recorded (the scheduler's encoder; one per device)
+    Ahead,   ///< committed before the InOrder encoder's current command buffer (hoisted uploads)
+};
+
 /// How render encoders use a buffer reached by GPU address (Encoder::DeclareIndirect).
 enum class IndirectUse : u8 {
     Read,        ///< read by vertex and fragment shaders (guest memory, page table)
@@ -66,7 +81,8 @@ struct RenderPassDesc {
     u32 width{}, height{}; ///< render area, used when there are no attachments
     /// A buffer this pass's vertex shaders read and write by GPU address (object motion
     /// history): declared on the pass's encoders like DeclareIndirect(VertexWrite), so hazard
-    /// tracking orders only the passes that use it.
+    /// tracking orders only the passes that use it. Untracked (the default), the pass's draws
+    /// are HazardClass::MotionHistory reads instead, ordered per frame (OrderBarrier).
     void* vertex_rw_buffer{};
 };
 
@@ -92,7 +108,7 @@ protected:
 
 class Encoder {
 public:
-    explicit Encoder(Device& device);
+    explicit Encoder(Device& device, Ordering ordering = Ordering::InOrder);
     ~Encoder();
 
     Encoder(const Encoder&) = delete;
@@ -104,7 +120,10 @@ public:
     [[nodiscard]] bool InRenderPass() const noexcept;
 
     // Render state: kept across passes, applied at the next draw.
-    void SetRenderPipeline(void* pipeline); ///< id<MTLRenderPipelineState>
+    /// id<MTLRenderPipelineState>; `buffers`: what its shaders do to untracked buffers (Write:
+    /// they store to guest buffers; Read: they only load, incl. by address; None: they use no
+    /// buffer, e.g. texture copies). Fault-buffer bits are not writes (mtl_order.h).
+    void SetRenderPipeline(void* pipeline, Access buffers = Access::Write);
     void SetDepthStencil(void* state);      ///< id<MTLDepthStencilState>; null: no depth/stencil test
     void SetViewport(const Viewport& viewport);
     void SetScissor(const Scissor& scissor);
@@ -157,14 +176,18 @@ public:
                      BufferRef patch_index_buffer, u32 instance_count, u32 base_instance);
 
     // Compute.
-    void SetComputePipeline(void* pipeline); ///< id<MTLComputePipelineState>
+    /// id<MTLComputePipelineState>; `buffers` as for SetRenderPipeline. `lane`: Lane::Copy for
+    /// copy kernels (the copy shader: their barriers do not wait for dispatches), else Compute.
+    void SetComputePipeline(void* pipeline, Access buffers = Access::Write,
+                            Lane lane = Lane::Compute);
     void Dispatch(Size3 groups, Size3 threads_per_group);
     /// Threadgroup counts (3 u32) are read from `args` on the GPU.
     void DispatchIndirect(BufferRef args, Size3 threads_per_group);
     /// The open compute encoder (id<MTLComputeCommandEncoder>, opened if needed) for kernels
     /// encoded outside the Encoder (tessellation and geometry emulation). The caller's pipeline
-    /// and slots are re-applied by its next Dispatch.
-    void* ComputeEncoder();
+    /// and slots are re-applied by its next Dispatch. `buffers`: what the caller's kernels do to
+    /// untracked buffers (as for SetComputePipeline).
+    void* ComputeEncoder(Access buffers = Access::Write);
 
     // Blits. Inside a render pass they end the render encoder; the pass continues afterwards.
     void CopyBuffer(BufferRef src, BufferRef dst, u64 size);
@@ -182,8 +205,8 @@ public:
                      u32 dst_level, u32 dst_slice, Origin3 dst_origin, Size3 size);
 
     /// Buffers shaders reach by GPU address, declared on every Metal encoder this Encoder opens
-    /// from now on (useResource) so they are resident and Metal's hazard tracking orders the
-    /// encoders that use them (the buffers must be tracked: the default for device buffers).
+    /// from now on (useResource) so they are resident and, for tracked buffers, Metal's hazard
+    /// tracking orders the encoders that use them (untracked buffers: the fences do).
     /// Compute encoders: read/write. Render encoders: read (vertex and fragment stages), or
     /// with VertexWrite read/write at the vertex stage. Declaring a buffer again changes its use.
     void DeclareIndirect(void* buffer, IndirectUse use = IndirectUse::Read);
@@ -193,6 +216,11 @@ public:
     /// Samples GPU timestamps at the start and end of every Metal encoder opened from now on
     /// into `sink` (null: stops). Sampling may keep the GPU from overlapping adjacent encoders.
     void SetTimestampSink(TimestampSink* sink);
+    /// Every command touching untracked memory of class `c` from now on waits for what `scopes`
+    /// names among the commands before (OrderTracker::Barrier): the renderer's arena barriers
+    /// (mtl_buffer_barriers.h) and object motion's frame start. Ends the open Metal encoder when
+    /// it touches `c`. No-op with hazard tracking and on Ahead encoders.
+    void OrderBarrier(HazardClass c, BarrierScopes scopes = ScopeAll);
     /// True while any slot, pipeline or render state is set (Submit clears all of it).
     [[nodiscard]] bool HasBindings() const noexcept;
 

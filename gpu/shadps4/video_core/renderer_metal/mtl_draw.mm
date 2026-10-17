@@ -90,18 +90,20 @@ bool Runs::Draw(Encoder& e, const Graphics& g, const DrawState& s, const Resourc
                 const DrawArgs& a) {
     if (g.tessellation) {
         // A tessellated draw continues the run: the waiting patch draws stay queued.
-        return DrawTessellated(e, *g.tessellation, s, r, a);
+        return DrawTessellated(e, *g.tessellation, g.buffers, s, r, a);
     }
     if (g.geometry) {
         EndRun(e);
-        return DrawGeometry(e, *g.geometry, s, r, a);
+        return DrawGeometry(e, *g.geometry, g.buffers, s, r, a);
     }
     if (!g.render) {
         EndRun(e);
         ++counters.skipped_no_pipeline;
         return false;
     }
-    return Draw(e, View(*g.render), s, r, a);
+    DrawPipeline view = View(*g.render);
+    view.buffers = g.buffers;
+    return Draw(e, view, s, r, a);
 }
 
 bool Runs::DrawIndirect(Encoder& e, const Graphics& g, const DrawState& s, const Resources& r,
@@ -114,13 +116,15 @@ bool Runs::DrawIndirect(Encoder& e, const Graphics& g, const DrawState& s, const
         return false;
     }
     if (g.geometry) {
-        return DrawGeometryIndirect(e, *g.geometry, s, r, a);
+        return DrawGeometryIndirect(e, *g.geometry, g.buffers, s, r, a);
     }
     if (!g.render) {
         ++counters.skipped_no_pipeline;
         return false;
     }
-    return DrawIndirect(e, View(*g.render), s, r, a);
+    DrawPipeline view = View(*g.render);
+    view.buffers = g.buffers;
+    return DrawIndirect(e, view, s, r, a);
 }
 
 bool Runs::Dispatch(Encoder& e, const ComputePipeline& c, std::span<const Bound> bound,
@@ -135,8 +139,8 @@ bool Runs::DispatchIndirect(Encoder& e, const ComputePipeline& c, std::span<cons
 
 /// A tessellated draw (as Huax-1839's RecordTessellationDraw): the vertex and control shaders as
 /// compute kernels writing scratch memory now, the patch draw at the end of the run (Flush).
-bool Runs::DrawTessellated(Encoder& e, const TessellationPipeline& t, const DrawState& s,
-                           const Resources& r, const DrawArgs& a) {
+bool Runs::DrawTessellated(Encoder& e, const TessellationPipeline& t, Access buffers,
+                           const DrawState& s, const Resources& r, const DrawArgs& a) {
     ++counters.tess_draws;
     if (last_draw_tess) {
         ++counters.tess_after_tess;
@@ -155,7 +159,8 @@ bool Runs::DrawTessellated(Encoder& e, const TessellationPipeline& t, const Draw
         ++counters.skipped_no_pipeline;
         return false;
     }
-    const DrawPipeline view = View(*t.render);
+    DrawPipeline view = View(*t.render);
+    view.buffers = buffers;
     // The patch draw would be skipped with the same state: spare the kernels.
     if (!Count(CheckDraw(e, view, s))) {
         return false;
@@ -181,7 +186,7 @@ bool Runs::DrawTessellated(Encoder& e, const TessellationPipeline& t, const Draw
     // Steps 1 and 2 (the run's kernels share one compute pass; the render pass reopens later).
     const auto plan = Tessellation::PlanScratch(t, patches);
     const BufferRef scratch = Scratch(e, plan.total);
-    void* enc = e.ComputeEncoder();
+    void* enc = e.ComputeEncoder(buffers);
     const auto bind = [&](const CompiledShader& shader) {
         BindKernelStage(enc, shader, r.bound, r.push, nulls);
     };
@@ -202,8 +207,8 @@ bool Runs::DrawTessellated(Encoder& e, const TessellationPipeline& t, const Draw
 /// A geometry-shader draw (as Huax-1839's RecordGeometryDraw): per chunk of primitives the
 /// export and geometry shaders as compute kernels writing vertex records and strip indices,
 /// then the strip draws (pass-through vertex function) in the reopened render pass.
-bool Runs::DrawGeometry(Encoder& e, const GeometryPipeline& g, const DrawState& s,
-                        const Resources& r, const DrawArgs& a) {
+bool Runs::DrawGeometry(Encoder& e, const GeometryPipeline& g, Access buffers,
+                        const DrawState& s, const Resources& r, const DrawArgs& a) {
     const u32 prims = g.info.input_vertices ? a.count / g.info.input_vertices : 0;
     if (!prims || !a.instances) {
         return false;
@@ -215,7 +220,8 @@ bool Runs::DrawGeometry(Encoder& e, const GeometryPipeline& g, const DrawState& 
         ++counters.skipped_no_pipeline;
         return false;
     }
-    const DrawPipeline view = View(*g.render);
+    DrawPipeline view = View(*g.render);
+    view.buffers = buffers;
     if (!Count(CheckDraw(e, view, s))) {
         return false;
     }
@@ -258,7 +264,7 @@ bool Runs::DrawGeometry(Encoder& e, const GeometryPipeline& g, const DrawState& 
             draw.first_vertex = params.first_vertex + u32(first_vertex);
         }
         // (Asked per chunk: Scratch may not end the compute encoder, but stays correct if so.)
-        void* enc = e.ComputeEncoder();
+        void* enc = e.ComputeEncoder(buffers);
         const auto bind = [&](const CompiledShader& shader) {
             BindKernelStage(enc, shader, r.bound, r.push, nulls);
         };
@@ -283,8 +289,8 @@ bool Runs::DrawGeometry(Encoder& e, const GeometryPipeline& g, const DrawState& 
 /// An indirect geometry-shader draw (as Huax-1839's RecordGeometryIndirectDraw): per record a
 /// prep kernel reads the guest's arguments into a control block that sizes the export and
 /// geometry kernels and the strip draw (mtl_geometry.h, "Indirect draws").
-bool Runs::DrawGeometryIndirect(Encoder& e, const GeometryPipeline& g, const DrawState& s,
-                                const Resources& r, const IndirectArgs& a) {
+bool Runs::DrawGeometryIndirect(Encoder& e, const GeometryPipeline& g, Access buffers,
+                                const DrawState& s, const Resources& r, const IndirectArgs& a) {
     if (!a.args.buffer || !a.count) {
         return false;
     }
@@ -311,7 +317,8 @@ bool Runs::DrawGeometryIndirect(Encoder& e, const GeometryPipeline& g, const Dra
         ++counters.skipped_emulated;
         return false;
     }
-    const DrawPipeline view = View(*g.render);
+    DrawPipeline view = View(*g.render);
+    view.buffers = buffers;
     if (!Count(CheckDraw(e, view, s))) {
         return false;
     }
@@ -347,7 +354,7 @@ bool Runs::DrawGeometryIndirect(Encoder& e, const GeometryPipeline& g, const Dra
             draw.index_limit =
                 r.indices.offset < length ? (length - r.indices.offset) / index_size : 0;
         }
-        void* enc = e.ComputeEncoder();
+        void* enc = e.ComputeEncoder(buffers);
         const auto bind = [&](const CompiledShader& shader) {
             BindKernelStage(enc, shader, r.bound, r.push, nulls);
         };

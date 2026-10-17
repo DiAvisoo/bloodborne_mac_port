@@ -99,6 +99,9 @@ struct DrawPipeline {
     const CompiledShader* vs{};
     const CompiledShader* fs{}; ///< null: depth-only
     std::span<const VertexBufferSlot> vertex_slots;
+    /// What the shaders do to untracked buffers (Encoder::SetRenderPipeline); the cache's
+    /// pipelines do not know, the rasterizer sets it from the guest shaders.
+    Access buffers{Access::Write};
 };
 
 /// The dynamic state of one draw, in the guest's (Vulkan) conventions.
@@ -209,6 +212,7 @@ struct ComputeView {
     void* state{}; ///< id<MTLComputePipelineState>
     const CompiledShader* shader{};
     Size3 threads_per_group{};
+    Access buffers{Access::Write}; ///< as DrawPipeline::buffers
 };
 ComputeView View(const ComputePipeline& p);
 
@@ -273,6 +277,7 @@ public:
         const RenderPipeline* render{};
         const TessellationPipeline* tessellation{};
         const GeometryPipeline* geometry{};
+        Access buffers{Access::Write}; ///< as DrawPipeline::buffers (every stage, kernels too)
     };
     /// Routes to the tessellation, geometry or plain path.
     bool Draw(Encoder& e, const Graphics& g, const DrawState& s, const Resources& r,
@@ -329,12 +334,12 @@ private:
     /// Ends a tessellation run before any other command.
     void EndRun(Encoder& e);
 
-    bool DrawTessellated(Encoder& e, const TessellationPipeline& t, const DrawState& s,
-                         const Resources& r, const DrawArgs& a);
-    bool DrawGeometry(Encoder& e, const GeometryPipeline& g, const DrawState& s,
+    bool DrawTessellated(Encoder& e, const TessellationPipeline& t, Access buffers,
+                         const DrawState& s, const Resources& r, const DrawArgs& a);
+    bool DrawGeometry(Encoder& e, const GeometryPipeline& g, Access buffers, const DrawState& s,
                       const Resources& r, const DrawArgs& a);
-    bool DrawGeometryIndirect(Encoder& e, const GeometryPipeline& g, const DrawState& s,
-                              const Resources& r, const IndirectArgs& a);
+    bool DrawGeometryIndirect(Encoder& e, const GeometryPipeline& g, Access buffers,
+                              const DrawState& s, const Resources& r, const IndirectArgs& a);
 
     Device& device;
     Nulls nulls;

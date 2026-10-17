@@ -56,7 +56,7 @@ std::array<float, 12> Multiply(const std::array<float, 12>& a, const std::array<
 
 void CameraMotion::Record(Metal::Encoder& encoder, const Metal::HostKernel& kernel, void* depth,
                           void* motion, void* object, const Params& params) {
-    encoder.SetComputePipeline(kernel.pipeline.Get());
+    encoder.SetComputePipeline(kernel.pipeline.Get(), Metal::Access::None); // textures only
     encoder.SetTexture(Metal::Stage::Compute, kernel.texture_slot[0], depth);
     encoder.SetTexture(Metal::Stage::Compute, kernel.texture_slot[1], motion);
     encoder.SetTexture(Metal::Stage::Compute, kernel.texture_slot[2], object);

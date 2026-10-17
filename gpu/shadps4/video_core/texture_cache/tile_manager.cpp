@@ -121,7 +121,15 @@ const Metal::HostKernel& TileManager::GetTilingKernel(const ImageInfo& info, boo
 
 void TileManager::RecordTilingDispatch(const Metal::HostKernel& kernel, const Buffer* tiled,
                                        u64 tiled_offset, const Buffer* linear, u64 linear_offset,
-                                       const void* params, u32 params_size, u32 dim_x) {
+                                       const void* params, u32 params_size, u32 dim_x,
+                                       bool tiled_written, u64 size) {
+    // Both buffers are the arena or device-local staging, which the Runtime orders: a plain
+    // access then (else an isolated write, ordered by the Encoder).
+    runtime.FlushBarriers(runtime.IsBufferAccessed(tiled, tiled_offset, size, tiled_written) |
+                          runtime.IsBufferAccessed(linear, linear_offset, size, !tiled_written));
+    const Metal::Access access = runtime.IsOrdered(tiled) && runtime.IsOrdered(linear)
+                                     ? Metal::Access::Read
+                                     : Metal::Access::Write;
     // The parameters are small (268 bytes): SetBytes copies them when the encoder runs, so the
     // recorded closure owns its own copy.
     std::array<u8, sizeof(TilingInfo)> params_copy;
@@ -130,8 +138,8 @@ void TileManager::RecordTilingDispatch(const Metal::HostKernel& kernel, const Bu
     scheduler.Record([pipeline = kernel.pipeline.Get(), tiled_slot = kernel.buffer_slot[0],
                       linear_slot = kernel.buffer_slot[1], params_slot = kernel.buffer_slot[2],
                       tiled_ref = tiled->Ref(tiled_offset), linear_ref = linear->Ref(linear_offset),
-                      params_copy, dim_x](Metal::Encoder& e) {
-        e.SetComputePipeline(pipeline);
+                      params_copy, dim_x, access](Metal::Encoder& e) {
+        e.SetComputePipeline(pipeline, access, Metal::Lane::Copy);
         e.SetBuffer(Metal::Stage::Compute, tiled_slot, tiled_ref);
         e.SetBuffer(Metal::Stage::Compute, linear_slot, linear_ref);
         e.SetBytes(Metal::Stage::Compute, params_slot, params_copy.data(),
@@ -165,16 +173,11 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
 
     const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
     RecordTilingDispatch(GetTilingKernel(info, false), in_buffer, in_offset, staging.buffer,
-                         staging.offset, &params, sizeof(params), dim_x);
+                         staging.offset, &params, sizeof(params), dim_x, false, info.guest_size);
     // bbport: the source may be the arena (BB_PREUPLOAD), which later uploads write: a copy into
     // it must wait for this read.
-    runtime.AccessBuffer(in_buffer, in_offset, info.guest_size,
-                         vk::PipelineStageFlagBits2::eComputeShader,
-                         vk::AccessFlagBits2::eShaderRead);
-
-    runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
-                         vk::PipelineStageFlagBits2::eComputeShader,
-                         vk::AccessFlagBits2::eShaderWrite);
+    runtime.AccessBuffer(in_buffer, in_offset, info.guest_size);
+    runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size, true);
 
     return {staging.buffer, staging.offset};
 }
@@ -212,11 +215,10 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
 
     const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
     RecordTilingDispatch(GetTilingKernel(info, true), out_buffer, out_offset, staging.buffer,
-                         staging.offset, &params, sizeof(params), dim_x);
+                         staging.offset, &params, sizeof(params), dim_x, true, info.guest_size);
 
-    runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
-                         vk::PipelineStageFlagBits2::eComputeShader,
-                         vk::AccessFlagBits2::eShaderWrite);
+    runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size);
+    runtime.AccessBuffer(out_buffer, out_offset, info.guest_size, true);
 }
 
 } // namespace VideoCore

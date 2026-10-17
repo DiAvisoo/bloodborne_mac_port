@@ -72,21 +72,37 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     }
     scheduler.EndRendering();
     const u64 src_size = src_max - src_min, dst_size = dst_max - dst_min;
+    // The arena's ordering (Runtime::IsBufferAccessed): a barrier when the ranges were used.
+    // (Exact ranges: the batch spans up to 64 KiB of scattered table entries.)
+    Metal::BarrierScopes need = Metal::ScopeNone;
+    for (const auto& copy : copies) {
+        if ((need & Metal::ScopeAll) == Metal::ScopeAll) {
+            break; // nothing more to find
+        }
+        need |= runtime.IsBufferAccessed(src, copy.src_offset, copy.size) |
+                runtime.IsBufferAccessed(dst, copy.dst_offset, copy.size, true);
+    }
+    runtime.FlushBarriers(need);
     const u32 count = static_cast<u32>(copies.size());
     scheduler.Record([pipeline = kernel.pipeline.Get(), src_slot = kernel.buffer_slot[0],
                       dst_slot = kernel.buffer_slot[1], table_slot = kernel.buffer_slot[2],
                       group_size = kernel.local_size, src = src->Ref(src_min),
                       dst = dst->Ref(dst_min), table = stream.Ref(table_offset),
                       count](Metal::Encoder& e) {
-        e.SetComputePipeline(pipeline);
+        // Guest memory only (the arena, ordered by the Runtime) and the stream buffer.
+        e.SetComputePipeline(pipeline, Metal::Access::Read, Metal::Lane::Copy);
         e.SetBuffer(Metal::Stage::Compute, src_slot, src);
         e.SetBuffer(Metal::Stage::Compute, dst_slot, dst);
         e.SetBuffer(Metal::Stage::Compute, table_slot, table);
         e.SetBytes(Metal::Stage::Compute, Metal::kPushConstantBuffer, &count, sizeof(count));
         e.Dispatch({count, 1, 1}, {group_size[0], group_size[1], group_size[2]});
     });
-    runtime.AccessBuffer(src, src_min, src_size);
-    runtime.AccessBuffer(dst, dst_min, dst_size);
+    runtime.NoteSubmissionUse(src, src_min, src_size);
+    runtime.NoteSubmissionUse(dst, dst_min, dst_size);
+    for (const auto& copy : copies) {
+        runtime.MarkAccess(src, copy.src_offset, copy.size, false);
+        runtime.MarkAccess(dst, copy.dst_offset, copy.size, true);
+    }
     return true;
 }
 

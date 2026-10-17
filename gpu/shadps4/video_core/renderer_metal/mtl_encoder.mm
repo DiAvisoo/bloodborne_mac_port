@@ -127,6 +127,63 @@ kernel void clamp_indirect_count(device const uint* records [[buffer(0)]],
 }
 )";
 
+/// A buffer whose hazards the Encoder orders (mtl_order.h).
+bool Untracked(void* buffer) {
+    return buffer && [(__bridge id<MTLBuffer>)buffer hazardTrackingMode] ==
+                         MTLHazardTrackingModeUntracked;
+}
+
+/// What a blit does to untracked memory: reads `src`, writes `dst` (either may be null). A write
+/// into a buffer the caller orders (Device::OrderByCaller: the arena) is a plain access; a
+/// write into any other untracked buffer is isolated (mtl_order.h).
+Access BlitAccess(const Device& device, void* src, void* dst) {
+    if (Untracked(dst)) {
+        return device.OrderedByCaller(dst) ? Access::Read : Access::Write;
+    }
+    return Untracked(src) ? Access::Read : Access::None;
+}
+
+/// True when every class of `open` allows `need`.
+bool Covers(const OrderTracker::Accesses& open, const OrderTracker::Accesses& need) {
+    for (u32 i = 0; i < NumHazardClasses; ++i) {
+        if (u8(open[i]) < u8(need[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void WaitFences(id<MTLRenderCommandEncoder> e, const OrderPlan& plan, const id<MTLFence>* fences) {
+    for (u32 i = 0; i < plan.num_waits; ++i) {
+        [e waitForFence:fences[plan.waits[i]] beforeStages:MTLRenderStageVertex];
+    }
+}
+/// Render encoders: a slot's vertex fence after the vertex stage, its end fence after the
+/// fragment stage; motion history after the vertex stage (only vertex shaders use it, so the
+/// next pass's vertices may overlap these fragments).
+void UpdateFences(id<MTLRenderCommandEncoder> e, const OrderPlan& plan, const id<MTLFence>* fences) {
+    for (u32 i = 0; i < plan.num_updates; ++i) {
+        const u32 f = plan.updates[i];
+        [e updateFence:fences[f]
+            afterStages:OrderTracker::IsVertexFence(f) ||
+                                 OrderTracker::ClassOf(f) == HazardClass::MotionHistory
+                            ? MTLRenderStageVertex
+                            : MTLRenderStageFragment];
+    }
+}
+template <typename E> // compute and blit encoders
+void WaitFences(E e, const OrderPlan& plan, const id<MTLFence>* fences) {
+    for (u32 i = 0; i < plan.num_waits; ++i) {
+        [e waitForFence:fences[plan.waits[i]]];
+    }
+}
+template <typename E>
+void UpdateFences(E e, const OrderPlan& plan, const id<MTLFence>* fences) {
+    for (u32 i = 0; i < plan.num_updates; ++i) {
+        [e updateFence:fences[plan.updates[i]]];
+    }
+}
+
 MTLBlitOption BlitOptions(BlitAspect aspect) {
     switch (aspect) {
     case BlitAspect::All:
@@ -142,9 +199,10 @@ MTLBlitOption BlitOptions(BlitAspect aspect) {
 } // namespace
 
 struct Encoder::Impl {
-    explicit Impl(Device& device_)
+    explicit Impl(Device& device_, Ordering ordering)
         : device{device_}, dev{(__bridge id<MTLDevice>)device_.NativeDevice()},
-          queue{(__bridge id<MTLCommandQueue>)device_.NativeQueue()} {}
+          queue{(__bridge id<MTLCommandQueue>)device_.NativeQueue()}, order{device_.Order()},
+          ahead{ordering == Ordering::Ahead}, fences{device_.GetImpl().fences.data()} {}
 
     Device& device;
     id<MTLDevice> dev;
@@ -154,6 +212,59 @@ struct Encoder::Impl {
     id<MTLComputeCommandEncoder> compute;
     id<MTLBlitCommandEncoder> blit;
     std::vector<Object> keep;
+
+    // Ordering of untracked buffers (mtl_order.h); `order` is null with hazard tracking.
+    OrderTracker* order;
+    bool ahead;
+    const id<MTLFence>* fences;
+    OrderTracker::Accesses open_access{}; ///< of the open render, compute or blit encoder
+    OrderPlan open_plan;                  ///< its updates, encoded when it ends
+    Access render_access{Access::Write}, compute_access{Access::Write}; ///< of the pipelines
+    Lane compute_lane{Lane::Compute}; ///< of the compute pipeline
+    Lane open_lane{};                 ///< of the open encoder
+
+    /// What a command needs (nothing with hazard tracking).
+    OrderTracker::Accesses Need(Access memory, Access motion = Access::None) const {
+        if (!order) {
+            return {};
+        }
+        return {memory, ahead ? Access::None : motion};
+    }
+    /// The fences of a Metal encoder opening with `need`.
+    OrderPlan Plan(const OrderTracker::Accesses& need, Lane lane) {
+        if (!order || (need[0] == Access::None && need[1] == Access::None)) {
+            return {};
+        }
+        if (ahead) {
+            if (need[u32(HazardClass::Memory)] == Access::None) {
+                return {};
+            }
+            return OrderTracker::OpenAhead();
+        }
+        return order->Open(need, lane, device.CurrentTick(), device.KnownGpuTick());
+    }
+    template <typename E>
+    void BeginOrdered(E e, const OrderTracker::Accesses& need, Lane lane) {
+        open_access = need;
+        open_lane = lane;
+        open_plan = Plan(need, lane);
+        WaitFences(e, open_plan, fences);
+    }
+    /// After a command: an isolated write ends its encoder, so the next command opens another
+    /// one after the barrier (mtl_order.h).
+    void AfterCommand(Access memory) {
+        if (order && !ahead && memory == Access::Write) {
+            EndRender();
+            EndCompute();
+            EndBlit();
+        }
+    }
+    template <typename E>
+    void EndOrdered(E e) {
+        UpdateFences(e, open_plan, fences);
+        open_plan = {};
+        open_access = {};
+    }
 
     // Render pass (Task 5).
     bool in_pass{}, pass_opened{}, pass_clears{};
@@ -361,6 +472,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
     void EndRender() {
         if (render) {
             CloseGroups(render);
+            EndOrdered(render);
             [render endEncoding];
             render = nil;
         }
@@ -368,6 +480,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
     void EndCompute() {
         if (compute) {
             CloseGroups(compute);
+            EndOrdered(compute);
             [compute endEncoding];
             compute = nil;
         }
@@ -375,6 +488,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
     void EndBlit() {
         if (blit) {
             CloseGroups(blit);
+            EndOrdered(blit);
             [blit endEncoding];
             blit = nil;
         }
@@ -430,7 +544,12 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
         }
     }
 
-    id<MTLBlitCommandEncoder> Blit() {
+    /// The open blit encoder, reopened when it was opened for less than `access` needs.
+    id<MTLBlitCommandEncoder> Blit(Access access = Access::None) {
+        const OrderTracker::Accesses need = Need(access);
+        if (blit && !Covers(open_access, need)) {
+            EndBlit();
+        }
         if (!blit) {
             FlushPendingClear();
             EndRender();
@@ -441,11 +560,17 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
                            ? [Cmd() blitCommandEncoderWithDescriptor:d]
                            : [Cmd() blitCommandEncoder];
             }
+            BeginOrdered(blit, need, Lane::Copy);
         }
         return blit;
     }
 
-    id<MTLComputeCommandEncoder> Compute() {
+    /// The open compute encoder, reopened when it was opened for less than `access` needs.
+    id<MTLComputeCommandEncoder> Compute(Access access, Lane lane) {
+        const OrderTracker::Accesses need = Need(access);
+        if (compute && (!Covers(open_access, need) || (order && open_lane != lane))) {
+            EndCompute();
+        }
         if (!compute) {
             FlushPendingClear();
             EndRender();
@@ -453,6 +578,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
             @autoreleasepool {
                 compute = NewCompute();
             }
+            BeginOrdered(compute, need, lane);
             DeclareOn(compute);
             compute_stage.Reapply();
             compute_pipeline_dirty = compute_pipeline != nullptr;
@@ -461,7 +587,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
     }
 
     void ApplyCompute() {
-        id<MTLComputeCommandEncoder> e = Compute();
+        id<MTLComputeCommandEncoder> e = Compute(compute_access, compute_lane);
         if (compute_pipeline_dirty) {
             [e setComputePipelineState:(__bridge id<MTLComputePipelineState>)compute_pipeline];
             compute_pipeline_dirty = false;
@@ -485,7 +611,14 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
         s.textures_dirty.Clear();
     }
 
-    id<MTLRenderCommandEncoder> Render() {
+    /// The open render encoder of the pass, reopened (Load) when it was opened for less than the
+    /// draw needs (`draw`: the pipeline's access; false: clears and resolves only).
+    id<MTLRenderCommandEncoder> Render(bool draw = false) {
+        const OrderTracker::Accesses need =
+            draw ? Need(render_access, pass_vertex_rw ? Access::Read : Access::None) : Need(Access::None);
+        if (render && !Covers(open_access, need)) {
+            EndRender();
+        }
         if (!render) {
             ASSERT_MSG(in_pass, "Draw outside a render pass");
             EndCompute();
@@ -497,6 +630,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
                 }
                 render = [Cmd() renderCommandEncoderWithDescriptor:pass];
             }
+            BeginOrdered(render, need, Lane::Render);
             pass_opened = true;
             DeclareOn(render);
             if (pass_vertex_rw) {
@@ -550,7 +684,7 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
     }
 
     void ApplyRender() {
-        id<MTLRenderCommandEncoder> e = Render();
+        id<MTLRenderCommandEncoder> e = Render(true);
         const u32 d = render_dirty;
         if (d & BitPipeline) {
             [e setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)render_pipeline];
@@ -633,7 +767,8 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
     }
 };
 
-Encoder::Encoder(Device& device) : impl{std::make_unique<Impl>(device)} {}
+Encoder::Encoder(Device& device, Ordering ordering)
+    : impl{std::make_unique<Impl>(device, ordering)} {}
 
 Encoder::~Encoder() {
     if (impl->in_pass) {
@@ -650,11 +785,13 @@ void Encoder::CopyBuffer(BufferRef src, BufferRef dst, u64 size) {
     if (size == 0) {
         return; // Metal rejects empty blits (MTL_DEBUG_LAYER aborts)
     }
-    [impl->Blit() copyFromBuffer:(__bridge id<MTLBuffer>)src.buffer
+    const Access access = BlitAccess(impl->device, src.buffer, dst.buffer);
+    [impl->Blit(access) copyFromBuffer:(__bridge id<MTLBuffer>)src.buffer
                     sourceOffset:src.offset
                         toBuffer:(__bridge id<MTLBuffer>)dst.buffer
                destinationOffset:dst.offset
                             size:size];
+    impl->AfterCommand(access);
 }
 
 void Encoder::FillBuffer(BufferRef dst, u64 size, u32 pattern) {
@@ -662,9 +799,11 @@ void Encoder::FillBuffer(BufferRef dst, u64 size, u32 pattern) {
         return; // Metal rejects empty blits (MTL_DEBUG_LAYER aborts)
     }
     if (pattern == u32(u8(pattern)) * 0x01010101u) {
-        [impl->Blit() fillBuffer:(__bridge id<MTLBuffer>)dst.buffer
+        const Access access = BlitAccess(impl->device, nullptr, dst.buffer);
+        [impl->Blit(access) fillBuffer:(__bridge id<MTLBuffer>)dst.buffer
                            range:NSMakeRange(dst.offset, size)
                            value:u8(pattern)];
+        impl->AfterCommand(access);
         return;
     }
     // Guest sizes (HTile clears) need not be whole words: fill the whole words only.
@@ -696,10 +835,12 @@ void Encoder::FillBuffer(BufferRef dst, u64 size, u32 pattern) {
     const u32 args[2] = {pattern, u32(size / 4)};
     @autoreleasepool {
         id<MTLComputeCommandEncoder> e = impl->NewCompute();
+        impl->BeginOrdered(e, impl->Need(BlitAccess(impl->device, nullptr, dst.buffer)), Lane::Copy);
         [e setComputePipelineState:pipeline];
         [e setBuffer:(__bridge id<MTLBuffer>)dst.buffer offset:dst.offset atIndex:0];
         [e setBytes:args length:sizeof(args) atIndex:1];
         [e dispatchThreads:MTLSizeMake(size / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        impl->EndOrdered(e);
         [e endEncoding];
     }
 }
@@ -707,7 +848,7 @@ void Encoder::FillBuffer(BufferRef dst, u64 size, u32 pattern) {
 void Encoder::CopyBufferToTexture(BufferRef src, u32 bytes_per_row, u32 bytes_per_image,
                                   void* texture, u32 level, u32 slice, Origin3 origin, Size3 size,
                                   BlitAspect aspect) {
-    [impl->Blit() copyFromBuffer:(__bridge id<MTLBuffer>)src.buffer
+    [impl->Blit(BlitAccess(impl->device, src.buffer, nullptr)) copyFromBuffer:(__bridge id<MTLBuffer>)src.buffer
                     sourceOffset:src.offset
                sourceBytesPerRow:bytes_per_row
              sourceBytesPerImage:bytes_per_image
@@ -722,7 +863,8 @@ void Encoder::CopyBufferToTexture(BufferRef src, u32 bytes_per_row, u32 bytes_pe
 void Encoder::CopyTextureToBuffer(void* texture, u32 level, u32 slice, Origin3 origin, Size3 size,
                                   BufferRef dst, u32 bytes_per_row, u32 bytes_per_image,
                                   BlitAspect aspect) {
-    [impl->Blit() copyFromTexture:(__bridge id<MTLTexture>)texture
+    const Access access = BlitAccess(impl->device, nullptr, dst.buffer);
+    [impl->Blit(access) copyFromTexture:(__bridge id<MTLTexture>)texture
                       sourceSlice:slice
                       sourceLevel:level
                      sourceOrigin:MTLOriginMake(origin.x, origin.y, origin.z)
@@ -732,6 +874,7 @@ void Encoder::CopyTextureToBuffer(void* texture, u32 level, u32 slice, Origin3 o
            destinationBytesPerRow:bytes_per_row
          destinationBytesPerImage:bytes_per_image
                           options:BlitOptions(aspect)];
+    impl->AfterCommand(access);
 }
 
 void Encoder::CopyTexture(void* src, u32 src_level, u32 src_slice, Origin3 src_origin, void* dst,
@@ -814,6 +957,23 @@ void Encoder::RemoveIndirect(void* buffer) {
     std::erase_if(impl->indirect, [buffer](const Impl::Indirect& i) { return i.buffer == buffer; });
 }
 
+void Encoder::OrderBarrier(HazardClass c, BarrierScopes scopes) {
+    if (!impl->order || impl->ahead) {
+        return;
+    }
+    if (scopes == ScopeNone) {
+        return;
+    }
+    // Commands after the barrier must not share an encoder with the ones before it (the pass
+    // continues with Load, as after a blit).
+    if (impl->open_access[u32(c)] != Access::None) {
+        impl->EndRender();
+        impl->EndCompute();
+        impl->EndBlit();
+    }
+    impl->order->Barrier(c, scopes);
+}
+
 bool Encoder::HasBindings() const noexcept {
     const auto used = [](const StageState& s) {
         return s.buffers_used | s.textures_used.Any() | s.samplers_used;
@@ -883,7 +1043,9 @@ void Encoder::SetSampler(Stage stage, u32 slot, void* sampler) {
     s.samplers_used |= 1u << slot;
 }
 
-void Encoder::SetComputePipeline(void* pipeline) {
+void Encoder::SetComputePipeline(void* pipeline, Access buffers, Lane lane) {
+    impl->compute_access = buffers;
+    impl->compute_lane = lane;
     if (pipeline != impl->compute_pipeline) {
         impl->compute_pipeline = pipeline;
         impl->compute_pipeline_dirty = true;
@@ -897,6 +1059,7 @@ void Encoder::Dispatch(Size3 groups, Size3 threads_per_group) {
                   threadsPerThreadgroup:MTLSizeMake(threads_per_group.width,
                                                     threads_per_group.height,
                                                     threads_per_group.depth)];
+    impl->AfterCommand(impl->compute_access);
 }
 
 void Encoder::DispatchIndirect(BufferRef args, Size3 threads_per_group) {
@@ -907,10 +1070,11 @@ void Encoder::DispatchIndirect(BufferRef args, Size3 threads_per_group) {
                                     threadsPerThreadgroup:MTLSizeMake(threads_per_group.width,
                                                                       threads_per_group.height,
                                                                       threads_per_group.depth)];
+    impl->AfterCommand(impl->compute_access);
 }
 
-void* Encoder::ComputeEncoder() {
-    id<MTLComputeCommandEncoder> e = impl->Compute();
+void* Encoder::ComputeEncoder(Access buffers) {
+    id<MTLComputeCommandEncoder> e = impl->Compute(buffers, Lane::Compute);
     // The caller's kernels change the pipeline and slots: its next Dispatch applies them again.
     impl->compute_stage.Reapply();
     impl->compute_pipeline_dirty = impl->compute_pipeline != nullptr;
@@ -1021,7 +1185,8 @@ void Encoder::EndRenderPass() {
     impl->pass_vertex_rw = nullptr;
 }
 
-void Encoder::SetRenderPipeline(void* pipeline) {
+void Encoder::SetRenderPipeline(void* pipeline, Access buffers) {
+    impl->render_access = buffers;
     if (pipeline != impl->render_pipeline) {
         impl->render_pipeline = pipeline;
         impl->MarkRender(Impl::BitPipeline);
@@ -1102,6 +1267,7 @@ void Encoder::Draw(Primitive primitive, u32 vertex_count, u32 instance_count, u3
                      vertexCount:vertex_count
                    instanceCount:instance_count
                     baseInstance:first_instance];
+    impl->AfterCommand(impl->render_access);
 }
 
 void Encoder::DrawIndexed(Primitive primitive, u32 index_count, IndexType type, BufferRef indices,
@@ -1117,6 +1283,7 @@ void Encoder::DrawIndexed(Primitive primitive, u32 index_count, IndexType type, 
                           instanceCount:instance_count
                              baseVertex:base_vertex
                            baseInstance:first_instance];
+    impl->AfterCommand(impl->render_access);
 }
 
 void Encoder::DrawIndirect(Primitive primitive, BufferRef args) {
@@ -1125,6 +1292,7 @@ void Encoder::DrawIndirect(Primitive primitive, BufferRef args) {
     [impl->render drawPrimitives:ToMtl(primitive)
                   indirectBuffer:(__bridge id<MTLBuffer>)args.buffer
             indirectBufferOffset:args.offset];
+    impl->AfterCommand(impl->render_access);
 }
 
 void Encoder::DrawIndexedIndirect(Primitive primitive, IndexType type, BufferRef indices,
@@ -1138,6 +1306,7 @@ void Encoder::DrawIndexedIndirect(Primitive primitive, IndexType type, BufferRef
                       indexBufferOffset:indices.offset
                          indirectBuffer:(__bridge id<MTLBuffer>)args.buffer
                    indirectBufferOffset:args.offset];
+    impl->AfterCommand(impl->render_access);
 }
 
 void Encoder::DrawIndirectCount(Primitive primitive, BufferRef args, u32 stride, BufferRef count,
@@ -1162,12 +1331,15 @@ void Encoder::DrawIndirectCount(Primitive primitive, BufferRef args, u32 stride,
         scratch = [impl->dev newBufferWithLength:u64(max_count) * stride
                                          options:MTLResourceStorageModePrivate];
         id<MTLComputeCommandEncoder> e = impl->NewCompute();
+        // Reads the records and the count (guest memory); writes only its own tracked scratch.
+        impl->BeginOrdered(e, impl->Need(Access::Read), Lane::Compute); // part of a draw
         [e setComputePipelineState:pipeline];
         [e setBuffer:(__bridge id<MTLBuffer>)args.buffer offset:args.offset atIndex:0];
         [e setBuffer:(__bridge id<MTLBuffer>)count.buffer offset:count.offset atIndex:1];
         [e setBytes:params length:sizeof(params) atIndex:2];
         [e setBuffer:scratch offset:0 atIndex:3];
         [e dispatchThreads:MTLSizeMake(max_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        impl->EndOrdered(e);
         [e endEncoding];
     }
     KeepAlive(Object::Retain((__bridge void*)scratch));
@@ -1192,6 +1364,7 @@ void Encoder::DrawPatches(u32 control_points, u32 patch_start, u32 patch_count,
        patchIndexBufferOffset:patch_index_buffer.offset
                 instanceCount:instance_count
                  baseInstance:base_instance];
+    impl->AfterCommand(impl->render_access);
 }
 
 void Encoder::PushDebugGroup(std::string_view label) {

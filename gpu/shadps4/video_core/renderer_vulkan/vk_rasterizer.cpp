@@ -133,7 +133,9 @@ Metal::Draw::Runs::Graphics DrawPipelines(const GraphicsPipeline& pipeline) {
     if (pipeline.Failed() || !pipeline.Render()) {
         return {};
     }
-    return {pipeline.Render(), pipeline.Tessellation(), pipeline.Geometry()};
+    // Guest shaders reach only the arena (ordered by the Runtime's barriers: a plain access for
+    // the Encoder) and tracked buffers.
+    return {pipeline.Render(), pipeline.Tessellation(), pipeline.Geometry(), Metal::Access::Read};
 }
 
 /// Recording thread: the same for a compute pipeline (an empty view: skipped and counted).
@@ -142,7 +144,10 @@ Metal::Draw::ComputeView ComputeView(const ComputePipeline& pipeline) {
     if (pipeline.Failed() || !pipeline.Compute()) {
         return {};
     }
-    return Metal::Draw::View(*pipeline.Compute());
+    Metal::Draw::ComputeView view = Metal::Draw::View(*pipeline.Compute());
+    view.buffers = Metal::Access::Read; // as DrawPipelines
+
+    return view;
 }
 
 /// Producer side: the draw may leave patch draws waiting in the draw runs (a tessellated draw;
@@ -1028,6 +1033,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
 
+    SetDrawEncoders(*pipeline);
     PrepareRenderState(pipeline);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
@@ -1170,6 +1176,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         .first_instance = first_instance,
         .indexed = is_indexed,
     };
+    OrderAccesses();
     // Right before the command: the copies share its chunk (push_data is final here).
     const Metal::Draw::Resources resources = RecordResources(is_indexed);
     // bbport: the pipeline may still be compiling on the creation pool; the recording thread
@@ -1246,6 +1253,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     // Indirect arguments may be GPU-written: leave these draws on camera fallback.
     motion_draw = false;
     motion_geometry = 0;
+    // (The count clamp and the indirect geometry kernels read the records in compute encoders.)
+    SetDrawEncoders(*pipeline, true);
     PrepareRenderState(pipeline);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
@@ -1265,11 +1274,13 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
 
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
+    NoteRead(buffer, base, stride * max_count);
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
     if (count_address != 0) {
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
+        NoteRead(count_buffer, count_offset, 4);
     }
 
     // bbport: screen-space (clip disabled) draws into the upscaler's output-size images.
@@ -1296,6 +1307,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         .count_buffer =
             count_address != 0 ? count_buffer->Ref(count_offset) : Metal::BufferRef{},
     };
+    OrderAccesses();
     const Metal::Draw::Resources resources = RecordResources(is_indexed);
     // Indirect tessellated draws are skipped by the helper (no run is left waiting).
     scheduler.RecordDraw(
@@ -1357,6 +1369,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         return;
     }
 
+    SetDrawEncoders(*pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
@@ -1371,6 +1384,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     // An empty grid is a no-op (as in Vulkan); Metal's validation rejects it.
     if (dim_x != 0 && dim_y != 0 && dim_z != 0) {
         const Metal::Size3 groups{dim_x, dim_y, dim_z};
+        OrderAccesses();
         const Metal::Draw::Resources resources = RecordResources(false);
         // Dispatches always wait for their pipeline: skipping one could leave its results
         // missing for later frames (a failed one is skipped and counted).
@@ -1411,16 +1425,19 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     scheduler.PopPendingOperations();
     const u32 offset = 0;
 
+    SetDrawEncoders(*pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
+    NoteRead(buffer, base, size, Metal::ReadStage::Late);
 
     scheduler.EndRendering();
 
     // The group counts are an argument of the dispatch (hazard-tracked by Metal).
     const Metal::BufferRef args = buffer->Ref(base);
+    OrderAccesses();
     const Metal::Draw::Resources resources = RecordResources(false);
     scheduler.RecordDraw(
         [=, runs = &scheduler.GetDrawRuns()](Metal::Encoder& e) {
@@ -1832,6 +1849,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
+        NoteRead(range.buffer, range.offset, size);
     }
 
     // The streams, by attribute location (fetch shader order, like guest_buffers). A V# without
@@ -1884,6 +1902,7 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+    NoteRead(buffer, offset, index_buffer_size);
     index_bind = {buffer->Ref(offset), is_index16 ? Metal::IndexType::U16 : Metal::IndexType::U32};
 }
 
@@ -1891,11 +1910,39 @@ void Rasterizer::ResetBindings() {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
-    for (const auto [buffer, offset, size] : bound_buffers) {
-        runtime.AccessBuffer(buffer, offset, size);
+    for (const auto [buffer, offset, size, is_written, read_stage, encoders] : bound_buffers) {
+        runtime.AccessBuffer(buffer, offset, size, is_written, encoders, read_stage);
+    }
+    for (const auto [buffer, offset, size, is_written, read_stage, encoders] : read_ranges) {
+        runtime.AccessBuffer(buffer, offset, size, is_written, encoders, read_stage);
     }
     bound_images.clear();
     bound_buffers.clear();
+    read_ranges.clear();
+    needs_barrier = Metal::ScopeNone;
+}
+
+void Rasterizer::NoteRead(const VideoCore::Buffer* buffer, u64 offset, u64 size,
+                          Metal::ReadStage stage) {
+    needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size);
+    read_ranges.push_back(
+        {buffer, offset, u32(std::min<u64>(size, ~0u)), false, stage, draw_encoders});
+}
+
+void Rasterizer::SetDrawEncoders(const Pipeline& pipeline, bool indirect) {
+    if (pipeline.IsCompute()) {
+        draw_encoders = Metal::EncoderCompute;
+        return;
+    }
+    const auto stages = pipeline.GetStages();
+    const bool kernels = stages[u32(Shader::SwStage::TessellationControl)] != nullptr ||
+                         stages[u32(Shader::SwStage::Geometry)] != nullptr;
+    draw_encoders = Metal::EncoderRender | (kernels || indirect ? Metal::EncoderCompute : 0);
+}
+
+void Rasterizer::OrderAccesses() {
+    runtime.FlushBarriers(needs_barrier);
+    needs_barrier = Metal::ScopeNone;
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -2100,6 +2147,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
             } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
                 const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
+                // bbport: direct memory access (BB_DIRECT_MEMORY_ACCESS=1) reads any guest
+                // memory by address: the whole arena and the page table, for the ordering.
+                const auto stage_of_read = stage.sw_stage == Shader::SwStage::Fragment ||
+                                                   stage.sw_stage == Shader::SwStage::Compute
+                                               ? Metal::ReadStage::Late
+                                               : Metal::ReadStage::Vertex;
+                NoteRead(bda_buffer, 0, bda_buffer->SizeBytes(), stage_of_read);
+                for (const auto& arena : buffer_cache.GetArenas()) {
+                    NoteRead(&arena, 0, arena.SizeBytes(), stage_of_read);
+                }
                 element = {.buffer = bda_buffer->Ref(), .size = bda_buffer->SizeBytes()};
             } else if (desc.buffer_type == Shader::BufferType::FaultBuffer) {
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
@@ -2158,7 +2215,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
                 push_data.AddOffset(binding.buffer, adjust);
                 element = {.buffer = buffer->Ref(offset_aligned), .size = size + adjust};
-                bound_buffers.emplace_back(buffer, offset, size);
+                needs_barrier |=
+                    runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                bound_buffers.emplace_back(buffer, offset, size, desc.is_written,
+                                           stage.sw_stage == Shader::SwStage::Fragment ||
+                                                   stage.sw_stage == Shader::SwStage::Compute
+                                               ? Metal::ReadStage::Late
+                                               : Metal::ReadStage::Vertex,
+                                           draw_encoders);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);

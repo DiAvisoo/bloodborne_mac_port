@@ -71,7 +71,7 @@ u32 NumericFlavour(u32 pixel_format) {
 
 /// Fullscreen-triangle render state over `rect`: what the rasterizer may have left is reset.
 void SetFullscreenState(Encoder& e, void* pipeline, const ScaleRect& rect) {
-    e.SetRenderPipeline(pipeline);
+    e.SetRenderPipeline(pipeline, Access::None); // textures only
     e.SetCullMode(CullMode::None);
     e.SetDepthBias(0.0f, 0.0f, 0.0f);
     e.SetFillMode(FillMode::Fill);

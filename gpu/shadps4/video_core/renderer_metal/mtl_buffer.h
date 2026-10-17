@@ -12,7 +12,8 @@ namespace Metal {
 
 class Device;
 
-/// Creates an MTLBuffer of `size` bytes: DeviceLocal is private storage, HostUncached is shared
+/// Creates an MTLBuffer of `size` bytes: DeviceLocal is private storage (untracked unless
+/// Device::HazardTracking(): Encoders order it, mtl_order.h), HostUncached is shared
 /// and write-combined, HostCached and Stream are shared. Returns an empty Object on failure.
 /// `gpu_address` receives the buffer's GPU address, `contents` the CPU pointer (null for
 /// DeviceLocal).

@@ -92,7 +92,7 @@ void PresentPasses::PostProcess(Encoder& encoder, void* input, void* output, u32
     pass.height = out_height;
     encoder.BeginRenderPass(pass);
     // Fullscreen-triangle state: whatever the rasterizer left is reset.
-    encoder.SetRenderPipeline(impl->post_process.Get());
+    encoder.SetRenderPipeline(impl->post_process.Get(), Access::None); // textures only
     encoder.SetDepthStencil(nullptr);
     encoder.SetCullMode(CullMode::None);
     encoder.SetDepthBias(0.0f, 0.0f, 0.0f);

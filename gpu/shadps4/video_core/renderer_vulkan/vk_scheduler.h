@@ -664,6 +664,8 @@ public:
     /// `ordered`: the copy may read or write memory that copies hoisted before it (in this call or
     /// earlier) wrote: each copy starts a new blit encoder (Metal does not document the order of
     /// copies within one).
+    /// The upload encoder's encoders are chained; the arena accesses after a barrier on the
+    /// uploads wait for them (Runtime::HoistCopy marks their ranges).
     void RecordHoistedCopy(Metal::BufferRef src, Metal::BufferRef dst,
                            std::span<const VideoCore::BufferCopy> copies, bool ordered = false);
 
@@ -926,7 +928,7 @@ private:
     Metal::Encoder encoder{device};
     /// bbport: this submission's hoisted copies, recorded on the calling thread while the
     /// recorder thread encodes into `encoder`.
-    Metal::Encoder upload_encoder{device};
+    Metal::Encoder upload_encoder{device, Metal::Ordering::Ahead};
     std::mutex upload_mutex; ///< upload_encoder and upload_open
     bool upload_open{};
     Metal::DepthStencilCache depth_stencil{device};

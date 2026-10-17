@@ -70,6 +70,11 @@ public:
         return bda_pagetable_buffer.get();
     }
 
+    /// bbport: the arenas (guest memory), for the ordering of address-reached reads.
+    [[nodiscard]] const std::deque<Buffer>& GetArenas() const noexcept {
+        return arenas;
+    }
+
     /// Retrieves the fault buffer.
     [[nodiscard]] Buffer* GetFaultBuffer() noexcept {
         return fault_manager->GetFaultBuffer();

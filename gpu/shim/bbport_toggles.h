@@ -99,6 +99,10 @@ inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0}, flips
 inline std::atomic<std::uint64_t> hoisted_copies{0};
 /// bbport: copy-shader copies recorded ahead of their submission, and those that could not be.
 inline std::atomic<std::uint64_t> hoisted_shader_copies{0}, inline_shader_copies{0};
+/// bbport: arena barriers recorded (Runtime::FlushBarriers: those waiting for render passes,
+/// and the others), and uploads not hoisted because their ranges were in use by a submission
+/// in flight.
+inline std::atomic<std::uint64_t> arena_barriers{0}, arena_other_barriers{0}, hoists_in_flight{0};
 /// Frames the GPU command thread has started (display pass), for per-frame diagnostics.
 inline std::atomic<std::uint64_t> gpu_frames{0};
 /// Wall time spent in operations suspected of stalls (ns, all threads).

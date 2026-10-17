@@ -56,9 +56,11 @@ public:
                                               const ImageInfo& info);
 
 private:
+    /// `tiled_written`: the dispatch writes the tiled buffer (tiling) and reads the linear one,
+    /// else the reverse (detiling); `size` bytes each. Orders both with the Runtime's barriers.
     void RecordTilingDispatch(const Metal::HostKernel& kernel, const Buffer* tiled, u64 tiled_offset,
                               const Buffer* linear, u64 linear_offset, const void* params,
-                              u32 params_size, u32 dim_x);
+                              u32 params_size, u32 dim_x, bool tiled_written, u64 size);
 
     const Metal::HostKernel& GetTilingKernel(const ImageInfo& info, bool is_tiler);
 

@@ -49,6 +49,8 @@ BufferCache::BufferCache(Metal::Device& device_, Vulkan::Scheduler& scheduler_,
                                                    blocks_per_arena_page * NUM_ARENA_PAGES);
     bda_pagetable_buffer = std::make_unique<Buffer>(device, MemoryType::DeviceLocal, 0,
                                                     bda_pagetable_size, "BDA Page Table Buffer");
+    // Its updates and the shaders' reads (direct memory access) are ordered by the Runtime.
+    runtime.RegisterOrdered(bda_pagetable_buffer.get(), bda_pagetable_size);
     runtime.FillBuffer(*bda_pagetable_buffer, 0u, bda_pagetable_size, 0u);
     // Shaders reach the page table by address.
     device.MakeResident(bda_pagetable_buffer->Handle());

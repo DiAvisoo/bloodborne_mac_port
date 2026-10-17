@@ -6,14 +6,19 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+#include "common/assert.h"
 #include "common/types.h"
+#include "video_core/renderer_metal/mtl_order.h"
 
 namespace Metal {
 
@@ -58,6 +63,7 @@ public:
         latest_end = std::max(latest_end, hi);
         std::erase_if(kept, [&](const auto& span) { return span.second < latest_end - horizon; });
         spans = std::move(kept);
+        added = std::max(added, 0.0); // rounding: never negative (callers convert to u64)
         total += added;
         return added;
     }
@@ -139,6 +145,34 @@ public:
     [[nodiscard]] u64 GpuBusyNs() const noexcept {
         return counters->gpu_busy_ns.load(std::memory_order_relaxed);
     }
+    /// False (the default): device-local buffers are untracked and Encoders order them with
+    /// fences (mtl_order.h). True with BB_METAL_HAZARD_TRACKING=1 (logged once): every buffer is
+    /// tracked and Metal orders them, as before (A/B comparisons, fallback).
+    [[nodiscard]] bool HazardTracking() const noexcept {
+        return hazard_tracking;
+    }
+    /// Untracked buffers whose ordering the renderer records itself (OrderBarrier at the
+    /// conflicts it finds, mtl_buffer_barriers.h): the guest arena, the page table, device-local
+    /// staging. Encoders treat writes into them as plain accesses instead of isolating them.
+    /// Call before recording uses of the buffer; `false` before releasing it (after its last
+    /// use completed).
+    void OrderByCaller(const void* buffer, bool ordered = true) {
+        std::scoped_lock lock{caller_ordered_mutex};
+        if (ordered) {
+            caller_ordered.insert(buffer);
+        } else {
+            caller_ordered.erase(buffer);
+        }
+    }
+    [[nodiscard]] bool OrderedByCaller(const void* buffer) const {
+        std::shared_lock lock{caller_ordered_mutex};
+        return caller_ordered.contains(buffer);
+    }
+    /// The ordering of untracked buffers for the in-order Encoder (null with HazardTracking()).
+    [[nodiscard]] OrderTracker* Order() noexcept {
+        return hazard_tracking ? nullptr : &order;
+    }
+
     /// Counts `command_buffer`'s (id<MTLCommandBuffer>, not committed yet) GPU interval in
     /// GpuBusyNs once it completes: for command buffers committed on other queues (present).
     void TrackGpuTime(void* command_buffer);
@@ -151,6 +185,10 @@ private:
     std::unordered_map<void*, u64> resident; ///< buffer -> length (residency_mutex)
     u64 resident_bytes{};                    ///< sum of `resident` (residency_mutex)
     std::atomic<u64> current_tick{1};
+    bool hazard_tracking{};
+    OrderTracker order;
+    mutable std::shared_mutex caller_ordered_mutex;
+    std::unordered_set<const void*> caller_ordered; ///< caller_ordered_mutex
     /// What completion handlers write. Shared with each handler, so a handler that runs after
     /// the Device is gone writes into memory it still owns.
     struct Counters {

@@ -45,7 +45,7 @@ Kernels Build(Metal::Device& device, std::span<const u32> taa_spirv) {
 void Record(Metal::Encoder& encoder, const Kernels& kernels, const Textures& textures,
             const Params& params, u32 width, u32 height) {
     const Metal::HostKernel& kernel = kernels.taa;
-    encoder.SetComputePipeline(kernel.pipeline.Get());
+    encoder.SetComputePipeline(kernel.pipeline.Get(), Metal::Access::None); // textures only
     // Bindings 0-3: combined image samplers; 4-6: storage images.
     const std::array<void*, 7> bound{textures.color,   textures.depth,        textures.motion,
                                      textures.history, textures.result,       textures.next_history,
@@ -63,7 +63,7 @@ void Record(Metal::Encoder& encoder, const Kernels& kernels, const Textures& tex
 
 void RecordSharpen(Metal::Encoder& encoder, const Metal::HostKernel& kernel, void* resolved,
                    void* output, float strength, u32 width, u32 height) {
-    encoder.SetComputePipeline(kernel.pipeline.Get());
+    encoder.SetComputePipeline(kernel.pipeline.Get(), Metal::Access::None); // textures only
     encoder.SetTexture(Metal::Stage::Compute, kernel.texture_slot[0], resolved);
     encoder.SetTexture(Metal::Stage::Compute, kernel.texture_slot[1], output);
     encoder.SetBytes(Metal::Stage::Compute, Metal::kPushConstantBuffer, &strength,

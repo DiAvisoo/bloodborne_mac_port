@@ -50,15 +50,16 @@ ObjectMotion::ObjectMotion(Metal::Device& device_, Scheduler& scheduler_)
     // nor orders the passes that use them on its own:
     //  - residency: the queue's residency set (MakeResident); parameters are also declared
     //    (useResource, read) on every encoder the scheduler's Encoder opens (DeclareIndirect);
-    //  - order: the buffers are tracked (Metal's default for device buffers) and declared, so
-    //    hazard tracking orders the encoders that use them, across command buffers too (one
-    //    queue). Positions are written by this frame's vertex shaders (current half) and read
-    //    by the next frame's (previous half), and the half read this frame is written two
-    //    frames on: they are declared read/write at the vertex stage on the passes of motion
-    //    pipelines only (Attach: RenderState::vertex_rw_buffer), which orders those stores and
-    //    loads (and the reuse) the way the Vulkan vertex-to-vertex barrier at frame start did.
-    //    Other passes and dispatches do not wait on them (declared read/write on every
-    //    encoder, they would order all of them).
+    //  - order: positions are written by this frame's vertex shaders (current half, each draw
+    //    its own range) and read by the next frame's (previous half), and the half read this
+    //    frame is written two frames on. Only the passes of motion pipelines use them
+    //    (Attach: RenderState::vertex_rw_buffer). The positions buffer is device-local, so
+    //    untracked (mtl_buffer.mm): those passes' draws are HazardClass::MotionHistory accesses
+    //    that do not wait for each other within a frame, and OnFrameStart's OrderBarrier orders
+    //    one frame's after the last frame's, as the Vulkan vertex-to-vertex barrier at frame
+    //    start did. With BB_METAL_HAZARD_TRACKING=1 it is tracked and declared read/write at
+    //    the vertex stage on those passes, so hazard tracking orders them (all of them).
+    //    Other passes and dispatches do not wait on it either way.
     //    Parameters are written by the CPU before the command buffer that reads them is
     //    committed and only read on the GPU (FrameSlots ring, params_ticks).
     device.MakeResident(params_buffer.Get());
@@ -117,8 +118,9 @@ void ObjectMotion::OnFrameStart() {
     }
     params_used = 0;
     written = false;
-    // Last frame's position stores before this frame's loads: hazard tracking on the positions
-    // buffer declared by the motion passes (constructor), no barrier to record.
+    // Last frame's position stores before this frame's loads, and this frame's stores after the
+    // loads two frames back (constructor): a phase boundary in the motion history's ordering.
+    scheduler.Record([](Metal::Encoder& e) { e.OrderBarrier(Metal::HazardClass::MotionHistory); });
 }
 
 u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {

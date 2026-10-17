@@ -10,6 +10,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_copy.h"
+#include "video_core/renderer_metal/mtl_buffer_barriers.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/types.h"
@@ -34,6 +35,8 @@ public:
     /// submission (Scheduler::RecordHoistedCopy) when nothing in this submission has used its
     /// destination yet; then the pass stays open. Tracked per 1 KiB page of registered buffers
     /// (the buffer cache arenas), with the submission's tick.
+    /// The buffer is also ordered by this Runtime's barriers (mtl_buffer_barriers.h; untracked:
+    /// Device::OrderByCaller), unless BB_METAL_HAZARD_TRACKING=1.
     void RegisterHoistTarget(const VideoCore::Buffer* buffer, u64 size);
     void NoteSubmissionUse(const VideoCore::Buffer* buffer, u64 offset, u64 size);
     /// Records the copies ahead of the submission and returns true, or false (nothing done)
@@ -107,13 +110,49 @@ public:
 
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
 
-    /// Metal hazard-tracks buffers: only the hoisting bookkeeping remains. The stage and access
-    /// arguments are unused (callers lose them in M3).
-    void AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                      vk::PipelineStageFlags2 src_stage = {}, vk::AccessFlags2 src_access = {});
-
-    /// No-op: there are no barriers to flush (callers are removed in M3).
-    void FlushBarriers(std::source_location where = std::source_location::current()) {}
+    /// bbport: ordering of the untracked arena (as the Vulkan renderer's barrier tracker):
+    /// a command first asks IsBufferAccessed for each range it reads or writes; when any is,
+    /// FlushBarriers before recording it; after recording it, AccessBuffer marks its ranges
+    /// (and the hoisting bookkeeping). Unregistered buffers are not tracked here: tracked ones
+    /// Metal orders, untracked ones the Encoder (an isolated write, mtl_order.h).
+    /// What a barrier before the access must wait for (RAW, WAR, WAW; ScopeNone: no barrier).
+    [[nodiscard]] Metal::BarrierScopes IsBufferAccessed(const VideoCore::Buffer* handle,
+                                                        u64 offset, u64 size,
+                                                        bool write = false) const;
+    /// The access is made by `encoders` (Metal::EncoderKinds: copies EncoderCopy, dispatches
+    /// EncoderCompute, draws EncoderRender), reads in render passes at `stage`.
+    void AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size, bool write = false,
+                      u8 encoders = Metal::EncoderCopy,
+                      Metal::ReadStage stage = Metal::ReadStage::Late);
+    /// The ordering half of AccessBuffer (no hoisting bookkeeping).
+    void MarkAccess(const VideoCore::Buffer* handle, u64 offset, u64 size, bool write,
+                    u8 encoders = Metal::EncoderCopy,
+                    Metal::ReadStage stage = Metal::ReadStage::Late) {
+        if (ordering) {
+            barriers.Mark(handle, offset, size, write, encoders, stage);
+        }
+    }
+    /// Orders `buffer` (untracked) with this Runtime's barriers (Device::OrderByCaller), until
+    /// UnregisterOrdered (before it is released).
+    void RegisterOrdered(const VideoCore::Buffer* buffer, u64 size);
+    void UnregisterOrdered(const VideoCore::Buffer* buffer);
+    /// Whether this Runtime orders `buffer` (else, untracked, the Encoder does).
+    [[nodiscard]] bool IsOrdered(const VideoCore::Buffer* buffer) const {
+        return ordering && barriers.Registered(buffer);
+    }
+    /// A recorded command that downloads textures into a staging range and uploads from it:
+    /// the barrier before it, and its marks after it (the command orders its two halves).
+    void BeginStagingRoundTrip(const VideoCore::Buffer* staging, u64 offset, u64 size);
+    void EndStagingRoundTrip(const VideoCore::Buffer* staging, u64 offset, u64 size);
+    /// Records a barrier (Metal::Encoder::OrderBarrier) when anything was accessed since the
+    /// last one: every command after it waits for every command before it.
+    /// Records a barrier waiting for `scopes` (Metal::Encoder::OrderBarrier), when anything is
+    /// to be ordered.
+    void FlushBarriers(Metal::BarrierScopes scopes);
+    /// Barriers recorded so far (BB_FRAME_STATS).
+    [[nodiscard]] u64 BarrierCount() const noexcept {
+        return barriers.Barriers();
+    }
 
     /// bbport: runs before this thread records commands on an image or changes its backing:
     /// the rasterizer joins its texture binding helper there (BindHelper).
@@ -149,6 +188,12 @@ private:
         u64 pages;
     };
     std::unordered_map<const VideoCore::Buffer*, HoistPages> hoist_targets;
+    /// Whether a hoisted copy's ranges were used by a submission still running (the upload then
+    /// waits for all work before it).
+    bool UsedInFlight(const VideoCore::Buffer* buffer,
+                      std::span<const VideoCore::BufferCopy> copies, bool source) const;
+    Metal::BufferBarriers barriers; ///< the arena's accesses since the last barrier
+    bool ordering;                  ///< the arena is untracked (no BB_METAL_HAZARD_TRACKING)
 
     void (*image_access_hook)(void*) = nullptr;
     void* image_access_context = nullptr;
