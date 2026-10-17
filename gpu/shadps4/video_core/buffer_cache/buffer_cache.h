@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "bbport_copy.h"
 
 #include <deque>
@@ -49,6 +51,9 @@ class BufferCache {
     static constexpr u64 MacArenaBase = 0x7000000000; ///< runtime_memory.c USER_MIN (macOS)
     static constexpr u64 MacArenaPages = 4; ///< 16 GiB of guest GPU address space (BB_ARENA_GIB)
     u64 mac_arena_end = 0; ///< end of the arena (smaller where Metal buffers are limited)
+    /// Highest arena offset requested so far, in 256 MiB steps (logged when it grows: how big
+    /// the arena needs to be; it is committed in full, ~1 GB of memory per GiB).
+    std::atomic<u64> arena_high_steps{0};
 
 public:
     /// Read-only bindings up to this size are copied into a stream buffer (bbport: public for

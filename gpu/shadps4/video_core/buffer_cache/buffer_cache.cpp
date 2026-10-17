@@ -419,6 +419,18 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
                "GPU buffer {:#x}..{:#x} outside the macOS guest arena (ends at {:#x}; limited by "
                "this Mac's largest Metal buffer)",
                first_block << block_shift, ((last_block + 1) << block_shift) - 1, mac_arena_end);
+    // bbport: how much of the arena the game reaches (BB_ARENA_GIB sizing).
+    const u64 end = ((last_block + 1) << block_shift) - MacArenaBase;
+    const u64 steps = (end + (256_MB - 1)) / 256_MB;
+    u64 seen = arena_high_steps.load(std::memory_order_relaxed);
+    while (steps > seen &&
+           !arena_high_steps.compare_exchange_weak(seen, steps, std::memory_order_relaxed)) {
+    }
+    if (steps > seen) {
+        std::printf("GPU arena: the game reached %.2f GiB of the %.0f GiB arena\n",
+                    double(steps * 256_MB) / double(1_GB),
+                    double(mac_arena_end - MacArenaBase) / double(1_GB));
+    }
     return first_arena;
 }
 

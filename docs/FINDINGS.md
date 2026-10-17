@@ -1176,3 +1176,24 @@ standing / spread of guest flip intervals):
   Present-to-present gaps stayed under 25 ms. Per launch, not per scene: backlog.
 - Pacing script notes: the game's stdout is block-buffered into a file, so a log-silence
   watchdog needs a pty (`script -q /dev/null bash run.sh`) or a long limit.
+
+## 2026-10-17: the GPU arena was committed in full (24 GB); lazy arena
+
+The user saw ~25 GB in Activity Monitor. Dense Cathedral Ward scene from the user's save
+(`save-backups/dense-20261017`), 2560x1440 native, 90 cap, `top` physical footprint:
+
+| Arena | GPU process | Game process | FPS standing / turning |
+|---|---|---|---|
+| 16 GiB private (default before) | 24 GB | 3.2 GB | 57.6 / 59.8 |
+| 8 GiB private | 15 GB | 3.3 GB | 57.6 |
+| 4 GiB private | 11 GB | 3.3 GB | 58.4 |
+| **16 GiB lazy (`BB_ARENA_LAZY`, default)** | **7.4 GB** | 3.2 GB | **59.1 / 59.8** |
+| 0.4.0 (MoltenVK) | 22 GB | 3.2 GB | 48.8 / 51.7 |
+
+- A private `MTLBuffer` is backed in full when created. The arena is now `vm_allocate`d memory
+  wrapped with `newBufferWithBytesNoCopy` (shared storage, untracked): only touched pages count.
+  Same FPS, images correct.
+- How much of the arena the game reaches varies per run: 4.0 and 4.5 GiB in the same scene, so a
+  4 GiB arena is not safe. `GPU arena: the game reached N GiB` is logged at each new 256 MiB step.
+- In this scene the native renderer beats 0.4.0 by ~18% with steadier frames (0.4.0: 120 frames
+  presented > 25 ms apart in 60 s; ours none).
