@@ -21,6 +21,13 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 1. Stability
 
+- **Metal-native: world geometry missing after long play (Hemwick graveyard, user's 0.4.5 test,
+  2026-10-17).** After a long session a large rock wall and the terrain behind it drew as a flat
+  fog-coloured hole; quit to menu and load restored them. Suspects: a missed CPU write to guest
+  memory the game recycles while streaming (the GPU keeps stale vertex/index data), or GPU
+  visibility culling reading stale results (`BB_READBACKS` Relaxed). Unknown whether 0.4.0 does it.
+  Repro: long scripted walk from `save-backups/dense-20261017` with before/after snapshots.
+
 - **Metal-native (M4 → M5): render pipelines declare a depth/stencil format the pass does not
   bind.** Fixed 2026-10-16 (M5 Task 3): `BoundDepthAttachment` (vk_depth_attachment.h) is the one
   rule for the pass's depth attachment and the pipeline key's formats; `MTL_DEBUG_LAYER=1` title +
@@ -334,6 +341,15 @@ Each item: what was done for now, what the refinement is, and where it lives.
   `MTLCaptureScope` that leaves the arena out if Apple's tool allows it.
 
 ## 2. Performance
+
+- **Frame drops while traversing (user's 0.4.5 test, 2026-10-17).** Otherwise very smooth (the user:
+  better pacing than the original and the PC version on a 4060). Shader/pipeline compiles or asset
+  streaming (texture/buffer uploads, page-protection faults); the Frame stats line and Spike
+  lines separate them (compiles, image create/refresh, write faults).
+- **Frame rate stuck at 60 with the 90 cap in the user's session.** Suspect: Apple's Metal HUD
+  (`metal_hud=1`): the user's ini matched the 89-90 FPS test runs except for it, and the HUD
+  showed exactly 60.00 even facing a wall. Test with and without `MTL_HUD_ENABLED`; if confirmed,
+  note it at the launcher toggle.
 
 - **Metal-native: GPU ~12% slower than 0.4.0 in the city (11.2 vs 9.9 ms/frame; 2026-10-17).**
   Caps 120 FPS at 89-94 against 0.4.0's ~100. Task 10c's per-command ordering is in; an unsafe
