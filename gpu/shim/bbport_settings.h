@@ -19,7 +19,8 @@ namespace BbSettings {
 
 enum Upscaler : int { UpscalerOff = 0, UpscalerFsr3 = 1, UpscalerFsr4 = 2, UpscalerFsr411 = 3,
                       UpscalerTaa = 4, UpscalerMetalFx = 5, UpscalerCount };
-/// FSR 4 v07 or FSR 4.1.1: the same inputs, settings and placement in the frame.
+/// FSR 4 v07 or FSR 4.1.1: removed from the Mac build (M5); an ini that names them still loads
+/// (they run as a fallback, the file keeps the name).
 inline bool IsFsr4(int upscaler) {
     return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
 }
@@ -70,9 +71,6 @@ struct Values {
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
-    // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
-    std::atomic<bool> fsr4_auto_exposure{true};
-    std::atomic<bool> fsr4_invert_jitter{false};
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};
@@ -89,19 +87,17 @@ struct Values {
     /// bbport.ini renderer=metal|vulkan, read by run.sh at start (native Metal: the arm64 GPU
     /// process); kept here so saving the settings does not drop it.
     std::atomic<bool> metal_renderer{false};
-    /// Why FSR 4 cannot run (assets, device features), or null. Set by the renderer.
-    std::atomic<const char*> fsr4_problem{nullptr};
-    std::atomic<bool> fsr4_supported{false}, fsr411_supported{false};
+    /// Providers this build and device can run (ConfigureUpscalerSupport); off and TAA always.
     std::atomic<bool> metalfx_supported{false}; ///< macOS: Apple MetalFX temporal scaler
+    std::atomic<bool> fsr3_supported{false};    ///< FSR 3.1: returns with M6 (ffx_metal)
+    /// What the user chose (the ini, BB_UPSCALER or the menu): Save() writes it. From
+    /// ConfigureUpscalerSupport on, `upscaler` is what runs, which differs while that choice is
+    /// unavailable (FallbackUpscaler).
+    std::atomic<int> requested_upscaler{UpscalerOff};
 
     /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;
     int startup_upscaler = UpscalerFsr3;
-    /// What the ini (or BB_UPSCALER) asked for, and the value Load() ran with. They differ for
-    /// the removed FSR 4 choices, which run as off; Save() writes requested_upscaler while the
-    /// running choice is still loaded_upscaler (the user did not change it).
-    int requested_upscaler = UpscalerFsr3;
-    int loaded_upscaler = UpscalerFsr3;
     bool startup_object_motion = true;
     bool startup_effects[EffectCount]{};
     int startup_model_lod = 0;
@@ -113,8 +109,17 @@ Values& Get();
 
 /// Reads the file, then the environment overrides. Called once at start.
 void Load();
-/// Checks the loaded choice before the first frame; unsupported FSR 4 uses FSR 3.1.
-void ConfigureUpscalerSupport(bool fsr4, bool fsr411, bool metalfx = false);
+/// Records which providers can run and, before the first frame, resolves the user's choice to
+/// the one that runs (FallbackUpscaler; logged once, never saved).
+void ConfigureUpscalerSupport(bool metalfx, bool fsr3 = false);
+/// Whether `upscaler` can run with the providers ConfigureUpscalerSupport recorded.
+bool UpscalerAvailable(int upscaler);
+/// The provider that runs for a choice: the choice itself when available, else MetalFX when
+/// available, else TAA at Native AA (anti-aliasing at the same scene size), else off. Never an
+/// unavailable provider (FSR 3.1 until M6, the removed FSR 4 choices).
+int FallbackUpscaler(int requested, bool metalfx, bool fsr3, int preset);
+/// The menu's choice: becomes the requested (saved) value and runs, or its fallback.
+void ChooseUpscaler(int upscaler);
 /// Startup-patched scene dimensions cannot change until run.sh prepares a new image.
 bool FixedRenderSession();
 int RenderPreset();

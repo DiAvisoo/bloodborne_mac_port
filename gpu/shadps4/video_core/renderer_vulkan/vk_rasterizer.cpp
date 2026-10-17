@@ -9,6 +9,8 @@
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "bbport_metalfx.h"
+#include "bbport_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -60,6 +62,10 @@ Rasterizer::Rasterizer(Metal::Device& device_, Scheduler& scheduler_, Runtime& r
     // Before the rasterizer is bound: Liverpool enqueues buffers only once it sees it.
     draw_prep = std::make_unique<DrawPreparation>(pipeline_cache);
     scene_targets = std::make_unique<SceneTargets>(device, scheduler, runtime, texture_cache);
+    // bbport: the upscaler that runs, before anything reads it (object motion's on/off here,
+    // the upscaler's resources): unavailable providers fall back -- MetalFX only where our device
+    // has the temporal scaler, FSR 3.1 not before M6 -- and the fallback is never saved.
+    BbSettings::ConfigureUpscalerSupport(BbMetalFx::Supported(device));
     // Object motion first: it fixes the buffer addresses the motion shader variants embed.
     object_motion = std::make_unique<ObjectMotion>(device, scheduler);
     camera_motion = std::make_unique<CameraMotion>(device, scheduler, texture_cache, runtime);

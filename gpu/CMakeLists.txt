@@ -149,7 +149,7 @@ list(FILTER VIDEO_CORE EXCLUDE REGEX "renderdoc\\.cpp$")
 list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_metal/")
 # Metal-native renderer (docs/superpowers/plans/2026-10-16-metal-native-roadmap.md): the milestone
 # the renderer sources are converted to. Files of later milestones leave the build; their headers
-# include gpu/shim/stubs_m3.h instead (stand-ins with the same API, compiled in shim/stubs_m3.cpp).
+# include gpu/shim/stubs_m3.h instead (header-only stand-ins with the same API).
 set(BB_METAL_NATIVE_STAGE 5 CACHE STRING "Metal-native renderer milestone the sources are converted to (5-7)")
 if (BB_METAL_NATIVE_STAGE LESS 5)
     message(FATAL_ERROR "BB_METAL_NATIVE_STAGE below 5 is gone (the M5 stand-ins are selected by BB_M5_PENDING)")
@@ -157,9 +157,8 @@ endif()
 # Stage 5 (M5) files that are still Vulkan: left out of the build one by one, each with the
 # stand-in class of the same name in stubs_m3.h (BB_M5_PENDING_<NAME> selects it). Converting a
 # file removes its name from this list, and its stand-in in the same task. (The names are the
-# files under renderer_vulkan/ and shim/; imgui_impl_vulkan is the Vulkan ImGui backend, replaced
-# by imgui_impl_metal.)
-set(BB_M5_PENDING vk_gpu_profiler bbport_overlay imgui_impl_vulkan)
+# files under renderer_vulkan/.)
+set(BB_M5_PENDING vk_gpu_profiler)
 set(BB_UNCONVERTED_6 host_passes/fsr_pass)
 set(BB_UNCONVERTED_7 vk_instance vk_platform)
 foreach(stage 6 7)
@@ -187,26 +186,16 @@ set(COMMON
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
-if ("bbport_overlay" IN_LIST BB_M5_PENDING)
-    # The settings overlay draws through Vulkan until M5; stubs_m3.cpp answers for it (the other
-    # stand-ins are header-only), and goes with the overlay's conversion.
-    list(FILTER SHIM_SOURCES EXCLUDE REGEX "shim/bbport_overlay\\.cpp$")
-else()
-    list(FILTER SHIM_SOURCES EXCLUDE REGEX "shim/stubs_m3\\.cpp$")
-endif()
 add_library(bbgpu SHARED ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
-# In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
-# embedded Cyrillic font (third_party/fonts).
+# In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Metal backend (APPLE block
+# below), and an embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp)
-if (NOT "imgui_impl_vulkan" IN_LIST BB_M5_PENDING)
-    target_sources(bbgpu PRIVATE third_party/imgui/backends/imgui_impl_vulkan.cpp)
-endif()
 # PUBLIC: the gated headers (stubs_m3.h) must see the same stage in the tests that include them.
 target_compile_definitions(bbgpu PUBLIC BB_METAL_NATIVE_STAGE=${BB_METAL_NATIVE_STAGE})
 foreach(source IN LISTS BB_M5_PENDING)
@@ -214,7 +203,7 @@ foreach(source IN LISTS BB_M5_PENDING)
     target_compile_definitions(bbgpu PUBLIC BB_M5_PENDING_${pending_name})
 endforeach()
 target_include_directories(bbgpu PRIVATE third_party/imgui third_party/imgui/backends)
-target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
+target_compile_definitions(bbgpu PRIVATE
     BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
 set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
@@ -227,7 +216,12 @@ if (APPLE)
     target_sources(bbgpu PRIVATE shim/bbport_gpu_capture.mm)
     # MetalFX temporal upscaling on native textures (shim/bbport_metalfx.h), used by the upscaler.
     target_sources(bbgpu PRIVATE shim/bbport_metalfx.mm)
+    # The settings overlay's Metal side and ImGui's Metal backend (both ARC).
+    target_sources(bbgpu PRIVATE shim/bbport_overlay_metal.mm
+                   third_party/imgui/backends/imgui_impl_metal.mm)
     set_source_files_properties(shim/bbport_gpu_capture.mm shim/bbport_metalfx.mm
+                                shim/bbport_overlay_metal.mm
+                                third_party/imgui/backends/imgui_impl_metal.mm
                                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_METAL_EXT)
     # The runtime's symbols resolve against the executable at load time (bb-probe, src/runtime*.c;
@@ -348,6 +342,13 @@ if (APPLE)
     target_link_libraries(host-kernel-test PRIVATE bbgpu "-framework Metal" "-framework Foundation")
     target_link_options(host-kernel-test PRIVATE -Wl,-export_dynamic)
     add_dependencies(host-kernel-test host_shaders)
+    # The settings overlay drawn through ImGui's Metal backend into an offscreen BGRA8 target.
+    add_executable(overlay-test EXCLUDE_FROM_ALL ../tests/test_mtl_overlay.mm ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(overlay-test PRIVATE shim shadps4)
+    target_compile_options(overlay-test PRIVATE -UNDEBUG)
+    set_source_files_properties(../tests/test_mtl_overlay.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(overlay-test PRIVATE bbgpu "-framework Metal" "-framework Foundation")
+    target_link_options(overlay-test PRIVATE -Wl,-export_dynamic)
 endif()
 # These two run the TAA and camera motion kernels on Metal, recorded by the renderer's own
 # Taa::Record and CameraMotion::Record (M5 Tasks 7 and 5).

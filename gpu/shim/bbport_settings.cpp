@@ -19,12 +19,12 @@ const char* Path() {
 }
 
 /// Keys Save() writes; every other key=value line of the file is kept as it is (the launcher's
-/// fps_cap and fullscreen, ...).
+/// fps_cap and fullscreen, the removed FSR 4 checks fsr4_auto_exposure/fsr4_invert_jitter, ...).
 bool OwnedKey(const std::string& key) {
     static constexpr const char* owned[] = {
         "upscaler", "preset", "sharpen", "sharpness", "jitter", "reactive", "object_motion",
         "reactive_scale", "reactive_threshold", "reactive_max", "debug_view", "show_fps",
-        "fsr4_auto_exposure", "fsr4_invert_jitter", "model_lod", "output_res",
+        "model_lod", "output_res",
         "live_resolution", "shader_compile", "renderer"};
     for (const char* k : owned) {
         if (key == k) {
@@ -74,10 +74,6 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
-    } else if (key == "fsr4_auto_exposure") {
-        v.fsr4_auto_exposure = i != 0;
-    } else if (key == "fsr4_invert_jitter") {
-        v.fsr4_invert_jitter = i != 0;
     } else if (key == "model_lod") {
         v.model_lod = std::clamp(i, -2, 2);
     } else if (key == "live_resolution") {
@@ -148,13 +144,9 @@ void Load() {
             Set(v, key, value);
         }
     }
-    v.requested_upscaler = v.upscaler;
-    if (IsFsr4(v.upscaler)) {
-        // FSR 4 is removed from the Mac build (M5): it runs as off (M5 Task 9: fallback rule).
-        std::printf("Upscaler: %s was removed; using off\n", UpscalerName(v.upscaler));
-        v.upscaler = UpscalerOff;
-    }
-    v.loaded_upscaler = v.upscaler;
+    // The choice as asked for; ConfigureUpscalerSupport resolves what runs before the renderer
+    // reads it.
+    v.requested_upscaler = v.upscaler.load();
     v.startup_preset = v.preset;
     v.startup_upscaler = v.upscaler;
     v.startup_object_motion = v.object_motion;
@@ -166,23 +158,55 @@ void Load() {
     v.startup_live_resolution = v.live_resolution;
 }
 
-void ConfigureUpscalerSupport(bool fsr4, bool fsr411, bool metalfx) {
+void ConfigureUpscalerSupport(bool metalfx, bool fsr3) {
     auto& v = Get();
-    v.fsr4_supported = fsr4;
-    v.fsr411_supported = fsr4 && fsr411;
     v.metalfx_supported = metalfx;
-    const int requested = v.upscaler;
-    if (requested == UpscalerMetalFx && !metalfx) {
-        std::printf("Upscaler: MetalFX unavailable; falling back to FSR 3.1\n");
-        v.upscaler = UpscalerFsr3;
+    v.fsr3_supported = fsr3;
+    const int requested = v.requested_upscaler;
+    const int runs = FallbackUpscaler(requested, metalfx, fsr3, v.preset);
+    if (runs != requested) {
+        std::printf("Upscaler: %s %s; using %s (the saved choice is kept)\n",
+                    UpscalerName(requested),
+                    IsFsr4(requested)                ? "was removed"
+                    : requested == UpscalerFsr3      ? "returns with M6 (FSR 3.1 on Metal)"
+                                                     : "is unavailable on this device",
+                    UpscalerName(runs));
     }
-    if ((requested == UpscalerFsr4 && !v.fsr4_supported) ||
-        (requested == UpscalerFsr411 && !v.fsr411_supported)) {
-        v.fsr4_problem = "GPU does not support the selected FSR 4 shaders; using FSR 3.1";
-        std::printf("Upscaler: %s unsupported on this GPU; falling back to FSR 3.1 before the first frame\n",
-                    UpscalerName(requested));
-        v.upscaler = UpscalerFsr3;
+    v.upscaler = runs;
+    // Before the first frame: the choice the guest's startup patches were applied for.
+    v.startup_upscaler = runs;
+}
+
+bool UpscalerAvailable(int upscaler) {
+    const auto& v = Get();
+    return FallbackUpscaler(upscaler, v.metalfx_supported, v.fsr3_supported, NativeAA) ==
+           upscaler;
+}
+
+int FallbackUpscaler(int requested, bool metalfx, bool fsr3, int preset) {
+    switch (requested) {
+    case UpscalerOff:
+    case UpscalerTaa:
+        return requested;
+    case UpscalerMetalFx:
+        if (metalfx) return requested;
+        break;
+    case UpscalerFsr3:
+        if (fsr3) return requested;
+        break;
+    default: // the removed FSR 4 choices, unknown values
+        break;
     }
+    if (metalfx) {
+        return UpscalerMetalFx;
+    }
+    return preset == NativeAA ? UpscalerTaa : UpscalerOff;
+}
+
+void ChooseUpscaler(int upscaler) {
+    auto& v = Get();
+    v.requested_upscaler = upscaler;
+    v.upscaler = FallbackUpscaler(upscaler, v.metalfx_supported, v.fsr3_supported, v.preset);
 }
 
 bool FixedRenderSession() {
@@ -227,22 +251,20 @@ void Save() {
         std::printf("Settings: cannot write %s\n", Path());
         return;
     }
-    // A choice the menu did not change keeps what the user asked for (FSR 4 runs as off).
-    const int saved_upscaler =
-        v.upscaler == v.loaded_upscaler ? v.requested_upscaler : int(v.upscaler);
+    // The user's choice, never a fallback that runs in its place.
+    const int saved_upscaler = v.requested_upscaler;
     std::printf("Settings: saved %s (upscaler=%s preset=%d jitter=%d)\n", Path(),
                 UpscalerName(saved_upscaler), v.preset.load(), int(v.jitter.load()));
     std::fprintf(file,
                  "# bbport settings (in-game menu: " BBPORT_MENU_KEYS " / L3+R3)\n"
                  "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
-                 "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
+                 "debug_view=%d\nshow_fps=%d\n",
                  UpscalerName(saved_upscaler), v.preset.load(), int(v.sharpen.load()),
                  v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
                  int(v.object_motion.load()),
                  v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
-                 v.debug_view.load(), int(v.show_fps.load()),
-                 int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()));
+                 v.debug_view.load(), int(v.show_fps.load()));
     // Read by patches.py at start.
     for (int e = 0; e < EffectCount; ++e) {
         std::fprintf(file, "%s=%d\n", Effects[e].key, int(v.effects[e].load()));

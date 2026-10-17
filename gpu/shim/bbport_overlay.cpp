@@ -10,13 +10,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
+#include "bbport_overlay_metal.h"
 #include "imgui.h"
-#include "imgui_impl_vulkan.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 // DejaVu Sans, embedded (third_party/fonts, Bitstream Vera license): Latin, Cyrillic and
 // symbols such as U+2318 (Cmd) and U+2192 (arrow). ImGui 1.92 rasterizes glyphs on demand.
@@ -64,7 +64,7 @@ namespace BbOverlay {
 namespace {
 
 std::mutex imgui_mutex; // the ImGui context: window thread (input) and present thread
-bool initialized = false;
+std::atomic<bool> initialized{false}; // read without the lock (Visible, Render)
 std::atomic<bool> menu_open{false};
 bool l3_down = false, r3_down = false;
 // A key or pad combo that toggled/closed the menu is still held: the game polls the keyboard
@@ -167,16 +167,23 @@ const bool menu_trace = [] {
 }();
 bool widget_changed_this_frame = false;
 
+// A widget changed the settings: saved shortly after the last change (Render), and on close.
+void MarkChanged() {
+    dirty = true;
+    last_change = std::chrono::steady_clock::now();
+    widget_changed_this_frame = true;
+}
+
 // Marks the settings dirty when a widget changed them.
 template <typename T>
 void Store(std::atomic<T>& target, T value, bool changed) {
     if (changed) {
         target = value;
-        dirty = true;
-        last_change = std::chrono::steady_clock::now();
-        widget_changed_this_frame = true;
+        MarkChanged();
     }
 }
+
+constexpr const char* kFsr3Later = "FSR 3.1 returns with the Metal renderer in a later 0.5 update.";
 
 // ---------------------------------------------------------------------------------------------
 // Look: a macOS dark-mode settings panel. Grouped rows on lighter cards, system-blue accent for
@@ -615,75 +622,73 @@ int current_tab = TabDisplay;
 std::atomic<bool> gamepad_in_use{false}; // last menu input came from a pad: show L1/R1 hints
 
 void DisplayTab(BbSettings::Values& s) {
-    static const char* upscalers[] = {"Off", "FSR 3.1", "FSR 4", "FSR 4.1.1", "TAA", "MetalFX"};
-    static_assert(sizeof(upscalers) / sizeof(upscalers[0]) == BbSettings::UpscalerCount);
-    static const char* upscaler_about[] = {
+    // The menu's choices (FSR 4 is removed from the Mac build; an ini naming it still loads).
+    static constexpr int choices[] = {BbSettings::UpscalerOff, BbSettings::UpscalerFsr3,
+                                      BbSettings::UpscalerTaa, BbSettings::UpscalerMetalFx};
+    static constexpr int choice_count = int(sizeof(choices) / sizeof(choices[0]));
+    static const char* labels[choice_count] = {"Off", "FSR 3.1", "TAA", "MetalFX"};
+    static const char* about[choice_count] = {
         "No temporal upscaling: the game's own image.",
         "AMD FSR 3.1. Light on the GPU.",
-        "AMD FSR 4 (INT8). Sharper than FSR 3.1, but a heavier pass.",
-        "AMD FSR 4.1.1 (INT8), the model from AMD's 4.1.1 release.",
         "Anti-aliasing at output resolution, without upscaling.",
         "Apple MetalFX temporal upscaling, on the Mac's GPU.",
     };
-    bool supported[BbSettings::UpscalerCount];
-    const char* tips[BbSettings::UpscalerCount] = {};
-    for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
-        supported[i] = i == BbSettings::UpscalerFsr4     ? s.fsr4_supported.load()
-                       : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
-                       : i == BbSettings::UpscalerMetalFx ? s.metalfx_supported.load()
-                                                          : true;
-        if (!supported[i]) {
-            tips[i] = "Not supported by this GPU";
+    bool available[choice_count];
+    const char* tips[choice_count] = {};
+    for (int i = 0; i < choice_count; ++i) {
+        available[i] = BbSettings::UpscalerAvailable(choices[i]);
+        if (!available[i]) {
+            tips[i] = choices[i] == BbSettings::UpscalerFsr3 ? kFsr3Later
+                                                             : "Not supported by this GPU";
         }
     }
     const int upscaler = s.upscaler;
+    const int requested = s.requested_upscaler;
     const bool upscaler_on = upscaler != BbSettings::UpscalerOff;
     const bool taa = upscaler == BbSettings::UpscalerTaa;
+    int current = 0;
+    for (int i = 0; i < choice_count; ++i) {
+        if (choices[i] == upscaler) {
+            current = i;
+        }
+    }
 
     BeginCard("Upscaling");
     Label("Upscaler");
     InfoTip("Temporal upscalers build each frame from several previous ones: sharper edges, and "
             "with a lower preset, a faster game. DLSS and XeSS are planned for later.");
-    if (const int picked = Segmented("upscaler", upscalers, BbSettings::UpscalerCount, upscaler,
-                                     supported, tips);
-        picked >= 0) {
-        Store(s.upscaler, picked, true);
+    if (const int picked = Segmented("upscaler", labels, choice_count, current, available, tips);
+        picked >= 0 && choices[picked] != requested) {
+        BbSettings::ChooseUpscaler(choices[picked]);
+        MarkChanged();
     }
-    HintBelow(upscaler_about[std::clamp(upscaler, 0, BbSettings::UpscalerCount - 1)]);
-    if (BbSettings::IsFsr4(upscaler)) {
-        ImGui::SameLine(0.0f, 0.0f);
-        InfoTip(upscaler == BbSettings::UpscalerFsr411
-                    ? "FSR 4.1.1 in INT8 mode: the model from AMD's 4.1.1 DLL, reproduced in "
-                      "Vulkan (output matches the DLL). One model covers Native AA to Performance, "
-                      "a separate one Ultra Performance. Assets: tools/fsr4cap/build_assets.sh "
-                      "(needs the DLL and Proton)."
-                    : "FSR 4 in INT8 mode (model v07 from the AMD FidelityFX SDK sources). Higher "
-                      "quality than FSR 3.1, but a heavier pass. Changing the preset rebuilds the "
-                      "model (brief pause). Assets: tools/fetch_fsr4_assets.sh.");
-    }
-    bool any_unsupported = false;
-    for (bool ok : supported) {
-        any_unsupported |= !ok;
-    }
-    if (any_unsupported) {
-        char line[128] = "Not available on this GPU:";
-        bool first = true;
-        for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
-            if (!supported[i]) {
-                std::strncat(line, first ? " " : ", ", sizeof(line) - std::strlen(line) - 1);
-                std::strncat(line, upscalers[i], sizeof(line) - std::strlen(line) - 1);
-                first = false;
-            }
+    HintBelow(about[current]);
+    for (int i = 0; i < choice_count; ++i) {
+        if (!available[i] && choices[i] != BbSettings::UpscalerFsr3) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "Not available on this GPU: %s", labels[i]);
+            Note(line);
         }
-        Note(line);
     }
-    if (const char* problem = s.fsr4_problem.load()) {
-        char text[512];
-        std::snprintf(text, sizeof(text), "FSR 4 unavailable: %s%s", problem,
-                      BbSettings::IsFsr4(upscaler)
-                          ? ""
-                          : "\nThe mode selected above is active. FSR 4 can be selected again.");
+    if (requested != upscaler) {
+        // The saved choice cannot run here (FSR 3.1 until its Metal port, the removed FSR 4,
+        // MetalFX without a scaler): say what runs instead; the ini keeps the choice.
+        char text[256];
+        std::snprintf(text, sizeof(text),
+                      "%s from your settings is not available%s; %s runs instead. Your choice "
+                      "stays saved until you pick another.",
+                      requested == BbSettings::UpscalerFsr3 ? "FSR 3.1"
+                      : BbSettings::IsFsr4(requested)       ? "FSR 4"
+                      : requested == BbSettings::UpscalerMetalFx ? "MetalFX"
+                                                                 : "The upscaler",
+                      requested == BbSettings::UpscalerFsr3 ? " yet (it returns in a later 0.5 "
+                                                              "update)"
+                      : BbSettings::IsFsr4(requested)       ? " on the Mac"
+                                                            : "",
+                      labels[current]);
         Note(text, kOrange);
+    } else if (!BbSettings::UpscalerAvailable(BbSettings::UpscalerFsr3)) {
+        Note(kFsr3Later);
     }
     EndCard();
 
@@ -820,16 +825,6 @@ void GraphicsTab(BbSettings::Values& s) {
 void AdvancedTab(BbSettings::Values& s) {
     const bool upscaler_on = s.upscaler != BbSettings::UpscalerOff;
     const bool taa = s.upscaler == BbSettings::UpscalerTaa;
-
-    if (BbSettings::IsFsr4(s.upscaler)) {
-        BeginCard("FSR 4 diagnostics", -1,
-                  "For diagnosing ghosting: the FSR 4 network normalizes color by exposure and "
-                  "uses it to decide when to discard previous frames.");
-        Toggle("FSR 4: auto exposure", s.fsr4_auto_exposure);
-        Toggle("FSR 4: invert jitter sign", s.fsr4_invert_jitter);
-        HintBelow("Applies immediately, no restart.");
-        EndCard();
-    }
 
     BeginCard("Reactive mask");
     if (!upscaler_on || taa) {
@@ -1134,8 +1129,6 @@ void FpsCounter() {
     // Scene (render) size as reported by the upscaler, and the output size in effect: a
     // startup-patched session keeps its launch output until restart.
     const char* upscaler = s.upscaler == BbSettings::UpscalerFsr3      ? "FSR 3.1"
-                           : s.upscaler == BbSettings::UpscalerFsr4    ? "FSR 4"
-                           : s.upscaler == BbSettings::UpscalerFsr411  ? "FSR 4.1.1"
                            : s.upscaler == BbSettings::UpscalerTaa     ? "TAA"
                            : s.upscaler == BbSettings::UpscalerMetalFx ? "MetalFX"
                                                                        : "";
@@ -1274,7 +1267,7 @@ void ApplyScale(float display_height) {
 
 } // namespace
 
-void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
+void Init(Metal::Device& device, u32 pixel_format) {
     if (const char* env = std::getenv("BB_OVERLAY")) {
         if (!std::strcmp(env, "0") || !std::strcmp(env, "off") || !std::strcmp(env, "false")) {
             std::printf("Overlay: disabled (BB_OVERLAY=0)\n");
@@ -1296,34 +1289,8 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     SetupStyle();
     SetupFonts(io);
 
-    const vk::Instance vk_instance = instance.GetInstance();
-    ImGui_ImplVulkan_LoadFunctions(
-        instance.ApiVersion(),
-        [](const char* name, void* user) {
-            return VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr(
-                *static_cast<const vk::Instance*>(user), name);
-        },
-        const_cast<vk::Instance*>(&vk_instance));
-
-    const VkFormat color_format = static_cast<VkFormat>(format);
-    ImGui_ImplVulkan_InitInfo info{};
-    info.ApiVersion = instance.ApiVersion();
-    info.Instance = vk_instance;
-    info.PhysicalDevice = instance.GetPhysicalDevice();
-    info.Device = instance.GetDevice();
-    info.QueueFamily = instance.GetGraphicsQueueFamilyIndex();
-    info.Queue = instance.GetGraphicsQueue();
-    info.DescriptorPoolSize = 16;
-    info.MinImageCount = std::max(image_count, 2u);
-    info.ImageCount = std::max(image_count, 2u);
-    info.UseDynamicRendering = true;
-    info.PipelineInfoMain.PipelineRenderingCreateInfo = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
-        .colorAttachmentCount = 1,
-        .pColorAttachmentFormats = &color_format,
-    };
-    if (!ImGui_ImplVulkan_Init(&info)) {
-        std::printf("Overlay: ImGui Vulkan backend init failed\n");
+    if (!MetalBackend::Init(device, pixel_format)) {
+        std::printf("Overlay: ImGui Metal backend init failed\n");
         ImGui::DestroyContext();
         return;
     }
@@ -1504,7 +1471,97 @@ bool CapturesInput() {
     return held_sticks;
 }
 
-void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+namespace {
+
+/// BB_MENU_INPUT=<file>: scripted menu input for automated runs (the window gets no keyboard or
+/// mouse events while the screen is locked). Checked about twice a second; the file is read,
+/// removed and each whitespace-separated token fed to HandleEvent as the window thread would:
+/// cmd-comma, esc, tab, space, enter, up/down/left/right, cmd-hold/cmd-release, text:<chars>,
+/// click:<x>,<y> (drawable pixels).
+void ScriptedInput() {
+    static const char* path = std::getenv("BB_MENU_INPUT");
+    static int presents = 0;
+    if (!path || !path[0] || ++presents % 30 != 0) {
+        return;
+    }
+    FILE* file = std::fopen(path, "r");
+    if (!file) {
+        return;
+    }
+    char token[256];
+    std::vector<std::string> tokens;
+    while (std::fscanf(file, "%255s", token) == 1) {
+        tokens.emplace_back(token);
+    }
+    std::fclose(file);
+    std::remove(path);
+    const auto key = [](SDL_Keycode code, SDL_Keymod mod, SDL_Scancode scancode) {
+        for (const bool down : {true, false}) {
+            SDL_Event event{};
+            event.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+            event.key.key = code;
+            event.key.mod = mod;
+            event.key.scancode = scancode;
+            event.key.down = down;
+            HandleEvent(event);
+        }
+    };
+    for (const std::string& t : tokens) {
+        std::printf("menu: scripted %s\n", t.c_str());
+        if (t == "cmd-comma") {
+            key(SDLK_COMMA, SDL_KMOD_GUI, SDL_SCANCODE_COMMA);
+        } else if (t == "esc") {
+            key(SDLK_ESCAPE, SDL_KMOD_NONE, SDL_SCANCODE_ESCAPE);
+        } else if (t == "tab") {
+            key(SDLK_TAB, SDL_KMOD_NONE, SDL_SCANCODE_TAB);
+        } else if (t == "space") {
+            key(SDLK_SPACE, SDL_KMOD_NONE, SDL_SCANCODE_SPACE);
+        } else if (t == "enter") {
+            key(SDLK_RETURN, SDL_KMOD_NONE, SDL_SCANCODE_RETURN);
+        } else if (t == "up" || t == "down" || t == "left" || t == "right") {
+            key(t == "up" ? SDLK_UP : t == "down" ? SDLK_DOWN : t == "left" ? SDLK_LEFT : SDLK_RIGHT,
+                SDL_KMOD_NONE,
+                t == "up" ? SDL_SCANCODE_UP : t == "down" ? SDL_SCANCODE_DOWN
+                          : t == "left" ? SDL_SCANCODE_LEFT : SDL_SCANCODE_RIGHT);
+        } else if (t == "cmd-hold" || t == "cmd-release") {
+            // Cmd held across the next tokens (Cmd+click on a slider types a value).
+            SDL_Event event{};
+            event.type = t == "cmd-hold" ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+            event.key.key = SDLK_LGUI;
+            event.key.scancode = SDL_SCANCODE_LGUI;
+            event.key.mod = t == "cmd-hold" ? SDL_KMOD_LGUI : SDL_KMOD_NONE;
+            event.key.down = t == "cmd-hold";
+            HandleEvent(event);
+        } else if (t.rfind("text:", 0) == 0) {
+            SDL_Event event{};
+            event.type = SDL_EVENT_TEXT_INPUT;
+            const std::string chars = t.substr(5);
+            event.text.text = chars.c_str();
+            HandleEvent(event);
+        } else if (float x = 0, y = 0; std::sscanf(t.c_str(), "click:%f,%f", &x, &y) == 2) {
+            // Window id 0: no window, density 1, so the coordinates are drawable pixels.
+            SDL_Event event{};
+            event.type = SDL_EVENT_MOUSE_MOTION;
+            event.motion.x = x;
+            event.motion.y = y;
+            HandleEvent(event);
+            for (const bool down : {true, false}) {
+                event = {};
+                event.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+                event.button.button = SDL_BUTTON_LEFT;
+                event.button.down = down;
+                event.button.x = x;
+                event.button.y = y;
+                HandleEvent(event);
+            }
+        }
+    }
+}
+
+} // namespace
+
+void Render(void* command_buffer, void* target, u32 width, u32 height) {
+    ScriptedInput();
     // Present interval for the FPS readout (measured also while nothing is drawn).
     const auto now = std::chrono::steady_clock::now();
     const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
@@ -1512,18 +1569,22 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
     }
+    if (!initialized) {
+        return;
+    }
+    std::scoped_lock lock{imgui_mutex};
     // Save 0.3 s after the last change (a slider drag writes once), not only when the menu
-    // closes: closing the window or a crash with the menu open used to lose the changes.
+    // closes: closing the window or a crash with the menu open used to lose the changes. Under
+    // the lock: the window thread's SetOpen(false) saves and clears `dirty` too.
     if (dirty && now - last_change > std::chrono::milliseconds(300)) {
         dirty = false;
         BbSettings::Save();
     }
-    if (!Visible()) {
+    if (!Visible() || !command_buffer || !target || width == 0 || height == 0) {
         return;
     }
-    std::scoped_lock lock{imgui_mutex};
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2(float(extent.width), float(extent.height));
+    io.DisplaySize = ImVec2(float(width), float(height));
     if (menu_trace) {
         // Changes to these not made by a widget in the previous menu frame come from elsewhere.
         static int last[3] = {-1, -1, -1};
@@ -1540,41 +1601,25 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         widget_changed_this_frame = false;
     }
     io.DeltaTime = ms > 0.0f && ms < 1000.0f ? ms / 1000.0f : 1.0f / 60.0f;
-    ApplyScale(float(extent.height));
+    ApplyScale(float(height));
 
-    ImGui_ImplVulkan_NewFrame();
-    ImGui::NewFrame();
-    if (menu_open) {
-        Menu();
-    }
-    if (BbSettings::Get().show_fps && !menu_open) {
-        FpsCounter();
-    }
-    if (menu_trace && (io.MouseClicked[0] || io.MouseReleased[0])) {
-        std::printf("menu: frame sees %s at %.0f,%.0f, over a control: %s, control active: %s\n",
-                    io.MouseClicked[0] ? "press" : "release", io.MousePos.x, io.MousePos.y,
-                    ImGui::IsAnyItemHovered() ? "yes" : "no", ImGui::IsAnyItemActive() ? "yes" : "no");
-    }
-    ImGui::Render();
-
-    const vk::RenderingAttachmentInfo attachment{
-        .imageView = view,
-        .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
-        .loadOp = vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
-    };
-    cmdbuf.beginRendering(vk::RenderingInfo{
-        .renderArea = {{0, 0}, extent},
-        .layerCount = 1,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &attachment,
+    MetalBackend::Frame(command_buffer, target, [&] {
+        ImGui::NewFrame();
+        if (menu_open) {
+            Menu();
+        }
+        if (BbSettings::Get().show_fps && !menu_open) {
+            FpsCounter();
+        }
+        if (menu_trace && (io.MouseClicked[0] || io.MouseReleased[0])) {
+            std::printf("menu: frame sees %s at %.0f,%.0f, over a control: %s, control "
+                        "active: %s\n",
+                        io.MouseClicked[0] ? "press" : "release", io.MousePos.x, io.MousePos.y,
+                        ImGui::IsAnyItemHovered() ? "yes" : "no",
+                        ImGui::IsAnyItemActive() ? "yes" : "no");
+        }
+        ImGui::Render();
     });
-    {
-        // Font atlas uploads submit to the graphics queue themselves.
-        std::scoped_lock submit_lock{Vulkan::Scheduler::submit_mutex};
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmdbuf);
-    }
-    cmdbuf.endRendering();
 }
 
 } // namespace BbOverlay

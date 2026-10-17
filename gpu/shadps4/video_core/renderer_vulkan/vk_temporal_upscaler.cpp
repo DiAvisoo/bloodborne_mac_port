@@ -130,9 +130,6 @@ TemporalUpscaler::TemporalUpscaler(Metal::Device& device_, Scheduler& scheduler_
                                    CameraMotion& camera_motion_, SceneTargets& scene_targets_)
     : device{device_}, scheduler{scheduler_}, texture_cache{texture_cache_}, runtime{runtime_},
       camera_motion{camera_motion_}, scene_targets{scene_targets_}, scale{device_} {
-    // Reject unsupported providers before allocating resources or recording a frame: MetalFX
-    // only where our device has the temporal scaler.
-    BbSettings::ConfigureUpscalerSupport(false, false, BbMetalFx::Supported(device));
     // Available unless BB_UPSCALER=none; on/off and the parameters are the menu's settings.
     const char* env = std::getenv("BB_UPSCALER");
     enabled = !(env && std::strcmp(env, "none") == 0);

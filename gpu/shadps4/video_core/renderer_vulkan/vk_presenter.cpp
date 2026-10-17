@@ -9,6 +9,7 @@
 
 #include "bbport_cpu.h"
 #include "bbport_gpu_capture.h"
+#include "bbport_overlay.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -113,6 +114,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     // Snapshots read the drawable back.
     config.framebuffer_only = snapshot_trigger.empty();
     Metal::ConfigureLayer(device, layer, config);
+    // The settings menu and FPS counter, drawn into the drawable (Present).
+    BbOverlay::Init(device, FrameFormat);
     for (u32 i = 0; i < FramePool::Count; ++i) {
         pool->frames[i].id = i;
         pool->free.push_back(&pool->frames[i]);
@@ -341,6 +344,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         // to the pool at once, so PrepareFrame's Take never waits on a skipped present.
         if (!Metal::ShouldAcquireDrawable(window.IsVisible(), window.GetWidth(),
                                           window.GetHeight(), SnapshotRequested())) {
+            BbOverlay::Render(nullptr, nullptr, 0, 0); // FPS timing, the menu's pending save
             pool->Free(frame);
             return;
         }
@@ -370,7 +374,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         // not returns to the layer only after about a display refresh.
         pp_pass.Passes().Present(command_buffer, source, frame->width, frame->height,
                                  drawable.texture, drawable.width, drawable.height);
-        // The settings overlay (BbOverlay::Visible) draws here again in M5.
+        // The settings menu / FPS counter over the presented image, before the snapshot (which
+        // shows it) and the commit. Called every present: it also times the FPS readout and
+        // saves menu changes while nothing is drawn.
+        BbOverlay::Render(command_buffer, drawable.texture, drawable.width, drawable.height);
         std::string snapshot_path = TakeSnapshotRequest();
         std::shared_ptr<Metal::Object> snapshot;
         if (!snapshot_path.empty()) {

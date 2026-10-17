@@ -5,7 +5,6 @@
 // classes with the same public API that do nothing (each guarded by BB_M5_PENDING_<FILE NAME>,
 // which CMake defines while the file is pending):
 //   - M5: the GPU profiler (vk_gpu_profiler.h): off.
-//     The settings overlay keeps its header; stubs_m3.cpp defines what the shim calls.
 // Converting a file removes its name from BB_M5_PENDING and its stand-in from here; the last
 // conversion deletes this file.
 

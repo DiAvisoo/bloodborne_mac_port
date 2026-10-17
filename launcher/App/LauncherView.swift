@@ -40,6 +40,10 @@ struct LauncherView: View {
                         }
                         .disabled(!model.settings.upscaler.usesPreset)
                         LabeledContent("Renders", value: "\(model.settings.renderSize) → \(model.settings.output)")
+                        if model.settings.upscaler == .fsr3 && model.settings.renderer == .metal {
+                            Text("FSR 3.1 returns to the Metal renderer in a later 0.5 update; MetalFX runs until then (your choice stays saved).")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         if model.settings.upscaler == .fsr3 {
                             Toggle("Sharpening", isOn: $model.settings.sharpen)
                             if model.settings.sharpen {

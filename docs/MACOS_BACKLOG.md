@@ -457,6 +457,12 @@ Each item: what was done for now, what the refinement is, and where it lives.
   *2026-10-15:* settings were only written when the menu closed, so closing the game window (or
   a crash) with the menu open lost them; they are now saved 0.3 s after the last change. Still to
   check with the user (`BB_MENU_TRACE=1`): the jitter toggle flipping back.
+  *2026-10-17 (Metal renderer, M5):* the menu's upscaler choice is now the saved value
+  (`requested_upscaler`); before, a choice equal to the value Load() ran with (e.g. Off after an
+  ini naming the removed FSR 4) saved the old ini value back. Scripted menu input
+  (`BB_MENU_INPUT`, in game, `BB_MENU_TRACE=1`): jitter off/on, preset, typed sharpness and Off
+  were all saved and stayed; the jitter toggle never flipped back. Still open: the user's
+  original jitter report (not reproduced).
 - **Launcher and `.app` bundle.** *Done 2026-10-14 night:* `scripts/macos/make_app.sh` builds a
   local `Bloodborne.app` (launcher for this checkout, game icon from `sce_sys/icon0.png`, log in
   `~/Library/Logs/Bloodborne`, error dialog; the window process runs as the bundle's executable
