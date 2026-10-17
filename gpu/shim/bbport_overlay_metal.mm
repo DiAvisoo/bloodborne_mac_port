@@ -27,7 +27,7 @@ void Frame(void* command_buffer, void* target, const std::function<void()>& buil
         static bool logged = false;
         if (!logged) {
             logged = true;
-            std::printf("Overlay: target format %u, not %u: pipeline rebuilt for it\n",
+            std::printf("Overlay: target format %u, not %u (the backend builds a pipeline per format)\n",
                         unsigned(texture.pixelFormat), unsigned(expected_format));
         }
     }

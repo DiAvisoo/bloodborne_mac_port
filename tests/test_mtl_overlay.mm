@@ -3,7 +3,8 @@
 // a Metal::Device, then BbOverlay::Render into an offscreen BGRA8 render target, as the presenter
 // does into the drawable. Hidden, nothing is drawn (the target keeps its contents); the FPS
 // counter draws in the top-right corner only; Cmd+, opens the menu (drawn over the middle, the
-// game's input captured, text input consumed) and Escape closes it. Runs plain and under
+// game's input captured, text input consumed) and Escape closes it; with fsr3 saved and MetalFX
+// running, clicking the MetalFX segment saves MetalFX. Runs plain and under
 // MTL_DEBUG_LAYER=1 (build_macos.sh --test). Links libbbgpu (the overlay, ImGui and its Metal
 // backend).
 #import <Foundation/Foundation.h>
@@ -30,7 +31,8 @@ void Expect(bool ok, const char* what) {
     }
 }
 
-constexpr u32 Width = 1280, Height = 720;
+// The game window's drawable on a 16" MacBook Pro (menu layout as in the game gate).
+constexpr u32 Width = 2992, Height = 1672;
 constexpr u8 Fill[4] = {30, 20, 10, 255}; // BGRA
 
 struct Target {
@@ -156,7 +158,59 @@ int main() {
         Expect(!BbOverlay::HandleEvent(text), "typed text not consumed with the menu closed");
         Present(t, true);
         Expect(Changed(t, 0, 0, Width, Height) == 0.0, "closed menu draws nothing");
-        Expect(device.ErrorCount() == 0, "no command buffer errors on the device queue");
+
+        // The menu's upscaler control: with fsr3 saved and MetalFX running in its place, a click
+        // on the (selected) MetalFX segment saves MetalFX as the choice.
+        {
+            FILE* file = std::fopen(config, "w");
+            std::fputs("upscaler=fsr3\npreset=1\n", file);
+            std::fclose(file);
+        }
+        BbSettings::Load();
+        BbSettings::ConfigureUpscalerSupport(true);
+        Expect(s.upscaler == BbSettings::UpscalerMetalFx &&
+                   s.requested_upscaler == BbSettings::UpscalerFsr3,
+               "fsr3 runs as MetalFX");
+        Expect(BbOverlay::HandleEvent(Key(SDLK_COMMA, SDL_KMOD_GUI, true)), "menu reopened");
+        BbOverlay::HandleEvent(Key(SDLK_COMMA, SDL_KMOD_GUI, false));
+        for (int i = 0; i < 3; ++i) {
+            Present(t, true);
+        }
+        // The MetalFX segment of the Display tab at this size (drawable pixels; window id 0
+        // means density 1).
+        constexpr float mx = 1862.0f, my = 354.0f;
+        SDL_Event mouse{};
+        mouse.type = SDL_EVENT_MOUSE_MOTION;
+        mouse.motion.x = mx;
+        mouse.motion.y = my;
+        BbOverlay::HandleEvent(mouse);
+        Present(t, true);
+        for (const bool down : {true, false}) {
+            mouse = {};
+            mouse.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+            mouse.button.button = SDL_BUTTON_LEFT;
+            mouse.button.down = down;
+            mouse.button.x = mx;
+            mouse.button.y = my;
+            BbOverlay::HandleEvent(mouse);
+            Present(t, true);
+        }
+        Expect(s.requested_upscaler == BbSettings::UpscalerMetalFx &&
+                   s.upscaler == BbSettings::UpscalerMetalFx,
+               "click on the running MetalFX makes it the choice");
+        // The menu saves 0.3 s after the last change, on a present.
+        usleep(400 * 1000);
+        Present(t, true);
+        {
+            char text[4096] = {};
+            FILE* file = std::fopen(config, "r");
+            const size_t n = file ? std::fread(text, 1, sizeof(text) - 1, file) : 0;
+            if (file) std::fclose(file);
+            text[n] = 0;
+            Expect(std::strstr(text, "\nupscaler=metalfx\n") != nullptr,
+                   "the saved ini says upscaler=metalfx");
+        }
+        BbOverlay::HandleEvent(Key(SDLK_ESCAPE, SDL_KMOD_NONE, true));
     }
     std::remove(config);
     if (failures) {

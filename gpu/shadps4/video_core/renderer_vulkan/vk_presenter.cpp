@@ -354,6 +354,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
             if (!logged.exchange(true)) {
                 LOG_WARNING(Render_Vulkan, "No drawable from the layer: skipping frame(s)");
             }
+            BbOverlay::Render(nullptr, nullptr, 0, 0); // FPS timing, the menu's pending save
             pool->Free(frame);
             return;
         }

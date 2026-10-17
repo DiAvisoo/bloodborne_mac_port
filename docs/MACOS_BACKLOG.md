@@ -462,7 +462,22 @@ Each item: what was done for now, what the refinement is, and where it lives.
   ini naming the removed FSR 4) saved the old ini value back. Scripted menu input
   (`BB_MENU_INPUT`, in game, `BB_MENU_TRACE=1`): jitter off/on, preset, typed sharpness and Off
   were all saved and stayed; the jitter toggle never flipped back. Still open: the user's
-  original jitter report (not reproduced).
+  original jitter report (not reproduced). Also open: once (run g2, 2026-10-17) a value typed into the
+  Sharpness field showed "0.5", Enter was delivered and a save followed, yet the ini kept 0.30;
+  not reproduced in later runs. `BB_MENU_TRACE=1` now also logs sharpness and the requested
+  upscaler, so a repeat shows whether the widget ever stored it.
+- **Upscaler fallback and later preset changes (Metal renderer).** The fallback for an
+  unavailable provider (`BbSettings::FallbackUpscaler`) is resolved at start and on a menu
+  choice with the preset of that moment: on a Mac without the MetalFX temporal scaler, TAA chosen
+  as fallback at Native AA stays TAA after a change to a scaled preset (and off stays off), and
+  with the startup patch (`live_resolution=0`) patches.py still renders fsr3 at the scaled size
+  while the fallback is off. Unreachable on Apple Silicon (all have MetalFX); re-resolve on preset
+  changes and feed the fallback to patches.py if Intel/other GPUs are ever supported.
+- **Overlay font atlas updates while a present may sample it.** imgui_impl_metal (1.92) writes new
+  glyphs into the atlas texture with `replaceRegion` during `RenderDrawData`, while an earlier
+  present still in flight may read it (upstream behaviour, Huax's port too): at most a transient
+  glyph flicker the first time new characters appear. Refinement: double-buffer the atlas or wait
+  for the previous present before an update.
 - **Launcher and `.app` bundle.** *Done 2026-10-14 night:* `scripts/macos/make_app.sh` builds a
   local `Bloodborne.app` (launcher for this checkout, game icon from `sce_sys/icon0.png`, log in
   `~/Library/Logs/Bloodborne`, error dialog; the window process runs as the bundle's executable

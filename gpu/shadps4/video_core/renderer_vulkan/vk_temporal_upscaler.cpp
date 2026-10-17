@@ -236,7 +236,10 @@ bool TemporalUpscaler::OnFrameStart() {
                 BbSettings::Get().output_res.store(output);
             }
             if (fields == 3 && provider >= 0 && provider < BbSettings::UpscalerCount) {
-                BbSettings::Get().upscaler.store(provider);
+                // What runs (an unavailable provider falls back); the saved choice is kept.
+                const auto& v = BbSettings::Get();
+                BbSettings::Get().upscaler.store(BbSettings::FallbackUpscaler(
+                    provider, v.metalfx_supported, v.fsr3_supported, v.preset));
             }
             std::fclose(f);
         }

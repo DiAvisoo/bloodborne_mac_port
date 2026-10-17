@@ -394,10 +394,11 @@ void Label(const char* text) {
 /// Segmented control (a row of mutually exclusive buttons). Picks need one click on the
 /// visible option: nothing pops up over other options, so a stray second click lands on the
 /// same control instead of a list item. Falls back to a dropdown when the options don't fit.
-/// Returns the index picked this frame, or -1.
+/// Returns the index picked this frame, or -1. A click on the selected option counts only with
+/// `reselect` (it shows what runs, which the user may want to choose explicitly).
 int Segmented(const char* id, const char* const* labels, int count, int current,
               const bool* enabled = nullptr, const char* const* tips = nullptr,
-              bool accent = true, float width = 0.0f) {
+              bool accent = true, float width = 0.0f, bool reselect = false) {
     const ImGuiStyle& style = ImGui::GetStyle();
     const float pad_x = 12.0f * base_scale;
     const float inset = 2.0f * base_scale;
@@ -448,7 +449,7 @@ int Segmented(const char* id, const char* const* labels, int count, int current,
         ImGui::PushID(i);
         if (ImGui::InvisibleButton(labels[i], ImVec2(w, height - inset * 2.0f),
                                    ImGuiButtonFlags_EnableNav) &&
-            !selected) {
+            (!selected || reselect)) {
             picked = i;
         }
         ImGui::PopID();
@@ -657,7 +658,10 @@ void DisplayTab(BbSettings::Values& s) {
     Label("Upscaler");
     InfoTip("Temporal upscalers build each frame from several previous ones: sharper edges, and "
             "with a lower preset, a faster game. DLSS and XeSS are planned for later.");
-    if (const int picked = Segmented("upscaler", labels, choice_count, current, available, tips);
+    // The selected segment is what runs; while that is a fallback for the saved choice, a click
+    // on it saves it as the choice.
+    if (const int picked = Segmented("upscaler", labels, choice_count, current, available, tips,
+                                     true, 0.0f, requested != upscaler);
         picked >= 0 && choices[picked] != requested) {
         BbSettings::ChooseUpscaler(choices[picked]);
         MarkChanged();
@@ -1477,7 +1481,8 @@ namespace {
 /// mouse events while the screen is locked). Checked about twice a second; the file is read,
 /// removed and each whitespace-separated token fed to HandleEvent as the window thread would:
 /// cmd-comma, esc, tab, space, enter, up/down/left/right, cmd-hold/cmd-release, text:<chars>,
-/// click:<x>,<y> (drawable pixels).
+/// click:<x>,<y> (drawable pixels). Write the file elsewhere and mv it into place: a file read
+/// while it is still being written loses the tokens not yet written.
 void ScriptedInput() {
     static const char* path = std::getenv("BB_MENU_INPUT");
     static int presents = 0;
@@ -1587,11 +1592,15 @@ void Render(void* command_buffer, void* target, u32 width, u32 height) {
     io.DisplaySize = ImVec2(float(width), float(height));
     if (menu_trace) {
         // Changes to these not made by a widget in the previous menu frame come from elsewhere.
-        static int last[3] = {-1, -1, -1};
+        // Sharpness in hundredths (typed values: Cmd+click on the slider).
+        static int last[5] = {-1, -1, -1, -1, -1};
         const auto& s = BbSettings::Get();
-        const int now_values[3] = {int(s.jitter.load()), s.upscaler.load(), s.preset.load()};
-        static const char* names[3] = {"jitter", "upscaler", "preset"};
-        for (int i = 0; i < 3; ++i) {
+        const int now_values[5] = {int(s.jitter.load()), s.upscaler.load(), s.preset.load(),
+                                   s.requested_upscaler.load(),
+                                   int(std::lround(s.sharpness.load() * 100.0f))};
+        static const char* names[5] = {"jitter", "upscaler", "preset", "requested upscaler",
+                                       "sharpness x100"};
+        for (int i = 0; i < 5; ++i) {
             if (last[i] != -1 && last[i] != now_values[i]) {
                 std::printf("menu: %s %d -> %d (%s)\n", names[i], last[i], now_values[i],
                             widget_changed_this_frame ? "by a widget" : "NOT by a widget");
