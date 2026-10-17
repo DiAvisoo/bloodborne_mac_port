@@ -70,18 +70,30 @@ BufferCache::BufferCache(Metal::Device& device_, Vulkan::Scheduler& scheduler_,
     // the GPU again and again, and with 16 GiB on a 36 GB Mac (M5 Max, macOS 27) that wiring
     // never settled. Metal System Trace: 254 GiB wired in 8 s, 224 GiB of it the 4 GiB arena
     // pages; GPU work started ~1.2 s after submission, 7 FPS. 12 GiB: 60 FPS with ~110 ms
-    // stalls four times a second; 8 GiB: 60 FPS, the same scene.
-    const u64 wanted_pages = [] {
+    // stalls four times a second; 8 GiB: 60 FPS, the same scene. The lazily committed arena
+    // (mtl_buffer.mm, BB_ARENA_LAZY) does not change this: on that Mac 16 GiB ran at 7-9 FPS
+    // lazy or not where 8 GiB ran at full speed (2026-10-18), so the cap does not depend on it.
+    // The log line names what decided the size: past the arena the game stops in GetArena.
+    u64 memsize = 0;
+    size_t memsize_size = sizeof memsize;
+    if (sysctlbyname("hw.memsize", &memsize, &memsize_size, nullptr, 0) != 0) {
+        memsize = 0;
+    }
+    const char* reason = "the default";
+    const u64 wanted_pages = [&] {
         const char* env = std::getenv("BB_ARENA_GIB");
         const u64 gib = env ? std::strtoull(env, nullptr, 10) : 0;
         if (gib >= 4) {
+            reason = "BB_ARENA_GIB";
             return std::min<u64>(gib / 4, 6);
         }
         u64 pages = MacArenaPages;
-        u64 memsize = 0;
-        size_t size = sizeof memsize;
-        if (sysctlbyname("hw.memsize", &memsize, &size, nullptr, 0) == 0 && memsize) {
-            pages = std::min(pages, std::max<u64>(2, (memsize / 4) >> ARENA_PAGE_BITS));
+        if (memsize) {
+            const u64 by_memory = std::max<u64>(2, (memsize / 4) >> ARENA_PAGE_BITS);
+            if (by_memory < pages) {
+                pages = by_memory;
+                reason = "a quarter of the Mac's memory";
+            }
         }
         return pages;
     }();
@@ -95,13 +107,17 @@ BufferCache::BufferCache(Metal::Device& device_, Vulkan::Scheduler& scheduler_,
         max_buffer = std::min<u64>(max_buffer, std::strtoull(env, nullptr, 10) << 30);
     }
     const u64 arena_pages = std::min<u64>(wanted_pages, max_buffer >> ARENA_PAGE_BITS);
+    if (arena_pages < wanted_pages) {
+        reason = "the largest Metal buffer";
+    }
     ASSERT_MSG(arena_pages > 0,
                "This Mac's GPU allows buffers of {:.1f} GiB; the game needs 4 GiB (a Mac with "
                "at least 16 GB of memory)",
                double(max_buffer) / double(1_GB));
-    std::printf("GPU arena: %llu GiB (largest Metal buffer on this Mac: %.1f GiB)\n",
-                (unsigned long long)(arena_pages << ARENA_PAGE_BITS >> 30),
-                double(max_buffer) / double(1_GB));
+    std::printf("GPU arena: %llu GiB (%s; the Mac has %.0f GB of memory, its largest Metal buffer "
+                "is %.1f GiB)\n",
+                (unsigned long long)(arena_pages << ARENA_PAGE_BITS >> 30), reason,
+                double(memsize) / 1e9, double(max_buffer) / double(1_GB));
     mac_arena_end = MacArenaBase + (arena_pages << ARENA_PAGE_BITS);
     const auto* arena = &arenas.emplace_back(device, MemoryType::DeviceLocal, MacArenaBase,
                                              arena_pages << ARENA_PAGE_BITS, "Guest Arena");
