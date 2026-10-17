@@ -97,7 +97,8 @@ void WithAutoreleasePool(const std::function<void()>& body);
 
 /// A second command queue for presents. Its command buffers can wait for a device tick of the
 /// main queue (the shared event) and report completion through a callback. They are committed
-/// raw (never through Device::Commit, whose ticks assume one queue).
+/// raw (never through Device::Commit, whose ticks assume one queue); their GPU time counts in
+/// Device::GpuBusyNs.
 class PresentQueue {
 public:
     /// `shutdown_timeout_ms`: how long the destructor waits for command buffers in flight.

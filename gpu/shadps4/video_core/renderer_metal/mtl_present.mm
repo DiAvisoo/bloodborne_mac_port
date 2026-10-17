@@ -231,6 +231,7 @@ void WithAutoreleasePool(const std::function<void()>& body) {
 struct PresentQueue::Impl {
     id<MTLCommandQueue> queue;
     id<MTLSharedEvent> event; ///< the device's (Device::Commit signals it with each tick)
+    Device* device{};         ///< counts the present command buffers' GPU time (GpuBusyNs)
     /// What completion handlers touch; the destructor waits for them, so a handler never
     /// outlives it.
     std::mutex mutex;
@@ -246,6 +247,7 @@ PresentQueue::PresentQueue(Device& device, u32 shutdown_timeout_ms)
     ASSERT_MSG(impl->queue != nil, "No Metal present queue");
     impl->queue.label = @"Present";
     impl->event = device.GetImpl().event;
+    impl->device = &device;
 }
 
 PresentQueue::~PresentQueue() {
@@ -282,6 +284,7 @@ void PresentQueue::Commit(void* command_buffer, void* drawable,
         std::scoped_lock lock{impl->mutex};
         ++impl->in_flight;
     }
+    impl->device->TrackGpuTime((__bridge void*)cmd);
     Impl* const state = impl.get();
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
       if (done.status == MTLCommandBufferStatusError) {

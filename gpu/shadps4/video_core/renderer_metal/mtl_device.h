@@ -88,6 +88,15 @@ public:
     [[nodiscard]] u64 ErrorCount() const noexcept {
         return counters->errors.load(std::memory_order_relaxed);
     }
+    /// GPU busy time so far (ns): the union of the GPU intervals (GPUStartTime..GPUEndTime) of
+    /// the completed command buffers committed here (Commit, CommitUntracked) or passed to
+    /// TrackGpuTime. Intervals that overlap one already counted (two queues) count once.
+    [[nodiscard]] u64 GpuBusyNs() const noexcept {
+        return counters->gpu_busy_ns.load(std::memory_order_relaxed);
+    }
+    /// Counts `command_buffer`'s (id<MTLCommandBuffer>, not committed yet) GPU interval in
+    /// GpuBusyNs once it completes: for command buffers committed on other queues (present).
+    void TrackGpuTime(void* command_buffer);
 
 private:
     std::unique_ptr<Impl> impl;
@@ -102,6 +111,9 @@ private:
     struct Counters {
         std::atomic<u64> gpu_tick{0};
         std::atomic<u64> errors{0};
+        std::atomic<u64> gpu_busy_ns{0};
+        std::mutex busy_mutex;
+        double busy_end{}; ///< latest GPUEndTime counted (s, busy_mutex)
     };
     std::shared_ptr<Counters> counters{std::make_shared<Counters>()};
 };

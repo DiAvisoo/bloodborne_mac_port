@@ -215,6 +215,24 @@ void TestBlits() {
     Expect(device.ErrorCount() == 0, "blits ran without errors");
 }
 
+/// GPU busy time: the device sums the GPU intervals of the command buffers it commits (tracked
+/// and untracked; overlapping intervals count once), read by the frame stats line.
+void TestGpuBusyTime() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    Expect(device.GpuBusyNs() == 0, "no GPU time before any commit");
+    id<MTLBuffer> big = SharedBuffer(device, 64u << 20);
+    encoder.FillBuffer(Ref(big), 64u << 20, 0x11111111u);
+    device.Wait(encoder.Submit());
+    const u64 after_tracked = device.GpuBusyNs();
+    Expect(after_tracked > 0, "a committed command buffer reports GPU busy time");
+    Expect(after_tracked < 5'000'000'000ull, "the busy time is plausible (under 5 s)");
+    encoder.FillBuffer(Ref(big), 64u << 20, 0x22222222u);
+    encoder.SubmitUntracked();
+    device.Wait(encoder.Submit()); // the queue completes in order: the untracked one is done
+    Expect(device.GpuBusyNs() > after_tracked, "untracked command buffers count too");
+}
+
 void TestKeepAlive() {
     Metal::Device device;
     Metal::Encoder encoder{device};
@@ -1851,6 +1869,7 @@ int main() {
         TestTicks();
         TestDeviceLifetime();
         TestBlits();
+        TestGpuBusyTime();
         TestKeepAlive();
         TestWaitMeansCompleted();
         TestCompute();

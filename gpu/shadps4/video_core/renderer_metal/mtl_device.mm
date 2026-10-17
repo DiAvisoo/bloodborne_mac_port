@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: Metal::Device (Metal-native renderer, spec component 1).
 
+#include <algorithm>
 #include <atomic>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -76,7 +77,26 @@ void Device::Finish() {
 }
 
 void Device::CommitUntracked(void* command_buffer) {
+    TrackGpuTime(command_buffer);
     [(__bridge id<MTLCommandBuffer>)command_buffer commit];
+}
+
+void Device::TrackGpuTime(void* command_buffer) {
+    std::shared_ptr<Counters> shared = counters;
+    [(__bridge id<MTLCommandBuffer>)command_buffer addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      const double start = done.GPUStartTime, end = done.GPUEndTime;
+      if (!(end > start) || start <= 0) {
+          return; // never ran (error) or no work
+      }
+      std::scoped_lock lock{shared->busy_mutex};
+      // Completion order is close to start order: only the part after the latest end counted
+      // is new (command buffers of two queues may overlap).
+      const double from = std::max(start, shared->busy_end);
+      if (end > from) {
+          shared->gpu_busy_ns.fetch_add(u64((end - from) * 1e9), std::memory_order_relaxed);
+          shared->busy_end = end;
+      }
+    }];
 }
 
 void Device::MakeResident(void* buffer) {
@@ -108,6 +128,8 @@ u64 Device::Commit(void* command_buffer) {
     id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)command_buffer;
     const u64 tick = current_tick.fetch_add(1, std::memory_order_acq_rel);
     [cmd encodeSignalEvent:impl->event value:tick];
+    // Before the tick handler: when Wait(tick) returns, this command buffer's time is counted.
+    TrackGpuTime(command_buffer);
     std::shared_ptr<Counters> shared = counters;
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
         if (done.status == MTLCommandBufferStatusError) {
