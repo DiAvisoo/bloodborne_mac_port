@@ -17,6 +17,7 @@
 #include "bbport_settings.h"
 #include "bbport_overlay_metal.h"
 #include "imgui.h"
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
 
 // DejaVu Sans, embedded (third_party/fonts, Bitstream Vera license): Latin, Cyrillic and
 // symbols such as U+2318 (Cmd) and U+2192 (arrow). ImGui 1.92 rasterizes glyphs on demand.
@@ -95,6 +96,9 @@ float base_scale = 1.0f;
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
+// "Capture Frame": FrameCapture::Written() when it was pressed (~0: no request), and when.
+u64 capture_base = ~u64{0};
+std::chrono::steady_clock::time_point capture_time;
 
 void SetOpen(bool value) {
     if (menu_open.exchange(value) == value) {
@@ -1070,7 +1074,19 @@ void Menu() {
         ImGui::Dummy(ImVec2(0.0f, 6.0f * base_scale));
 
         ImGui::AlignTextToFramePadding();
-        if (restart) {
+        const bool capture_status =
+            capture_base != ~u64{0} &&
+            std::chrono::steady_clock::now() - capture_time < std::chrono::seconds(15);
+        if (capture_status) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kSecondary);
+            if (Vulkan::FrameCapture::Written() > capture_base) {
+                ImGui::TextUnformatted(
+                    "Frame saved to ~/Library/Logs/Bloodborne/captures: take a screenshot too");
+            } else {
+                ImGui::TextUnformatted("Capturing the next frame...");
+            }
+            ImGui::PopStyleColor();
+        } else if (restart) {
             const float line = ImGui::GetTextLineHeight();
             const ImVec2 p = ImGui::GetCursorScreenPos();
             const float r = 4.0f * base_scale;
@@ -1087,13 +1103,24 @@ void Menu() {
         }
         const char* apply = "Apply and Restart Game";
         const char* close = "Close";
-        float buttons = ButtonWidth(close);
+        // Records the frame's passes for a bug report (vk_frame_capture.h).
+        const char* capture = "Capture Frame";
+        float buttons = ButtonWidth(close) + ButtonWidth(capture) + style.ItemSpacing.x;
         if (restart) {
             buttons += ButtonWidth(apply) + style.ItemSpacing.x;
         }
         ImGui::SameLine();
         ImGui::SetCursorScreenPos(
             ImVec2(content_right - buttons, ImGui::GetCursorScreenPos().y));
+        if (ImGui::Button(capture)) {
+            capture_base = Vulkan::FrameCapture::Written();
+            capture_time = std::chrono::steady_clock::now();
+            Vulkan::FrameCapture::Arm();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Records what the GPU draws in the next frame, for a bug report");
+        }
+        ImGui::SameLine();
         if (ImGui::Button(close)) {
             keep_open = false;
         }

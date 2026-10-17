@@ -45,11 +45,23 @@ public:
     static void Buffer(u64 stage_hash, u32 slot, VAddr address, const void* data, u64 size);
     static void Note(const char* text);
 
+    /// bbport: records the next full frame, as the trigger file does (the overlay's "Capture
+    /// frame" button). Written to BB_CAPTURE_DIR, else ~/Library/Logs/Bloodborne/captures.
+    static void Arm() {
+        u32 idle = Idle;
+        state.compare_exchange_strong(idle, Armed, std::memory_order_acq_rel);
+    }
+    /// Captures written so far (the overlay shows when its request is done).
+    static u64 Written() {
+        return written.load(std::memory_order_acquire);
+    }
+
 private:
     enum : u32 { Idle, Armed, Recording };
     static inline std::atomic<u32> state{Idle};
     static inline std::atomic<u64> flips{0};
     static inline std::atomic<VAddr> last_presented{0};
+    static inline std::atomic<u64> written{0};
 };
 
 } // namespace Vulkan

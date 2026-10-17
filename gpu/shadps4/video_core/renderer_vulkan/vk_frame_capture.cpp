@@ -84,9 +84,21 @@ void AddShader(Entry& entry, u64 hash) {
 }
 
 void Write(VAddr presented) {
-    const char* dir = std::getenv("BB_CAPTURE_DIR");
-    const std::string path =
-        std::format("{}/frame_{}.txt", dir ? dir : ".", static_cast<long long>(std::time(nullptr)));
+    // bbport: BB_CAPTURE_DIR, else next to the game log (bug reports from players).
+    std::string dir;
+    if (const char* env = std::getenv("BB_CAPTURE_DIR")) {
+        dir = env;
+    } else if (const char* home = std::getenv("HOME")) {
+        dir = std::string(home) + "/Library/Logs/Bloodborne/captures";
+    } else {
+        dir = ".";
+    }
+    std::error_code mkdir_error;
+    std::filesystem::create_directories(dir, mkdir_error);
+    char stamp[32];
+    const std::time_t now = std::time(nullptr);
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&now));
+    const std::string path = std::format("{}/frame_{}.txt", dir, stamp);
     FILE* f = std::fopen(path.c_str(), "w");
     if (!f) {
         std::printf("Frame capture: cannot write %s\n", path.c_str());
@@ -186,6 +198,7 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
     if (display && new_pass) {
         if (state.load(std::memory_order_relaxed) == Recording) {
             Write(last_presented.load(std::memory_order_relaxed));
+            written.fetch_add(1, std::memory_order_release);
             entries.clear();
             pending_sampled.clear();
             pending_buffers.clear();
