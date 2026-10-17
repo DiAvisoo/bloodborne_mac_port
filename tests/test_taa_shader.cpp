@@ -1,59 +1,47 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Run the production TAA shader on synthetic inputs, including undefined/invalid history.
+// Metal-native (M5): the kernels are built by Taa::Build (Metal::BuildHostKernel) and recorded by
+// Taa::Record / Taa::RecordSharpen, as in the renderer. argv[1] (optional): a SPIR-V file to run
+// instead of the TAA kernel.
 #include <cassert>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <fstream>
+#include <string>
+#include <unistd.h>
 #include <vector>
-#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/renderer_metal/mtl_encoder.h"
+#include "video_core/renderer_metal/mtl_texture.h"
+#include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/texture_cache/image.h"
-#include "video_core/host_shaders/taa_comp.h"
-#include "video_core/host_shaders/taa_sharpen_comp.h"
-#include <vk_mem_alloc.h>
+#include "video_core/renderer_vulkan/vk_taa.h"
 
 int main(int argc, char** argv) {
-    using namespace Vulkan;
-    Instance instance(0, false);
-    static vk::detail::DynamicLoader loader;
-    vk::detail::DispatchLoaderDynamic d;
-    d.init(loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
-    d.init(instance.GetInstance()); d.init(instance.GetDevice());
-    const auto device = instance.GetDevice();
-    Scheduler scheduler(instance);
+    // No game: the host kernels' MSL disk cache goes to a temporary directory.
+    std::string dir_template =
+        (std::filesystem::temp_directory_path() / "bb-taa-shader-test.XXXXXX").string();
+    const char* cache_dir = mkdtemp(dir_template.data());
+    assert(cache_dir);
+    Metal::SetHostKernelCacheDir(cache_dir);
+    Metal::Device device;
+    Vulkan::Scheduler scheduler(device, false);
     // Odd dimensions and a pixel beyond 2000 exercise bounds and subpixel precision.
     constexpr u32 W = 2049, H = 7, N = W * H, X = 2010, center = 3 * W + X;
-    std::array<VideoCore::UniqueImage, 7> images;
-    std::array<vk::UniqueImageView, 7> views;
+    std::array<Metal::Object, 7> images;
     for (u32 i = 0; i < images.size(); ++i) {
         const auto format = i != 4 && i != 6 ? vk::Format::eR32G32B32A32Sfloat
                                   : vk::Format::eR16G16B16A16Sfloat;
-        images[i] = VideoCore::UniqueImage(device, instance.GetAllocator());
-        images[i].Create({.imageType = vk::ImageType::e2D, .format = format,
-            .extent = {W,H,1}, .mipLevels = 1, .arrayLayers = 1,
-            .samples = vk::SampleCountFlagBits::e1, .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
-                     vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst});
-        views[i] = device.createImageViewUnique({.image = vk::Image(images[i]),
-            .viewType = vk::ImageViewType::e2D, .format = format,
-            .subresourceRange = {vk::ImageAspectFlagBits::eColor,0,1,0,1}},nullptr,d).value;
+        images[i] = Metal::CreateTexture(device, {.pixel_format=Metal::VkToMtl::PixelFormat(format),
+            .width=W, .height=H, .shader_write=true}, "taa-shader-test", nullptr);
+        assert(images[i]);
     }
-    std::array<vk::DescriptorSetLayoutBinding,7> bindings{};
-    for (u32 i = 0; i < bindings.size(); ++i) {
-        bindings[i] = {.binding=i,
-            .descriptorType=i<4 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage,
-            .descriptorCount=1,.stageFlags=vk::ShaderStageFlagBits::eCompute};
-    }
-    auto descriptors = device.createDescriptorSetLayoutUnique({
-        .flags=vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
-        .bindingCount=u32(bindings.size()),.pBindings=bindings.data()},nullptr,d).value;
-    const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute,0,64};
-    auto layout = device.createPipelineLayoutUnique({.setLayoutCount=1,.pSetLayouts=&*descriptors,
-        .pushConstantRangeCount=1,.pPushConstantRanges=&push},nullptr,d).value;
     std::vector<u32> override_code;
     if (argc > 1) {
         std::ifstream source(argv[1],std::ios::binary|std::ios::ate);
@@ -63,31 +51,16 @@ int main(int argc, char** argv) {
         source.seekg(0); source.read(reinterpret_cast<char*>(override_code.data()),bytes);
         assert(source);
     }
-    auto module = device.createShaderModuleUnique({
-        .codeSize=override_code.empty() ? sizeof(TAA_COMP) : override_code.size()*4,
-        .pCode=override_code.empty() ? TAA_COMP : override_code.data()},nullptr,d).value;
-    auto pipeline = device.createComputePipelineUnique({}, {
-        .stage={.stage=vk::ShaderStageFlagBits::eCompute,.module=*module,.pName="main"},
-        .layout=*layout},nullptr,d).value;
-    auto sampler = device.createSamplerUnique({.magFilter=vk::Filter::eNearest,
-        .minFilter=vk::Filter::eNearest,.mipmapMode=vk::SamplerMipmapMode::eNearest,
-        .addressModeU=vk::SamplerAddressMode::eClampToEdge,
-        .addressModeV=vk::SamplerAddressMode::eClampToEdge,
-        .addressModeW=vk::SamplerAddressMode::eClampToEdge},nullptr,d).value;
-    VkBuffer staging{}; VmaAllocation allocation{}; VmaAllocationInfo ai{};
-    const VkBufferCreateInfo bi{.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size=N*16*4, .usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    const VmaAllocationCreateInfo ac{.flags=VMA_ALLOCATION_CREATE_MAPPED_BIT |
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, .usage=VMA_MEMORY_USAGE_AUTO,
-        .requiredFlags=VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-    assert(vmaCreateBuffer(instance.GetAllocator(),&bi,&ac,&staging,&allocation,&ai)==VK_SUCCESS);
-    const auto barrier = [&](vk::CommandBuffer cmd, vk::PipelineStageFlags2 source,
-                             vk::AccessFlags2 source_access, vk::PipelineStageFlags2 dest,
-                             vk::AccessFlags2 dest_access) {
-        const vk::MemoryBarrier2 b{.srcStageMask=source,.srcAccessMask=source_access,
-            .dstStageMask=dest,.dstAccessMask=dest_access};
-        cmd.pipelineBarrier2({.memoryBarrierCount=1,.pMemoryBarriers=&b},d);
-    };
+    const Vulkan::Taa::Kernels kernels = Vulkan::Taa::Build(device, override_code);
+    // The renderer's scene depth is D32S8, sampled where the kernel declares a sampler2D.
+    const Metal::Object scene_depth_image=Metal::CreateTexture(device,{.pixel_format=
+        Metal::VkToMtl::PixelFormat(vk::Format::eD32SfloatS8Uint),.width=W,.height=H},
+        "taa-shader-test depth",nullptr);
+    assert(scene_depth_image);
+    // Four RGBA32F inputs, then D32 depth values for the D32S8 depth.
+    VideoCore::Buffer staging(device,VideoCore::MemoryType::HostCached,0,N*16*4+N*4,"staging");
+    assert(!staging.mapped_data.empty());
+    void* const mapped = staging.mapped_data.data();
     const auto half = [](u16 v) {
         const int exponent=(v>>10)&31;
         const float mantissa=float(v&1023);
@@ -99,8 +72,8 @@ int main(int argc, char** argv) {
                          float scene_depth=0.5f, float z_translation=0.f,
                          float jitter_x=0.f, bool edge=false, float depth_slope=0.f,
                          bool thin_edge=false, bool history_edge=false,
-                         bool thin_history=false) {
-        auto* pixels = static_cast<float*>(ai.pMappedData);
+                         bool thin_history=false, bool d32s8=false) {
+        auto* pixels = static_cast<float*>(mapped);
         for (u32 image = 0; image < 4; ++image) {
             for (u32 p = 0; p < N; ++p) {
                 float* c=pixels+image*N*4+p*4;
@@ -118,61 +91,38 @@ int main(int argc, char** argv) {
                 if (image==3 && history_edge && p%W!=X) c[0]=c[1]=c[2]=0.25f;
             }
         }
+        // The same depth values for the D32S8 variant (the red channel of image 1).
+        for (u32 p = 0; p < N; ++p) pixels[N*16+p]=pixels[N*4+p*4];
         // A dark neighbor and a bright neighbor make history clipping measurable.
         pixels[(center-1)*4]=pixels[(center-1)*4+1]=pixels[(center-1)*4+2]=0.f;
-        const auto cmd=scheduler.CommandBuffer();
-        std::array<vk::ImageMemoryBarrier2,7> transitions{};
-        for (u32 i=0;i<7;++i) {
-            transitions[i]={.srcStageMask=vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask=vk::AccessFlagBits2::eNone,.dstStageMask=vk::PipelineStageFlagBits2::eAllCommands,
-                .dstAccessMask=vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite,
-                .oldLayout=vk::ImageLayout::eUndefined,.newLayout=vk::ImageLayout::eGeneral,
-                .image=vk::Image(images[i]),.subresourceRange={vk::ImageAspectFlagBits::eColor,0,1,0,1}};
-        }
-        cmd.pipelineBarrier2({.imageMemoryBarrierCount=7,.pImageMemoryBarriers=transitions.data()},d);
-        for (u32 i=0;i<4;++i) {
-            const vk::BufferImageCopy region{.bufferOffset=i*N*16,
-                .imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},.imageExtent={W,H,1}};
-            cmd.copyBufferToImage(staging,vk::Image(images[i]),vk::ImageLayout::eGeneral,region,d);
-        }
-        barrier(cmd,vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite,
-                vk::PipelineStageFlagBits2::eComputeShader,vk::AccessFlagBits2::eShaderRead);
-        std::array<vk::DescriptorImageInfo,7> infos{};
-        std::array<vk::WriteDescriptorSet,7> writes{};
-        for (u32 i=0;i<7;++i) {
-            infos[i]={.sampler=i<4 ? *sampler : vk::Sampler{}, .imageView=*views[i],
-                .imageLayout=vk::ImageLayout::eGeneral};
-            writes[i]={.dstBinding=i,.descriptorCount=1,.descriptorType=bindings[i].descriptorType,
-                .pImageInfo=&infos[i]};
-        }
-        struct Params {
-            float x,y;u32 reset,pad;
-            std::array<float,4> proj,prev_proj,previous_z;
-        } params{jitter_x,0,reset,0,{1,1,1,-0.05f},{1,1,1,-0.05f},
-                 {0,0,1,z_translation}};
-        cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline,d);
-        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,*layout,0,writes,d);
-        cmd.pushConstants(*layout,vk::ShaderStageFlagBits::eCompute,0,sizeof(params),&params,d);
-        cmd.dispatch((W+7)/8,(H+7)/8,1,d);
-        barrier(cmd,vk::PipelineStageFlagBits2::eComputeShader,vk::AccessFlagBits2::eShaderWrite,
-                vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferRead);
-        for (u32 i=4;i<6;++i) {
-            const vk::BufferImageCopy region{.bufferOffset=(i-4)*16,
-                .imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
-                .imageOffset={s32(X),3,0},.imageExtent={1,1,1}};
-            cmd.copyImageToBuffer(vk::Image(images[i]),vk::ImageLayout::eGeneral,staging,region,d);
-        }
-        barrier(cmd,vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite,
-                vk::PipelineStageFlagBits2::eHost,vk::AccessFlagBits2::eHostRead);
+        const Vulkan::Taa::Params params{{jitter_x,0},reset,0,
+            {{{1,1,1,-0.05f},{1,1,1,-0.05f},{0,0,1,z_translation}}}};
+        void* const depth_texture = d32s8 ? scene_depth_image.Get() : images[1].Get();
+        scheduler.Record([&,buffer=staging.Handle(),depth_texture](Metal::Encoder& e) {
+            for (u32 i=0;i<4;++i) {
+                e.CopyBufferToTexture({buffer,u64(i)*N*16},W*16,N*16,images[i].Get(),0,0,{},
+                    {W,H,1});
+            }
+            if (d32s8) {
+                e.CopyBufferToTexture({buffer,u64(N)*16*4},W*4,N*4,depth_texture,0,0,{},{W,H,1},
+                    Metal::BlitAspect::Depth);
+            }
+            Vulkan::Taa::Record(e,kernels,{images[0].Get(),depth_texture,images[2].Get(),
+                images[3].Get(),images[4].Get(),images[5].Get(),images[6].Get()},params,W,H);
+            for (u32 i=4;i<6;++i) {
+                e.CopyTextureToBuffer(images[i].Get(),0,0,{X,3,0},{1,1,1},{buffer,(i-4)*16},
+                    i==4 ? 8 : 16,i==4 ? 8 : 16);
+            }
+        });
         scheduler.Finish();
-        const auto* result=static_cast<u16*>(ai.pMappedData);
+        const auto* result=static_cast<u16*>(mapped);
         if (std::abs(half(result[0])-expected)>=0.001f) {
             std::fprintf(stderr,"TAA regression: %s: actual %.6f, expected %.6f\n",
                          label,half(result[0]),expected);
             std::fflush(stdout);
         }
         assert(std::abs(half(result[0])-expected)<0.001f);
-        const auto* next=reinterpret_cast<const float*>(static_cast<const char*>(ai.pMappedData)+16);
+        const auto* next=reinterpret_cast<const float*>(static_cast<const char*>(mapped)+16);
         assert(half(result[3])==1.f &&
                std::abs(next[3]-(thin_edge ? 0.99f : scene_depth+jitter_x*depth_slope))<1e-7f);
         assert(std::abs(next[0]-expected)<0.001f);
@@ -206,60 +156,26 @@ int main(int argc, char** argv) {
         false,0.5f,0,0,false,0,false,false,true);
     run("tiny motion at large pixel coordinate",0,0.75f,0.5f,-0.00003f,1,0.739985f,
         false,0.5f,0,0,false,0,false,true);
-    std::array<vk::DescriptorSetLayoutBinding,2> sharpen_bindings{};
-    for (u32 i=0;i<2;++i) sharpen_bindings[i]={.binding=i,
-        .descriptorType=vk::DescriptorType::eStorageImage,.descriptorCount=1,
-        .stageFlags=vk::ShaderStageFlagBits::eCompute};
-    auto sharpen_desc=device.createDescriptorSetLayoutUnique({
-        .flags=vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
-        .bindingCount=2,.pBindings=sharpen_bindings.data()},nullptr,d).value;
-    const vk::PushConstantRange sharpen_push{vk::ShaderStageFlagBits::eCompute,0,4};
-    auto sharpen_layout=device.createPipelineLayoutUnique({.setLayoutCount=1,.pSetLayouts=&*sharpen_desc,
-        .pushConstantRangeCount=1,.pPushConstantRanges=&sharpen_push},nullptr,d).value;
-    auto sharpen_module=device.createShaderModuleUnique({.codeSize=sizeof(TAA_SHARPEN_COMP),
-        .pCode=TAA_SHARPEN_COMP},nullptr,d).value;
-    auto sharpen_pipeline=device.createComputePipelineUnique({}, {
-        .stage={.stage=vk::ShaderStageFlagBits::eCompute,.module=*sharpen_module,.pName="main"},
-        .layout=*sharpen_layout},nullptr,d).value;
+    // Metal-native additions: the renderer's D32S8 scene depth instead of a float colour image.
+    run("temporal accumulation, D32S8 depth",0,0.75f,0.5f,0,1,0.74f,
+        false,0.5f,0,0,false,0,false,false,false,true);
+    run("sloping depth positive jitter, D32S8 depth",0,0.75f,0.99036f,0,1,0.746f,
+        false,0.99f,0,0.4f,false,0.0009f,false,false,false,true);
     const auto sharpen=[&](const char* label,float strength,float scale,bool flat) {
-        auto* input=static_cast<float*>(ai.pMappedData);
+        auto* input=static_cast<float*>(mapped);
         for (u32 p=0;p<N;++p) {
             for (u32 c=0;c<3;++c) input[p*4+c]=(p==center && !flat ? 0.55f : 0.5f)*scale;
             input[p*4+3]=0.99998f;
         }
-        const auto cmd=scheduler.CommandBuffer();
-        barrier(cmd,vk::PipelineStageFlagBits2::eAllCommands,
-                vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite,
-                vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite);
-        const vk::BufferImageCopy upload{.imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
-            .imageExtent={W,H,1}};
-        cmd.copyBufferToImage(staging,vk::Image(images[5]),vk::ImageLayout::eGeneral,upload,d);
-        barrier(cmd,vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite,
-                vk::PipelineStageFlagBits2::eComputeShader,
-                vk::AccessFlagBits2::eShaderStorageRead|vk::AccessFlagBits2::eShaderStorageWrite);
-        const std::array<vk::DescriptorImageInfo,2> si{{
-            {.imageView=*views[5],.imageLayout=vk::ImageLayout::eGeneral},
-            {.imageView=*views[4],.imageLayout=vk::ImageLayout::eGeneral}}};
-        std::array<vk::WriteDescriptorSet,2> sw{};
-        for (u32 i=0;i<2;++i) sw[i]={.dstBinding=i,.descriptorCount=1,
-            .descriptorType=vk::DescriptorType::eStorageImage,.pImageInfo=&si[i]};
-        cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*sharpen_pipeline,d);
-        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,*sharpen_layout,0,sw,d);
-        cmd.pushConstants(*sharpen_layout,vk::ShaderStageFlagBits::eCompute,0,4,&strength,d);
-        cmd.dispatch((W+7)/8,(H+7)/8,1,d);
-        barrier(cmd,vk::PipelineStageFlagBits2::eComputeShader,
-                vk::AccessFlagBits2::eShaderStorageRead|vk::AccessFlagBits2::eShaderStorageWrite,
-                vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferRead);
-        const vk::BufferImageCopy history_copy{.bufferOffset=N*16,
-            .imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},.imageExtent={W,H,1}};
-        cmd.copyImageToBuffer(vk::Image(images[5]),vk::ImageLayout::eGeneral,staging,history_copy,d);
-        const vk::BufferImageCopy output_copy{.bufferOffset=N*32,
-            .imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},.imageExtent={W,H,1}};
-        cmd.copyImageToBuffer(vk::Image(images[4]),vk::ImageLayout::eGeneral,staging,output_copy,d);
-        barrier(cmd,vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite,
-                vk::PipelineStageFlagBits2::eHost,vk::AccessFlagBits2::eHostRead);
+        scheduler.Record([&,buffer=staging.Handle()](Metal::Encoder& e) {
+            e.CopyBufferToTexture({buffer,0},W*16,N*16,images[5].Get(),0,0,{},{W,H,1});
+            Vulkan::Taa::RecordSharpen(e,kernels.sharpen,images[5].Get(),images[4].Get(),
+                strength,W,H);
+            e.CopyTextureToBuffer(images[5].Get(),0,0,{},{W,H,1},{buffer,u64(N)*16},W*16,N*16);
+            e.CopyTextureToBuffer(images[4].Get(),0,0,{},{W,H,1},{buffer,u64(N)*32},W*8,N*8);
+        });
         scheduler.Finish();
-        const auto* bytes=static_cast<const char*>(ai.pMappedData);
+        const auto* bytes=static_cast<const char*>(mapped);
         assert(!std::memcmp(bytes,bytes+N*16,N*16)); // Color and depth history remain exact.
         const auto* output=reinterpret_cast<const u16*>(bytes+N*32);
         for (u32 p=0;p<N;++p) {
@@ -289,5 +205,39 @@ int main(int argc, char** argv) {
     sharpen("flat black",1,0,true);
     sharpen("flat HDR",1,8,true);
     sharpen("HDR detail",1,8,false);
-    vmaDestroyBuffer(instance.GetAllocator(),staging,allocation);
+    // Metal-native addition: the LDR variant (ExtraSharpen of the UI image) writes an sRGB RGBA8
+    // texture through its RGBA8Unorm view: the stored bytes are the sharpened values, unencoded.
+    {
+        const Metal::Object ldr=Metal::CreateTexture(device,{.pixel_format=
+            Metal::VkToMtl::PixelFormat(vk::Format::eR8G8B8A8Srgb),.width=W,.height=H,
+            .shader_write=true,.format_views=true},"taa-shader-test LDR",nullptr);
+        assert(ldr);
+        const Metal::Object unorm=Metal::CreateTextureView(ldr.Get(),
+            Metal::VkToMtl::PixelFormat(vk::Format::eR8G8B8A8Unorm),Metal::TextureType::Tex2D,
+            0,1,0,1,{2,3,4,5});
+        assert(unorm);
+        auto* input=static_cast<float*>(mapped);
+        for (u32 p=0;p<N;++p) {
+            for (u32 c=0;c<3;++c) input[p*4+c]=p==center ? 0.55f : 0.5f;
+            input[p*4+3]=0.99998f;
+        }
+        scheduler.Record([&,buffer=staging.Handle()](Metal::Encoder& e) {
+            e.CopyBufferToTexture({buffer,0},W*16,N*16,images[5].Get(),0,0,{},{W,H,1});
+            Vulkan::Taa::RecordSharpen(e,kernels.sharpen_ldr,images[5].Get(),unorm.Get(),1,W,H);
+            e.CopyTextureToBuffer(ldr.Get(),0,0,{},{W,H,1},{buffer,u64(N)*16},W*4,N*4);
+        });
+        scheduler.Finish();
+        const auto* out=reinterpret_cast<const u8*>(static_cast<const char*>(mapped)+N*16);
+        for (u32 p=0;p<N;++p) {
+            if (p==center || p==center-1 || p==center+1 || p==center-W || p==center+W) continue;
+            for (u32 c=0;c<3;++c) assert(std::abs(int(out[p*4+c])-128)<=1);
+            assert(out[p*4+3]==255);
+        }
+        const float value=out[center*4]/255.f;
+        assert(std::abs(value-maximum)<=1.f/255+0.001f);
+        std::printf("TAA RCAS: LDR output through the Unorm view of an sRGB texture PASS (%.4f)\n",
+                    value);
+    }
+    assert(device.ErrorCount()==0);
+    std::filesystem::remove_all(cache_dir);
 }

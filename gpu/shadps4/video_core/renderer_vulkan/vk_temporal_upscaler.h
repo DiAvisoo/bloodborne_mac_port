@@ -34,6 +34,7 @@
 #include "video_core/renderer_metal/mtl_scale.h"
 #include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_taa.h"
 #include "video_core/texture_cache/image.h"
 
 namespace Metal {
@@ -195,9 +196,14 @@ private:
     bool Resolve(const ResolveInputs& in);
     /// Stand-in for providers not ported yet: a linear scaled copy, no history.
     bool ResolveCopy(const ResolveInputs& in);
-    bool ResolveTaa(const ResolveInputs& in);     ///< M5 Task 7: TAA kernel
+    /// TAA (native resolution): the history ping-pong and the menu's sharpen (0..2).
+    bool ResolveTaa(const ResolveInputs& in);
     bool ResolveMetalFx(const ResolveInputs& in); ///< M5 Task 8: MetalFX temporal scaler
     bool ResolveFsr3(const ResolveInputs& in);    ///< M6: FSR 3.1; false until then
+    /// Sharpness above 1 (the menu's 0..2) for providers whose own sharpening ends at 1: RCAS of
+    /// a copy of `target` (id<MTLTexture>, `width` x `height`, ShaderWrite) back into it. `ldr`:
+    /// the target is the RGBA8 UI image (sRGB or not), written through its RGBA8Unorm view.
+    void ExtraSharpen(void* target, bool ldr, u32 width, u32 height);
 
     /// A view of `texture` (made in `texture_format`) in the game's `format` with `mapping`,
     /// kept in `views` (by format and mapping) until the texture is recreated.
@@ -271,6 +277,16 @@ private:
     Metal::Object opaque_image;   ///< scene color before the blended draws
     Metal::Object reactive_image; ///< R8 reactive mask
     Metal::HostKernel merge_kernel;
+    Taa::Kernels taa;                         ///< built at construction
+    std::array<Metal::Object, 2> taa_history; ///< output size RGBA32F (TAA only): RGB, depth
+    u32 taa_next = 0;                         ///< the history written this frame
+    /// ExtraSharpen: a copy of the target (RCAS reads neighbours) in its format, and the RGBA8Unorm
+    /// views of the copy and of the UI image (LDR).
+    Metal::Object extra_sharpen_image;
+    Metal::Object extra_sharpen_view;
+    u32 extra_sharpen_format = 0;
+    u32 extra_sharpen_width = 0, extra_sharpen_height = 0;
+    Metal::Object ui_storage_view;
     Metal::HostKernel reactive_kernel;
     Metal::ScaleHelper scale; ///< scaled copies, UI depth resample and clear
 };

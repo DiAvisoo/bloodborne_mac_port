@@ -182,6 +182,10 @@ if [[ ${1:-} == --test ]]; then
         ninja -C out/gpu-arm64 camera-motion-test >/dev/null
         out/gpu-arm64/camera-motion-test 2>&1 | grep -E 'PASS|FAIL|Assertion' || { echo 'FAIL: camera-motion-test'; exit 1; }
         MTL_DEBUG_LAYER=1 out/gpu-arm64/camera-motion-test 2>&1 | grep -E 'PASS|FAIL|Assertion' || { echo 'FAIL: camera-motion-test (validation)'; exit 1; }
+        # Metal-native M5: the TAA kernel and its sharpen (Taa::Record), plain and under validation.
+        ninja -C out/gpu-arm64 taa-shader-test >/dev/null
+        out/gpu-arm64/taa-shader-test 2>&1 | grep -E 'PASS|FAIL|Assertion|regression' || { echo 'FAIL: taa-shader-test'; exit 1; }
+        MTL_DEBUG_LAYER=1 out/gpu-arm64/taa-shader-test 2>&1 | grep -E 'PASS|FAIL|Assertion|regression' || { echo 'FAIL: taa-shader-test (validation)'; exit 1; }
         # Metal-native M5: the pipeline key's depth/stencil formats follow the pass's attachment.
         ninja -C out/gpu-arm64 depth-attachment-test >/dev/null
         out/gpu-arm64/depth-attachment-test || { echo 'FAIL: depth-attachment-test'; exit 1; }

@@ -348,10 +348,20 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
                                  "Upscaler motion");
     output_image = CreateTexture(device, vk::Format::eR16G16B16A16Sfloat, ow, oh, true, true,
                                  false, "Upscaler output");
-    opaque_image = CreateTexture(device, vk::Format::eR16G16B16A16Sfloat, w, h, false, false,
+    // Opaque: also TAA's diagnostic output (BB_TAA_DIAGNOSTICS; TAA runs at render = output
+    // size), which the kernel binds as a storage texture every frame.
+    opaque_image = CreateTexture(device, vk::Format::eR16G16B16A16Sfloat, w, h, false, true,
                                  false, "Upscaler opaque scene");
     reactive_image = CreateTexture(device, vk::Format::eR8Unorm, w, h, false, true, false,
                                    "Upscaler reactive mask");
+    // TAA's history: RGB and depth, written one frame and read the next (taa_next).
+    for (auto& history : taa_history) {
+        history = upscaler == BbSettings::UpscalerTaa
+                      ? CreateTexture(device, vk::Format::eR32G32B32A32Sfloat, ow, oh, false, true,
+                                      false, "Upscaler TAA history")
+                      : Metal::Object{};
+    }
+    taa_next = 0;
     opaque_valid = false;
     mask_ready = false; // the new mask texture holds nothing yet
     reset = true;
@@ -365,6 +375,8 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
 void TemporalUpscaler::CreatePipelines() {
     merge_kernel = Metal::BuildHostKernel(device, UPSCALE_MERGE_COMP, {}, "upscale_merge");
     reactive_kernel = Metal::BuildHostKernel(device, UPSCALE_REACTIVE_COMP, {}, "upscale_reactive");
+    // TAA, its sharpen and the extra sharpen of the other providers (RGBA16F and LDR).
+    taa = Taa::Build(device);
     // The scale pipelines of every copy below: the copy resolve (RGBA16F output), the output
     // into the UI image and the menu background (RGBA8, linear or sRGB), the UI depth.
     scale.PrepareColor(PixelFormat(vk::Format::eR16G16B16A16Sfloat), Metal::ScaleFilter::Linear);
@@ -502,9 +514,14 @@ void TemporalUpscaler::RecordMerge(void* scene, bool has_reactive) {
 bool TemporalUpscaler::Resolve(const ResolveInputs& in) {
     switch (BbSettings::Get().upscaler.load()) {
     case BbSettings::UpscalerTaa:
+        // TAA's own sharpen covers the menu's whole 0..2.
         return ResolveTaa(in);
     case BbSettings::UpscalerMetalFx:
-        return ResolveMetalFx(in);
+        if (!ResolveMetalFx(in)) {
+            return false;
+        }
+        ExtraSharpen(in.output, false, in.out_width, in.out_height);
+        return true;
     case BbSettings::UpscalerFsr3:
         return ResolveFsr3(in);
     default:
@@ -523,8 +540,116 @@ bool TemporalUpscaler::ResolveCopy(const ResolveInputs& in) {
 }
 
 bool TemporalUpscaler::ResolveTaa(const ResolveInputs& in) {
-    // M5 Task 7 ports the TAA kernel (history, sharpen); until then the frame is copied.
-    return ResolveCopy(in);
+    // Native resolution only (EnsureResources refuses other sizes and makes the history).
+    if (!taa_history[0] || in.width != in.out_width || in.height != in.out_height) {
+        return false;
+    }
+    static const u32 diagnostics = [] {
+        const char* env = std::getenv("BB_TAA_DIAGNOSTICS");
+        return env ? u32(std::clamp(std::atoi(env), 1, 3)) : 0u;
+    }();
+    Taa::Params params{in.jitter, in.reset ? 1u : 0u, diagnostics,
+                       camera_motion.TaaDepthParameters()};
+    // Optional techniques for A/B in one run (BB_TOGGLE_FILE bits 51-55): tonemapped blending,
+    // YCoCg clipping, variance clipping, 3x3 reconstruction, keeping nearer history. Measured in
+    // game on 2026-10-02 (static and panning camera, interleaved captures): none improved
+    // stability beyond run noise; YCoCg clipping and the reconstruction made it worse. Default:
+    // all off.
+    params.mode |= (BbToggle::Disabled(BbToggle::TaaTonemapBlend) ? 1u << 8 : 0u) |
+                   (BbToggle::Disabled(BbToggle::TaaClip) ? 2u << 8 : 0u) |
+                   (BbToggle::Disabled(BbToggle::TaaVariance) ? 4u << 8 : 0u) |
+                   (BbToggle::Disabled(BbToggle::TaaFilter) ? 8u << 8 : 0u) |
+                   (BbToggle::Disabled(BbToggle::TaaKeepNearerHistory) ? 16u << 8 : 0u);
+    if (params.mode & 0xffu) {
+        static u32 diagnostic_frames = 0;
+        if (diagnostic_frames++ < 16) {
+            std::printf("TAA diagnostic: reset=%u jitter=%.6f,%.6f mode=%u\n", params.reset,
+                        in.jitter[0], in.jitter[1], params.mode);
+        }
+    }
+    // RCAS of the new history into the output (the history itself stays unsharpened); not over
+    // a diagnostic view.
+    const auto& settings = BbSettings::Get();
+    const float strength = std::clamp(settings.sharpness.load(), 0.0f, 2.0f);
+    const bool sharpen = settings.sharpen && strength > 0.0f && !(params.mode & 0xffu);
+    const Taa::Textures textures{
+        .color = in.color,
+        .depth = in.depth,
+        .motion = in.motion,
+        .history = taa_history[1 - taa_next].Get(),
+        .result = in.output,
+        .next_history = taa_history[taa_next].Get(),
+        .diagnostic = opaque_image.Get(),
+    };
+    scheduler.EndRendering();
+    // Metal orders the history's write in one frame before its read in the next (tracked
+    // textures, one queue); with reset the kernel ignores the undefined previous history.
+    scheduler.Record([kernels = &taa, textures, params, sharpen, strength, w = in.out_width,
+                      h = in.out_height](Metal::Encoder& e) {
+        Taa::Record(e, *kernels, textures, params, w, h);
+        if (sharpen) {
+            Taa::RecordSharpen(e, kernels->sharpen, textures.next_history, textures.result,
+                               strength, w, h);
+        }
+    });
+    taa_next = 1 - taa_next;
+    return true;
+}
+
+void TemporalUpscaler::ExtraSharpen(void* target, bool ldr, u32 w, u32 h) {
+    const auto& settings = BbSettings::Get();
+    const float extra = std::clamp(settings.sharpness.load(), 0.0f, 2.0f) - 1.0f;
+    if (!settings.sharpen || extra <= 0.0f) {
+        return;
+    }
+    ASSERT_MSG(!ldr || target == ui_image.Get(), "ExtraSharpen: the LDR target is the UI image");
+    const u32 format = Metal::TexturePixelFormat(target);
+    if (!extra_sharpen_image || extra_sharpen_width != w || extra_sharpen_height != h ||
+        extra_sharpen_format != format) {
+        // Commands of earlier frames may still read the old copy and its view.
+        scheduler.Finish();
+        extra_sharpen_view = {};
+        // The target's format: Metal copies between equal formats (the kernel reads any float
+        // format). PixelFormatView usage for the RGBA8Unorm view of an sRGB copy.
+        extra_sharpen_image = Metal::CreateTexture(device,
+                                                   Metal::TextureDesc{
+                                                       .pixel_format = format,
+                                                       .width = w,
+                                                       .height = h,
+                                                       .format_views = true,
+                                                   },
+                                                   "Upscaler extra sharpen", nullptr);
+        ASSERT_MSG(extra_sharpen_image, "Upscaler: no extra sharpen texture {}x{}", w, h);
+        extra_sharpen_width = w;
+        extra_sharpen_height = h;
+        extra_sharpen_format = format;
+    }
+    void* input = extra_sharpen_image.Get();
+    void* output = target;
+    if (ldr) {
+        // The UI image's format may be sRGB: read and write its bytes unencoded, as FSR 3 writes
+        // it through an RGBA8Unorm view too.
+        const u32 unorm = PixelFormat(vk::Format::eR8G8B8A8Unorm);
+        constexpr std::array<u8, 4> identity{2, 3, 4, 5}; // MTLTextureSwizzleRed..Alpha
+        if (!extra_sharpen_view) {
+            extra_sharpen_view = Metal::CreateTextureView(input, unorm, Metal::TextureType::Tex2D,
+                                                          0, 1, 0, 1, identity);
+        }
+        if (!ui_storage_view) {
+            ui_storage_view = Metal::CreateTextureView(target, unorm, Metal::TextureType::Tex2D, 0,
+                                                       1, 0, 1, identity);
+        }
+        ASSERT_MSG(extra_sharpen_view && ui_storage_view, "ExtraSharpen: no RGBA8Unorm views");
+        input = extra_sharpen_view.Get();
+        output = ui_storage_view.Get();
+    }
+    scheduler.EndRendering();
+    scheduler.Record([kernel = ldr ? &taa.sharpen_ldr : &taa.sharpen, target,
+                      copy = extra_sharpen_image.Get(), input, output, extra, w,
+                      h](Metal::Encoder& e) {
+        e.CopyTexture(target, 0, 0, {}, copy, 0, 0, {}, {w, h, 1});
+        Taa::RecordSharpen(e, *kernel, input, output, extra, w, h);
+    });
 }
 
 bool TemporalUpscaler::ResolveMetalFx(const ResolveInputs& in) {
@@ -699,6 +824,7 @@ void TemporalUpscaler::EnsureUiResources(u32 w, u32 h, vk::Format color, vk::For
     if (new_color) {
         // Views in the game's formats (Mirror); storage writes for the resolve providers.
         ui_views.clear();
+        ui_storage_view = {};
         ui_image = CreateTexture(device, color, w, h, true, true, true, "Upscaler UI");
         ui_format = color;
     }
@@ -836,6 +962,14 @@ void TemporalUpscaler::RunScaled() {
                         {output_image.Get(), ow, oh, 8, "output", "rgba16f"},
                         {depth_texture, source_width, source_height, 4, "depth", "f32",
                          Metal::BlitAspect::Depth}});
+            if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa && taa_history[0] &&
+                std::getenv("BB_TAA_DIAGNOSTICS")) {
+                // The history read this frame and the diagnostic output.
+                DumpImages(device, scheduler, dump,
+                           {{taa_history[taa_next].Get(), ow, oh, 16, "previous_history",
+                             "rgba32f"},
+                            {opaque_image.Get(), ow, oh, 8, "history_sample", "rgba16f"}});
+            }
             // ObjectMotion's attachment can be in a different resolution from the upscaler's
             // inputs: only dump it when it matches, to avoid an out-of-bounds GPU copy.
             if (void* const object = camera_motion.ObjectMotionImage(w, h)) {

@@ -351,19 +351,14 @@ if (APPLE)
     target_link_options(host-kernel-test PRIVATE -Wl,-export_dynamic)
     add_dependencies(host-kernel-test host_shaders)
 endif()
-# These two test the TAA and camera motion kernels. They are ported to Metal with their sources
-# (M5 Tasks 7 and 5). The TAA test is still the Vulkan one: off until Task 7 ports it with the
-# TAA kernel (the upscaler itself is on Metal since Task 6).
-set(BB_TAA_TEST_PORTED OFF)
-if (BB_TAA_TEST_PORTED)
-    add_executable(taa-shader-test EXCLUDE_FROM_ALL ../tests/test_taa_shader.cpp ../tests/test_gpu_runtime_stubs.cpp)
-    target_include_directories(taa-shader-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
-    target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)
-    set_source_files_properties(../tests/test_taa_shader.cpp PROPERTIES
-        COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
-    target_link_libraries(taa-shader-test PRIVATE bbgpu)
-    add_dependencies(taa-shader-test host_shaders)
-endif()
+# These two run the TAA and camera motion kernels on Metal, recorded by the renderer's own
+# Taa::Record and CameraMotion::Record (M5 Tasks 7 and 5).
+add_executable(taa-shader-test EXCLUDE_FROM_ALL ../tests/test_taa_shader.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(taa-shader-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
+target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(taa-shader-test PRIVATE bbgpu)
+target_link_options(taa-shader-test PRIVATE -Wl,-export_dynamic)
+add_dependencies(taa-shader-test host_shaders)
 if (NOT "vk_camera_motion" IN_LIST BB_M5_PENDING)
     add_executable(camera-motion-test EXCLUDE_FROM_ALL ../tests/test_camera_motion.cpp ../tests/test_gpu_runtime_stubs.cpp)
     target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
