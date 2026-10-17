@@ -87,6 +87,24 @@ struct PipelineKey {
     bool operator==(const PipelineKey&) const = default;
 };
 
+PipelineKey ColorKey(u32 format, ScaleFilter filter) {
+    const u32 flavour = NumericFlavour(format);
+    ASSERT_MSG(filter == ScaleFilter::Nearest || flavour == 0,
+               "Scale helper: linear copy into integer format {}", format);
+    return {.fragment = filter == ScaleFilter::Linear ? BlitShaders::Present
+                                                      : BlitShaders::ScaleNearest[flavour],
+            .color_format = format};
+}
+
+PipelineKey DepthKey(u32 format, StencilCopy stencil) {
+    const bool dst_stencil = StencilViewPixelFormat(format) != 0;
+    return {.fragment = stencil == StencilCopy::None     ? BlitShaders::DepthResample
+                        : stencil == StencilCopy::Export ? BlitShaders::DepthResampleStencil
+                                                         : BlitShaders::DepthResampleStencilBits,
+            .depth_format = format,
+            .stencil_format = dst_stencil ? format : 0};
+}
+
 } // namespace
 
 struct ScaleHelper::Impl {
@@ -149,9 +167,7 @@ void ScaleHelper::ScaleColor(Encoder& encoder, void* src, void* dst, ScaleFilter
     id<MTLTexture> source = (__bridge id<MTLTexture>)src;
     id<MTLTexture> target = (__bridge id<MTLTexture>)dst;
     const u32 format = u32(target.pixelFormat);
-    const u32 flavour = NumericFlavour(format);
-    ASSERT_MSG(filter == ScaleFilter::Nearest || flavour == 0,
-               "Scale helper: linear copy into integer format {}", format);
+    void* const pipeline = impl->Pipeline(ColorKey(format, filter));
     if (rect.width == 0) {
         rect = {0, 0, std::max<u32>(1, u32(target.width) >> dst_level),
                 std::max<u32>(1, u32(target.height) >> dst_level)};
@@ -165,9 +181,6 @@ void ScaleHelper::ScaleColor(Encoder& encoder, void* src, void* dst, ScaleFilter
         texture = view.Get();
         encoder.KeepAlive(std::move(view));
     }
-    const char* fragment = filter == ScaleFilter::Linear ? BlitShaders::Present
-                                                         : BlitShaders::ScaleNearest[flavour];
-    void* const pipeline = impl->Pipeline({.fragment = fragment, .color_format = format});
     RenderPassDesc pass{};
     pass.colors[0].texture = dst; // Load: pixels outside `rect` keep their content
     pass.colors[0].level = dst_level;
@@ -199,11 +212,7 @@ void ScaleHelper::ResampleDepth(Encoder& encoder, void* src_depth, void* dst_dep
         ASSERT_MSG(stencil_view, "Scale helper: no stencil view of format {}",
                    u32(source.pixelFormat));
     }
-    const char* fragment = stencil == StencilCopy::None     ? BlitShaders::DepthResample
-                           : stencil == StencilCopy::Export ? BlitShaders::DepthResampleStencil
-                                                            : BlitShaders::DepthResampleStencilBits;
-    void* const pipeline = impl->Pipeline(
-        {.fragment = fragment, .depth_format = format, .stencil_format = dst_stencil ? format : 0});
+    void* const pipeline = impl->Pipeline(DepthKey(format, stencil));
     RenderPassDesc pass{};
     pass.depth.texture = dst_depth;
     pass.depth.has_stencil = dst_stencil;
@@ -236,6 +245,19 @@ void ScaleHelper::ResampleDepth(Encoder& encoder, void* src_depth, void* dst_dep
         encoder.Draw(Primitive::Triangle, 3);
     }
     encoder.EndRenderPass();
+}
+
+void ScaleHelper::PrepareColor(u32 dst_format, ScaleFilter filter) {
+    impl->Pipeline(ColorKey(dst_format, filter));
+}
+
+void ScaleHelper::PrepareDepth(u32 dst_format, StencilCopy stencil) {
+    impl->Pipeline(DepthKey(dst_format, stencil));
+}
+
+size_t ScaleHelper::PipelineCount() const {
+    std::scoped_lock lock{impl->mutex};
+    return impl->pipelines.size();
 }
 
 void ScaleHelper::ClearDepth(Encoder& encoder, void* depth, float value, u32 stencil) {

@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include "common/types.h"
 
@@ -37,7 +38,8 @@ enum class StencilCopy : u8 {
 /// depth bias, fill and clip mode (PerBit also the stencil reference), fragment texture 0/1,
 /// sampler 0 and buffer 0. A caller that also draws with the rasterizer invalidates its dynamic
 /// state afterwards. Pipelines are made at first use, per destination format (thread-safe), so
-/// the methods may run inside Scheduler::Record closures. Textures are id<MTLTexture>, unretained;
+/// the methods may run inside Scheduler::Record closures; PrepareColor/PrepareDepth make them
+/// ahead (a first use on the encoder thread would stall the frame). Textures are id<MTLTexture>, unretained;
 /// views the helper makes are kept alive by the Encoder.
 class ScaleHelper {
 public:
@@ -64,6 +66,14 @@ public:
     /// Clears level 0 of `depth` (a depth or depth-stencil render target) to `value` and its
     /// stencil, if any, to `stencil`: Vulkan's clearDepthStencilImage.
     void ClearDepth(Encoder& encoder, void* depth, float value, u32 stencil = 0);
+
+    /// Makes the pipeline ScaleColor(..., `filter`) into a `dst_format` (MTLPixelFormat) target
+    /// uses, now instead of at the first call.
+    void PrepareColor(u32 dst_format, ScaleFilter filter);
+    /// The same for ResampleDepth(..., `stencil`) into a `dst_format` depth target.
+    void PrepareDepth(u32 dst_format, StencilCopy stencil = StencilCopy::None);
+    /// Pipelines made so far (tests).
+    [[nodiscard]] size_t PipelineCount() const;
 
 private:
     struct Impl;

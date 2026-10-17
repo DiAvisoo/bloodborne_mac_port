@@ -291,6 +291,29 @@ void TestClearDepth(Device& device, ScaleHelper& scale) {
     Expect(ok, "ClearDepth: D32S8 to 0.25 / 7, D32 to 0.5");
 }
 
+// Prepare* builds the pipelines a later call uses: the call then builds none (the upscaler builds
+// them ahead, not at first use on the encoder thread).
+void TestPrepare(Device& device) {
+    ScaleHelper fresh{device};
+    Expect(fresh.PipelineCount() == 0, "Prepare: a new helper has no pipelines");
+    fresh.PrepareColor(MTLPixelFormatRGBA16Float, ScaleFilter::Linear);
+    fresh.PrepareColor(MTLPixelFormatRGBA8Unorm_sRGB, ScaleFilter::Nearest);
+    fresh.PrepareDepth(MTLPixelFormatDepth32Float_Stencil8, StencilCopy::None);
+    fresh.PrepareColor(MTLPixelFormatRGBA16Float, ScaleFilter::Linear); // again: no new one
+    Expect(fresh.PipelineCount() == 3, "Prepare: three distinct pipelines");
+    Object src = Texture(device, MTLPixelFormatRGBA16Float, 2, 2);
+    Object hdr = Texture(device, MTLPixelFormatRGBA16Float, 4, 4);
+    Object ldr = Texture(device, MTLPixelFormatRGBA8Unorm_sRGB, 4, 4);
+    Object depth_src = Texture(device, MTLPixelFormatDepth32Float_Stencil8, 2, 2);
+    Object depth_dst = Texture(device, MTLPixelFormatDepth32Float_Stencil8, 4, 4);
+    Encoder encoder{device};
+    fresh.ScaleColor(encoder, src.Get(), hdr.Get(), ScaleFilter::Linear);
+    fresh.ScaleColor(encoder, src.Get(), ldr.Get(), ScaleFilter::Nearest);
+    fresh.ResampleDepth(encoder, depth_src.Get(), depth_dst.Get());
+    device.Wait(encoder.Submit());
+    Expect(fresh.PipelineCount() == 3, "Prepare: the prepared calls build no pipeline");
+}
+
 } // namespace
 
 int main() {
@@ -303,6 +326,7 @@ int main() {
         TestRect(device, scale);
         TestLevelsUint(device, scale);
         TestClearDepth(device, scale);
+        TestPrepare(device);
         TestResampleDepthOnly(device, scale);
         TestResampleStencil(device, scale, StencilCopy::Export,
                             "depth+stencil resample 2x2 -> 4x4, stencil export");
