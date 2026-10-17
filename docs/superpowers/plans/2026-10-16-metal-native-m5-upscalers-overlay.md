@@ -252,6 +252,20 @@ per-frame busy time), `BbStats`/`driver.cpp` frame-stats line, `vk_gpu_profiler.
   prints nothing; suite no FAIL.
 - [ ] Commit `Metal-native M5: GPU time stats, profiler, capture; M5 stubs removed`.
 
+### Task 10b: untracked guest buffers with explicit ordering (added after Task 10)
+
+Task 10 found the native renderer's extra GPU time (city 88.3 FPS vs 0.4.0's 98.8) is Metal's
+hazard tracking on the guest arena and fault buffer. **Done** (`325fa91..59a823e`): DeviceLocal
+buffers untracked, guest-memory writers ordered with MTLFences (256-byte blocks, RAW/WAR/WAW,
+across command buffers and hoisted uploads), fault buffer cleared by atomic exchange,
+`BB_METAL_HAZARD_TRACKING=1` fallback. City 95.4 FPS; snapshots unchanged; debug layer clean.
+
+### Task 10c: per-command ordering (added after Task 10b, time-boxed)
+
+Each wait narrowed to the encoders that actually conflict (an unsafe probe reached 108 FPS).
+Measured against 0.4.0 in the same session with background windows. Gate: ours ≥ 0.4.0; if
+not met, stop at a correct measured state and record where the time goes.
+
 ### Task 11: M5 gate — parity runs
 
 **Files:** fixes as found; `docs/FINDINGS.md`, `docs/MACOS_BACKLOG.md`, roadmap M5 row and open items.
@@ -260,6 +274,7 @@ per-frame busy time), `BbStats`/`driver.cpp` frame-stats line, `vk_gpu_profiler.
 - [ ] Three scenes (loadcrash Hunter's Dream, cages Central Yharnam, livecopy Cathedral Ward) ×
   {off, MetalFX Quality, TAA} on metal-native and 0.4.0 with the same ini: snapshots side by side,
   FPS, worst frames (display on). Differences are fixed or recorded precisely.
+- [ ] CPU-bound comparison (added): low render resolution, CPU ms/frame per build vs 0.4.0.
 - [ ] Two 15-minute walks (scripted pad input, e.g. walk/turn loops in the city) with
   `BB_FRAME_STATS=1`: no crash, no command-buffer errors (`Device::ErrorCount`), memory stable.
 - [ ] `MTL_DEBUG_LAYER=1` and `MTL_SHADER_VALIDATION=1` runs at each scene: list every distinct
