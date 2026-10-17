@@ -84,6 +84,47 @@ void UploadDepth(Device& device, void* texture, u32 width, u32 height, bool sten
     device.Wait(encoder.Submit());
 }
 
+/// Writes `value` into every half-float component of `texture` (`components` per texel, iw x ih)
+/// outside its top-left w x h, keeping zeros inside.
+void FillBorder(Device& device, void* texture, u32 components, u32 iw, u32 ih, u32 w, u32 h,
+                uint16_t value) {
+    std::vector<uint16_t> texels(iw * ih * components, 0);
+    for (u32 y = 0; y < ih; ++y) {
+        for (u32 x = 0; x < iw; ++x) {
+            if (x >= w || y >= h) {
+                for (u32 i = 0; i < components; ++i) {
+                    texels[(y * iw + x) * components + i] = value;
+                }
+            }
+        }
+    }
+    const u32 texel = components * 2;
+    id<MTLBuffer> staging = SharedBuffer(device, texels.size() * 2);
+    std::memcpy(staging.contents, texels.data(), texels.size() * 2);
+    Encoder encoder{device};
+    encoder.CopyBufferToTexture(Ref(staging), iw * texel, iw * ih * texel, texture, 0, 0, {},
+                                {iw, ih, 1});
+    device.Wait(encoder.Submit());
+}
+
+/// An RGBA8 colour: the scene grey (128) in the top-left w x h, white outside.
+void FillBorder8(Device& device, void* texture, u32 iw, u32 ih, u32 w, u32 h) {
+    std::vector<uint8_t> texels(iw * ih * 4);
+    for (u32 y = 0; y < ih; ++y) {
+        for (u32 x = 0; x < iw; ++x) {
+            const uint8_t v = x >= w || y >= h ? 255 : 128;
+            for (u32 i = 0; i < 4; ++i) {
+                texels[(y * iw + x) * 4 + i] = i == 3 ? 255 : v;
+            }
+        }
+    }
+    id<MTLBuffer> staging = SharedBuffer(device, texels.size());
+    std::memcpy(staging.contents, texels.data(), texels.size());
+    Encoder encoder{device};
+    encoder.CopyBufferToTexture(Ref(staging), iw * 4, iw * ih * 4, texture, 0, 0, {}, {iw, ih, 1});
+    device.Wait(encoder.Submit());
+}
+
 void TestJitterSigns() {
     using BbMetalFx::JitterSigns;
     const auto is = [](std::array<float, 2> s, float x, float y) {
@@ -136,6 +177,15 @@ void RunCase(Device& device, const Case& c) {
     Object output = Texture(device, c.output, ow, oh, true, true);
     Clear(device, color.Get(), 0.5);
     Clear(device, motion.Get(), 0.0);
+    if (c.iw > w || c.ih > h) {
+        // BB_RENDER_RES: nothing writes outside the scene; there the targets hold garbage (NaN
+        // motion, a white colour border), which must not reach the output.
+        FillBorder(device, motion.Get(), c.motion == MTLPixelFormatRG16Float ? 2 : 4, c.iw, c.ih,
+                   w, h, 0x7e00); // half NaN
+        if (c.color == MTLPixelFormatRGBA8Unorm_sRGB || c.color == MTLPixelFormatRGBA8Unorm) {
+            FillBorder8(device, color.Get(), c.iw, c.ih, w, h);
+        }
+    }
     Clear(device, output.Get(), 0.0);
     UploadDepth(device, depth.Get(), c.iw, c.ih, c.depth == MTLPixelFormatDepth32Float_Stencil8);
 
@@ -179,6 +229,14 @@ void RunCase(Device& device, const Case& c) {
     std::snprintf(what, sizeof(what), "%s: output centre %.3f (expected %s)", c.name, red,
                   expected < 0 ? "> 0.1" : "0.5 +- 0.1");
     Expect(expected < 0 ? red > 0.1f : std::fabs(red - expected) <= 0.1f, what);
+    if (c.iw > w || c.ih > h) {
+        // The output's corner pixel comes from the scene's corner, next to the border.
+        const u32 corner = (oh - 1) * ow + ow - 1;
+        const float v = rgba8 ? static_cast<const u8*>(readback.contents)[corner * 4] / 255.0f
+                              : float(static_cast<const _Float16*>(readback.contents)[corner * 4]);
+        std::snprintf(what, sizeof(what), "%s: output corner %.3f (no border garbage)", c.name, v);
+        Expect(std::isfinite(v) && std::fabs(v - 0.5f) <= 0.1f, what);
+    }
     std::printf("%s: %ux%u -> %ux%u, centre %.3f\n", c.name, w, h, ow, oh, red);
 }
 
@@ -205,7 +263,7 @@ int main() {
             {"tonemapped RGBA8, D32S8, RG16F -> RGBA8", MTLPixelFormatRGBA8Unorm,
              MTLPixelFormatDepth32Float_Stencil8, MTLPixelFormatRG16Float,
              MTLPixelFormatRGBA8Unorm, false, 64, 36},
-            {"BB_RENDER_RES: 72x40 targets, 64x36 scene", MTLPixelFormatRGBA8Unorm_sRGB,
+            {"BB_RENDER_RES: 72x40 targets (garbage border), 64x36 scene", MTLPixelFormatRGBA8Unorm,
              MTLPixelFormatDepth32Float_Stencil8, MTLPixelFormatRG16Float,
              MTLPixelFormatRGBA16Float, false, 72, 40},
         };

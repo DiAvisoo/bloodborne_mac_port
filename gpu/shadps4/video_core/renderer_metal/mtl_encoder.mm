@@ -717,6 +717,9 @@ void Encoder::WaitForDeviceTick(u64 device_tick) {
 }
 
 void Encoder::EndEncoding() {
+    // A pass whose encoder has not opened yet still owes its clears: run them first, so work
+    // encoded outside the Encoder next (MetalFX) comes after them.
+    impl->FlushPendingClear();
     impl->EndRender();
     impl->EndCompute();
     impl->EndBlit();

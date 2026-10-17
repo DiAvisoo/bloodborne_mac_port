@@ -320,8 +320,17 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
     Run();
 }
 
-bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr, u32 mw,
-                                       u32 mh) {
+std::array<u32, 2> TemporalUpscaler::MotionSize(u32 w, u32 h) const {
+    if (!scaled_session || BbSettings::Get().upscaler != BbSettings::UpscalerMetalFx ||
+        !camera_motion.Depth()) {
+        return {w, h};
+    }
+    // RunScaled requires the colour target to have the depth's size.
+    const auto& size = texture_cache.GetImage(camera_motion.Depth()).info.size;
+    return {std::max(w, size.width), std::max(h, size.height)};
+}
+
+bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
     const int upscaler = BbSettings::Get().upscaler.load();
     if (upscaler == BbSettings::UpscalerTaa && (w != ow || h != oh)) {
         std::printf("TAA: render size %ux%u is not the output size %ux%u (native-resolution "
@@ -329,10 +338,7 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr, u
         std::fflush(stdout);
         return false;
     }
-    if (!mw || !mh) {
-        mw = w;
-        mh = h;
-    }
+    const auto [mw, mh] = MotionSize(w, h);
     if (resources_ready && w == width && h == height && ow == out_width && oh == out_height &&
         mw == motion_width && mh == motion_height && hdr == resources_hdr &&
         upscaler == resources_upscaler) {
@@ -417,9 +423,8 @@ void TemporalUpscaler::OnBlendedSceneDraw() {
     if (color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat) {
         return;
     }
-    // The motion size as RunScaled makes it (BB_RENDER_RES: the targets' size).
     if (!EnsureResources(w, h, Scaled() ? target_width : ow, Scaled() ? target_height : oh,
-                         !Scaled(), scaled_session ? ow : w, scaled_session ? oh : h)) {
+                         !Scaled())) {
         Fail("no resources at this size");
         return;
     }
@@ -950,9 +955,7 @@ void TemporalUpscaler::RunScaled() {
     if (depth.info.size.width != iw || depth.info.size.height != ih || w > ow || h > oh) {
         return;
     }
-    // MetalFX: the motion texture has the colour input's size (the native targets with
-    // BB_RENDER_RES, the w x h proxies otherwise).
-    if (!EnsureResources(w, h, ow, oh, false, scaled_session ? iw : w, scaled_session ? ih : h)) {
+    if (!EnsureResources(w, h, ow, oh, false)) {
         Fail("no resources at this size");
         return;
     }

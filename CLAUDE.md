@@ -106,7 +106,9 @@ Native 1080p 22→25 FPS; FSR 3.1 Quality (720p→1080p) 28→31; MetalFX Qualit
 (sharper, more distant shimmer). At 720p the GPU is no longer the limit: the draw-recording
 CPU thread (`bb:DrawRec`, ~35–40 ms/frame: MoltenVK encoding in vkQueueSubmit ~47%, renderer
 per-draw work ~21%, host-copy spin ~12%) caps it. `MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0` gave
-nothing measurable. MetalFX needs synchronous submits (commit order on MoltenVK's queue).
+nothing measurable. On MoltenVK (0.4.0) MetalFX needed synchronous submits (commit order on
+MoltenVK's queue); the native Metal renderer encodes MetalFX into its own frame command buffer,
+so that no longer applies there.
 Benchmark settings: `out/macdata/bench-{native,fsr3-quality,metalfx-quality}.ini` via BB_CONFIG.
 
 **2026-10-13:** fragment/compute shaders no longer use SPIR-V `NoContraction` (MoltenVK made each

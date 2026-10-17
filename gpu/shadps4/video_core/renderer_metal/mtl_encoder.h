@@ -192,7 +192,8 @@ public:
     void PopDebugGroup();
     /// Keeps `object` alive until the current command buffer completes.
     void KeepAlive(Object object);
-    /// Ends the open render, compute or blit encoder (a pass in progress reopens with Load).
+    /// Ends the open render, compute or blit encoder (a pass in progress reopens with Load). A
+    /// pass that has not opened its encoder yet runs its clears first.
     void EndEncoding();
     /// The command buffer being recorded (id<MTLCommandBuffer>, created if needed), for work
     /// encoded outside the Encoder (MetalFX). Call EndEncoding() first.

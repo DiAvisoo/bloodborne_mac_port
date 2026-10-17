@@ -602,6 +602,30 @@ void TestCopyInPassSeesClear() {
     Expect(Pixel(out, kSize, 4, 4) == kYellow, "the pass's clear happens before a copy inside it");
 }
 
+/// Work encoded straight into CommandBuffer() after EndEncoding() (as MetalFX is), inside a
+/// clearing pass whose encoder has not opened, comes after the pass's clear.
+void TestOutsideWorkAfterPendingClear() {
+    Metal::Device device;
+    Metal::Encoder encoder{device};
+    id<MTLTexture> target = Texture(device, kSize, kSize);
+    FillTexture(device, encoder, target, kBlue);
+    encoder.BeginRenderPass(ColorPass(target, true, kYellow));
+    encoder.EndEncoding();
+    id<MTLBuffer> out = [(__bridge id<MTLDevice>)device.NativeDevice()
+        newBufferWithLength:kSize * kSize * 4
+                    options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)encoder.CommandBuffer();
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    [blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(kSize, kSize, 1) toBuffer:out destinationOffset:0
+      destinationBytesPerRow:kSize * 4 destinationBytesPerImage:kSize * kSize * 4];
+    [blit endEncoding];
+    encoder.EndRenderPass();
+    device.Wait(encoder.Submit());
+    Expect(Pixel(out, kSize, 4, 4) == kYellow,
+           "EndEncoding runs a pending clear before work encoded outside the Encoder");
+}
+
 /// A scissor carried from a bigger pass is clamped to the next, smaller target (Metal requires
 /// the scissor inside the render target; Vulkan does not).
 void TestScissorClampedToTarget() {
@@ -1838,6 +1862,7 @@ int main() {
         TestBindingsEndAtSubmit();
         TestNoLeakOnPoollessThread();
         TestCopyInPassSeesClear();
+        TestOutsideWorkAfterPendingClear();
         TestScissorClampedToTarget();
         TestFillPattern();
         TestSubmitResetsBindings();

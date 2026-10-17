@@ -180,10 +180,13 @@ private:
     [[nodiscard]] bool Active() const;
     [[nodiscard]] bool ReactiveOn() const;
     /// The per-size textures; recreated (after scheduler.Finish()) when a size, the input kind
-    /// or the provider changes. The motion texture is `motion_width` x `motion_height` (0: the
-    /// render size): the colour input's size, which MetalFX requires (BB_RENDER_RES targets).
-    bool EnsureResources(u32 width, u32 height, u32 out_width, u32 out_height, bool hdr,
-                         u32 motion_width = 0, u32 motion_height = 0);
+    /// or the provider changes. The motion texture is MotionSize(width, height).
+    bool EnsureResources(u32 width, u32 height, u32 out_width, u32 out_height, bool hdr);
+    /// The motion texture's size for a `width` x `height` scene: that size, except MetalFX in a
+    /// BB_RENDER_RES session, where it is the scene targets' (the scene depth's) size: MetalFX
+    /// requires motion and colour of one size. The same at every EnsureResources call, so
+    /// nothing is rebuilt per frame; other providers never see the unwritten border.
+    [[nodiscard]] std::array<u32, 2> MotionSize(u32 width, u32 height) const;
     /// The kernels and scale pipelines, built once at construction (not at first use on the
     /// encoder thread).
     void CreatePipelines();
