@@ -327,6 +327,12 @@ Each item: what was done for now, what the refinement is, and where it lives.
 - **SRT walker faulting loads stay zeroed for good** (upstream behaviour, kept in the portable
   interpreter). *Proper:* zero only for the walk that faulted, if repeated faults are cheap enough.
 
+- **Metal-native (M5): `BB_GPU_CAPTURE` crashes with the default 16 GiB arena.** Apple's
+  GPUToolsCapture segfaults in `stopCapture` (`GTTraceDump_writeUnsortedCapture`) while writing
+  the `.gputrace` (bbgpu-host dies). Workaround: `BB_ARENA_GIB=4` (884 MB capture in the city,
+  FINDINGS 2026-10-17 Task 10). Proper fix: capture with a smaller arena automatically, or a
+  `MTLCaptureScope` that leaves the arena out if Apple's tool allows it.
+
 ## 2. Performance
 
 - **Metal-native (M5): hazard tracking on the guest arena and the fault buffer costs ~2.3 ms of

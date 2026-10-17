@@ -89,13 +89,8 @@ void Device::TrackGpuTime(void* command_buffer) {
           return; // never ran (error) or no work
       }
       std::scoped_lock lock{shared->busy_mutex};
-      // Completion order is close to start order: only the part after the latest end counted
-      // is new (command buffers of two queues may overlap).
-      const double from = std::max(start, shared->busy_end);
-      if (end > from) {
-          shared->gpu_busy_ns.fetch_add(u64((end - from) * 1e9), std::memory_order_relaxed);
-          shared->busy_end = end;
-      }
+      shared->gpu_busy_ns.fetch_add(u64(shared->busy.Add(start, end) * 1e9),
+                                    std::memory_order_relaxed);
     }];
 }
 

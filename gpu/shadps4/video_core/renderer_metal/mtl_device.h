@@ -5,11 +5,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 #include "common/types.h"
 
 namespace Metal {
@@ -25,6 +28,48 @@ struct Limits {
     float max_anisotropy{16.0f};
     float max_lod_bias{16.0f};
     u32 max_samplers{500000};
+};
+
+/// The union of GPU busy intervals (seconds), whatever order they are added in: completion
+/// handlers of two queues report overlapping command buffers in any order. Keeps the counted
+/// spans of the last `horizon` seconds (before the latest end) to subtract overlaps.
+class BusyIntervals {
+public:
+    explicit BusyIntervals(double horizon = 1.0) : horizon{horizon} {}
+
+    /// Counts the part of [start, end) not counted yet; returns it (s).
+    double Add(double start, double end) {
+        if (!(end > start)) {
+            return 0.0;
+        }
+        double added = end - start, lo = start, hi = end;
+        std::vector<std::pair<double, double>> kept;
+        kept.reserve(spans.size() + 1);
+        for (const auto& [a, b] : spans) {
+            if (b < start || a > end) {
+                kept.emplace_back(a, b); // disjoint
+                continue;
+            }
+            added -= std::min(b, end) - std::max(a, start); // spans are disjoint
+            lo = std::min(lo, a);
+            hi = std::max(hi, b);
+        }
+        kept.emplace_back(lo, hi);
+        latest_end = std::max(latest_end, hi);
+        std::erase_if(kept, [&](const auto& span) { return span.second < latest_end - horizon; });
+        spans = std::move(kept);
+        total += added;
+        return added;
+    }
+    [[nodiscard]] double TotalSeconds() const noexcept {
+        return total;
+    }
+
+private:
+    double horizon;
+    double total{};
+    double latest_end{};
+    std::vector<std::pair<double, double>> spans; ///< disjoint, counted
 };
 
 class Device {
@@ -90,7 +135,7 @@ public:
     }
     /// GPU busy time so far (ns): the union of the GPU intervals (GPUStartTime..GPUEndTime) of
     /// the completed command buffers committed here (Commit, CommitUntracked) or passed to
-    /// TrackGpuTime. Intervals that overlap one already counted (two queues) count once.
+    /// TrackGpuTime. Overlapping intervals (two queues) count once, in any completion order.
     [[nodiscard]] u64 GpuBusyNs() const noexcept {
         return counters->gpu_busy_ns.load(std::memory_order_relaxed);
     }
@@ -113,7 +158,7 @@ private:
         std::atomic<u64> errors{0};
         std::atomic<u64> gpu_busy_ns{0};
         std::mutex busy_mutex;
-        double busy_end{}; ///< latest GPUEndTime counted (s, busy_mutex)
+        BusyIntervals busy; ///< busy_mutex
     };
     std::shared_ptr<Counters> counters{std::make_shared<Counters>()};
 };

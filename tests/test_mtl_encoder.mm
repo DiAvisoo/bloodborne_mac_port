@@ -228,10 +228,39 @@ void TestGpuBusyTime() {
     const u64 after_tracked = device.GpuBusyNs();
     Expect(after_tracked > 0, "a committed command buffer reports GPU busy time");
     Expect(after_tracked < 5'000'000'000ull, "the busy time is plausible (under 5 s)");
+    // The reference: the same fill once the buffer is warm (the first touch costs more).
     encoder.FillBuffer(Ref(big), 64u << 20, 0x22222222u);
+    device.Wait(encoder.Submit());
+    const u64 before_untracked = device.GpuBusyNs();
+    const u64 fill_ns = before_untracked - after_tracked;
+    encoder.FillBuffer(Ref(big), 64u << 20, 0x33333333u);
     encoder.SubmitUntracked();
     device.Wait(encoder.Submit()); // the queue completes in order: the untracked one is done
-    Expect(device.GpuBusyNs() > after_tracked, "untracked command buffers count too");
+    // At least half the fill's time must come from the untracked buffer (the empty tracked one
+    // after it adds next to nothing).
+    Expect(fill_ns > 0 && device.GpuBusyNs() - before_untracked >= fill_ns / 2,
+           "untracked command buffers count too");
+}
+
+/// The union of GPU intervals must not depend on the order completion handlers report them
+/// (two queues: a present command buffer may complete before the main one it overlaps).
+void TestBusyIntervalUnion() {
+    const auto near = [](double a, double b) { return a > b - 1e-9 && a < b + 1e-9; };
+    Metal::BusyIntervals in_order;
+    in_order.Add(10.0, 20.2);
+    in_order.Add(20.0, 20.5);
+    Expect(near(in_order.TotalSeconds(), 10.5), "in end order: 10.5 s");
+    Metal::BusyIntervals out_of_order;
+    out_of_order.Add(20.0, 20.5); // present first
+    out_of_order.Add(10.0, 20.2); // then the main buffer it overlaps
+    Expect(near(out_of_order.TotalSeconds(), 10.5), "out of end order: still 10.5 s");
+    Metal::BusyIntervals mixed{100.0}; // seconds apart: keep every span
+    mixed.Add(5.0, 6.0);
+    mixed.Add(1.0, 2.0);  // before everything counted
+    mixed.Add(1.5, 5.5);  // bridges both
+    mixed.Add(1.2, 1.8);  // fully covered
+    mixed.Add(7.0, 7.0);  // empty
+    Expect(near(mixed.TotalSeconds(), 5.0), "disjoint, bridging and covered intervals: 5 s");
 }
 
 /// The GPU profiler's sampling: every Metal encoder opened while a TimestampSink is set
@@ -1927,6 +1956,7 @@ int main() {
         TestDeviceLifetime();
         TestBlits();
         TestGpuBusyTime();
+        TestBusyIntervalUnion();
         TestTimestampSampling();
         TestKeepAlive();
         TestWaitMeansCompleted();
