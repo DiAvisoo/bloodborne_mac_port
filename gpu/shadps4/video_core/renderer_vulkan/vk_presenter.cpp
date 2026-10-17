@@ -185,9 +185,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     u32 image_width = 0;
     u32 image_height = 0;
     if (upscaled) {
+        // The display buffer has the guest render target's format; the video-out format views
+        // it as Vulkan's mutable-format view did (BGRA view of an RGBA buffer: the texture has
+        // PixelFormatView usage).
         const u32 format =
             Metal::SafeViewPixelFormat(Metal::TexturePixelFormat(display.texture),
-                                       Metal::VkToMtl::PixelFormat(view_format), false);
+                                       Metal::VkToMtl::PixelFormat(view_format), true);
         input = Metal::CreateTextureView(
             display.texture, format, Metal::TextureType::Tex2D, 0, 1, 0, 1,
             {Metal::VkToMtl::SwizzleRed, Metal::VkToMtl::SwizzleGreen,

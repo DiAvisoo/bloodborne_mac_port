@@ -159,8 +159,7 @@ endif()
 # file removes its name from this list, and its stand-in in the same task. (The names are the
 # files under renderer_vulkan/ and shim/; imgui_impl_vulkan is the Vulkan ImGui backend, replaced
 # by imgui_impl_metal.)
-set(BB_M5_PENDING vk_temporal_upscaler vk_gpu_profiler
-    bbport_overlay bbport_metalfx imgui_impl_vulkan)
+set(BB_M5_PENDING vk_gpu_profiler bbport_overlay bbport_metalfx imgui_impl_vulkan)
 set(BB_UNCONVERTED_6 host_passes/fsr_pass)
 set(BB_UNCONVERTED_7 vk_instance vk_platform)
 foreach(stage 6 7)
@@ -353,8 +352,10 @@ if (APPLE)
     add_dependencies(host-kernel-test host_shaders)
 endif()
 # These two test the TAA and camera motion kernels. They are ported to Metal with their sources
-# (M5 Tasks 7 and 5): built from stage 5 on, but not while the Vulkan versions are pending.
-if (NOT "vk_temporal_upscaler" IN_LIST BB_M5_PENDING)
+# (M5 Tasks 7 and 5). The TAA test is still the Vulkan one: off until Task 7 ports it with the
+# TAA kernel (the upscaler itself is on Metal since Task 6).
+set(BB_TAA_TEST_PORTED OFF)
+if (BB_TAA_TEST_PORTED)
     add_executable(taa-shader-test EXCLUDE_FROM_ALL ../tests/test_taa_shader.cpp ../tests/test_gpu_runtime_stubs.cpp)
     target_include_directories(taa-shader-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
     target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)

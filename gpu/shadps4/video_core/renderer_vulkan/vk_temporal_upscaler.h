@@ -1,13 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: temporal upscaling of Bloodborne's HDR scene color (docs/upscaler.md). BB_UPSCALER=fsr3
-// runs FSR 3.1 (FireBurn/FSR-Vulkan, native Vulkan) on the scene color right before the
-// post-processing combine pass, with the scene depth and camera motion vectors, and writes the
-// result back so the game's own post, tonemap and UI continue unchanged (Native AA preset).
+// bbport: temporal upscaling of Bloodborne's scene color (docs/upscaler.md), on Metal.
+//
+// Native AA (output 1920x1080): Run() resolves the HDR scene color right before the game's
+// post-processing combine pass, with the scene depth and camera motion vectors, and the merge
+// kernel writes the result back so the game's own post, tonemap and UI continue unchanged.
+// Other output sizes: RunScaled() resolves the game's tonemapped frame into an output-size UI
+// image at the first UI draw; the UI draws and the display pass are redirected to output-size
+// images (RedirectColor/RedirectDepth/RedirectSampled) and the presenter shows the output-size
+// display buffer (DisplayOverride). Menus and loading screens (no camera) scale the background
+// into the UI image instead (RunUiOnly).
 //
 // Guest targets stay at 1920x1080. Host scene targets use output/preset dimensions,
-// resized at frame boundaries. At 1080p HDR reconstruction precedes post; other outputs
-// reconstruct tonemapped scene proxies before output-size UI/display composition.
-// BB_RENDER_RES retains the older startup-patched guest-resolution path.
+// resized at frame boundaries (SceneTargets). BB_RENDER_RES retains the older startup-patched
+// guest-resolution path.
+//
+// The resolve step is pluggable (Resolve): TAA, MetalFX and FSR 3.1 plug in there; a plain
+// scaled copy stands in for a provider that is not ported yet.
 
 #pragma once
 
@@ -15,24 +23,22 @@
 #error "BB_METAL_NATIVE_STAGE must be defined (gpu/CMakeLists.txt: target_compile_definitions)"
 #endif
 
-#ifdef BB_M5_PENDING_VK_TEMPORAL_UPSCALER
-// Not converted to Metal yet (M5, BB_M5_PENDING in gpu/CMakeLists.txt): the source is left out
-// of the build and this stand-in takes its place.
-#include "stubs_m3.h"
-#else
-
 #include <array>
-#include <chrono>
-#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #include "common/types.h"
+#include "video_core/renderer_metal/mtl_host_kernel.h"
+#include "video_core/renderer_metal/mtl_object.h"
+#include "video_core/renderer_metal/mtl_scale.h"
+#include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
 
-struct FfxVkPortableUpscaleContext;
+namespace Metal {
+class Device;
+}
 
 namespace VideoCore {
 class TextureCache;
@@ -40,7 +46,6 @@ class TextureCache;
 
 namespace Vulkan {
 
-class Instance;
 class Scheduler;
 class Runtime;
 class CameraMotion;
@@ -48,7 +53,7 @@ class SceneTargets;
 
 class TemporalUpscaler {
 public:
-    TemporalUpscaler(const Instance& instance, Scheduler& scheduler,
+    TemporalUpscaler(Metal::Device& device, Scheduler& scheduler,
                      VideoCore::TextureCache& texture_cache, Runtime& runtime,
                      CameraMotion& camera_motion, SceneTargets& scene_targets);
     ~TemporalUpscaler();
@@ -84,7 +89,6 @@ public:
                u64(ui_color.index) << 8 | u64(ui_depth.index) << 36;
     }
 
-
     /// This frame's sub-pixel jitter in pixels (screen x right, y down); zero when off and after
     /// the upscale (post and UI are not jittered).
     [[nodiscard]] std::array<float, 2> Jitter() const noexcept {
@@ -94,7 +98,7 @@ public:
     // Scaled presets.
 
     /// After identifying this draw's targets, before drawing any UI pixels. Menus use
-    /// spatial background copy and native UI, without needing scene depth or FSR history.
+    /// spatial background copy and native UI, without needing scene depth or temporal history.
     void OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId depth,
                 bool native_viewport);
 
@@ -103,48 +107,52 @@ public:
     void OnColorTarget(VideoCore::ImageId color);
 
     struct Target {
-        vk::ImageView view;
-        vk::ImageLayout layout;
-        u32 width, height;
+        void* texture{}; ///< id<MTLTexture> (unretained; owned by the upscaler)
+        u32 width{}, height{};
         bool native_ui = false;
     };
     /// Render target redirection (UI passes, display pass): false when not redirected.
-    /// `view` is the game's view of the image: redirected views mirror its format (sRGB) and,
-    /// for sampling, its channel swizzle.
+    /// `view` is the game's view of the image: redirected targets are views in its format
+    /// (sRGB).
     bool RedirectColor(VideoCore::ImageId color, const VideoCore::ImageViewInfo& view,
                        Target& target);
     bool RedirectDepth(VideoCore::ImageId depth, Target& target);
-    /// A sampled image replaced by the upscaled frame (the display pass).
+    /// A sampled image replaced by the upscaled frame (the display pass): `texture`
+    /// (id<MTLTexture>) is replaced by a view in the game's format and swizzle when true.
     bool RedirectSampled(VideoCore::ImageId image, const VideoCore::ImageViewInfo& info,
-                         vk::ImageView& view, vk::ImageLayout& layout);
-    /// Whether RedirectSampled would replace `image` (it may record a barrier then).
+                         void*& texture);
+    /// Whether RedirectSampled would replace `image`.
     [[nodiscard]] bool RedirectsSampled(VideoCore::ImageId image) const {
         return display_redirect && image == ui_color;
     }
 
     /// Presenter: the output-size display buffer standing in for the guest one at `address`.
     struct Display {
-        vk::Image image;
-        vk::Format format;
-        u32 width, height;
+        /// id<MTLTexture> (unretained; owned by the upscaler) in `format`, with PixelFormatView
+        /// usage: the presenter views it in the video-out format (BGRA of an RGBA buffer).
+        void* texture{};
+        vk::Format format{};
+        u32 width{}, height{};
     };
     bool DisplayOverride(VAddr address, Display& display);
 
-private:
-    /// bbport: views of guest images the upscaler reads, kept across frames.
-    vk::ImageView CachedView(const VideoCore::Image& image, vk::Format format,
-                             vk::ImageAspectFlags aspect);
-    struct ViewEntry {
-        vk::Image image;
-        u64 uid = 0;
-        vk::Format format{};
-        vk::ImageAspectFlags aspect{};
-        vk::ImageView view;
-        u64 last_use = 0;
+    /// One frame of the resolve step (all textures id<MTLTexture>, unretained, alive until the
+    /// GPU has run the frame). Render size: `color`, `depth`, `motion`, `reactive`; output
+    /// size: `output`.
+    struct ResolveInputs {
+        void* color{};    ///< HDR RGBA16F scene color (hdr) or the tonemapped RGBA8 frame
+        void* depth{};    ///< scene depth (D32S8 or D32; depth in red when sampled)
+        void* motion{};   ///< RG16F, pixels, previous minus current (camera and object motion)
+        void* reactive{}; ///< R8 reactive mask, or null (no mask this frame)
+        void* output{};   ///< RGBA16F, ShaderWrite and RenderTarget usage
+        u32 width{}, height{};         ///< render size
+        u32 out_width{}, out_height{}; ///< output size
+        std::array<float, 2> jitter{}; ///< this frame's jitter in pixels (x right, y down)
+        bool reset{}; ///< discard history (first frame, resize, camera cut, settings change)
+        bool hdr{};   ///< linear HDR input (Run) or the tonemapped frame (RunScaled)
     };
-    std::array<ViewEntry, 6> view_cache{};
-    u64 view_uses = 0;
 
+private:
     void Run();
     void RunScaled();
     void RunUiOnly(VideoCore::ImageId color, VideoCore::ImageId depth);
@@ -166,16 +174,40 @@ private:
     /// Available and switched on (menu setting, toggle 1 << 24).
     [[nodiscard]] bool Active() const;
     [[nodiscard]] bool ReactiveOn() const;
+    /// The per-size textures; recreated (after scheduler.Finish()) when a size, the input kind
+    /// or the provider changes.
     bool EnsureResources(u32 width, u32 height, u32 out_width, u32 out_height, bool hdr);
+    /// The kernels and scale pipelines, built once at construction (not at first use on the
+    /// encoder thread).
     void CreatePipelines();
-    /// Records the reactive mask pass; false when there is no snapshot this frame.
-    bool RecordReactive(vk::ImageView color_view);
-    void RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color, vk::ImageView depth);
-    /// Sharpness above 1 for FSR 3/4 (their RCAS stops at 1): one more RCAS pass over the target
-    /// (output_image, or the 8-bit UI image with ldr) in General layout after the upscaler.
-    void ExtraSharpen(vk::CommandBuffer cmdbuf, vk::Image target, bool ldr, u32 w, u32 h);
+    /// Records the reactive mask pass over `color` (id<MTLTexture>, render size); false when
+    /// there is no snapshot this frame.
+    bool RecordReactive(void* color);
+    /// Records the merge of output_image into the scene color `scene` (id<MTLTexture>, output
+    /// size, ShaderWrite): RGB replaced, alpha kept; the menu's debug views.
+    void RecordMerge(void* scene, bool has_reactive);
 
-    const Instance& instance;
+    /// The resolve step: `in.color` (with depth, motion, reactive) -> `in.output` with the
+    /// selected provider, recorded in order with the frame (scheduler.Record). False when it
+    /// cannot run this frame: the frame stays unresolved and the caller sets `failed`.
+    bool Resolve(const ResolveInputs& in);
+    /// Stand-in for providers not ported yet: a linear scaled copy, no history.
+    bool ResolveCopy(const ResolveInputs& in);
+    bool ResolveTaa(const ResolveInputs& in);     ///< M5 Task 7: TAA kernel
+    bool ResolveMetalFx(const ResolveInputs& in); ///< M5 Task 8: MetalFX temporal scaler
+    bool ResolveFsr3(const ResolveInputs& in);    ///< M6: FSR 3.1; false until then
+
+    /// A view of `texture` in `format` with `swizzle`, kept in `views` (by format and swizzle)
+    /// until the texture is recreated.
+    struct MirrorView {
+        vk::Format format;
+        Metal::VkToMtl::TextureSwizzle swizzle;
+        Metal::Object view;
+    };
+    void* Mirror(void* texture, std::vector<MirrorView>& views, vk::Format format,
+                 Metal::VkToMtl::TextureSwizzle swizzle);
+
+    Metal::Device& device;
     Scheduler& scheduler;
     VideoCore::TextureCache& texture_cache;
     Runtime& runtime;
@@ -185,7 +217,6 @@ private:
     int applied_upscaler = -1;
     bool dispatched_last_frame = false;
     bool last_active = false, last_jitter = false;
-
 
     bool enabled = false;
     bool failed = false;
@@ -200,40 +231,26 @@ private:
     std::array<float, 2> jitter{};
     u32 jitter_index = 0;
     bool reset = true;
-    u64 frame_id = 0;
-    std::chrono::steady_clock::time_point last_frame{};
 
-    u32 width = 0, height = 0;             ///< render size
-    u32 out_width = 0, out_height = 0;     ///< output size of the context
-    bool context_hdr = true;
+    u32 width = 0, height = 0;         ///< render size of the resources
+    u32 out_width = 0, out_height = 0; ///< output size of the resources
+    bool resources_hdr = true;
     u32 target_width = 1920, target_height = 1080; ///< output size of scaled presets
     u64 ui_trigger_vs = 0x34e8a281;
     VideoCore::ImageId ldr_target{};
     VideoCore::ImageId ui_color{}, ui_depth{};
     bool ui_phase = false;         ///< from the upscale to the next display pass
     bool display_redirect = false; ///< the display pass of an upscaled frame
-    bool ui_read_barrier = false;
-    VideoCore::UniqueImage ui_image;
-    VideoCore::UniqueImage ui_depth_image;
-    vk::UniqueImageView ui_view;
-    vk::UniqueImageView ui_depth_view;
-    bool depth_blit = false;
     bool scaled_session = false;
     u32 ui_width = 0, ui_height = 0;
     u32 render_width = 0, render_height = 0;
     vk::Format ui_format = vk::Format::eUndefined;
     vk::Format ui_depth_format = vk::Format::eUndefined;
-    /// Views of the port's images in the formats/swizzles the game's views use.
-    struct MirrorView {
-        vk::Format format;
-        vk::ComponentMapping mapping;
-        vk::UniqueImageView view;
-    };
-    vk::ImageView Mirror(vk::Image image, std::vector<MirrorView>& views, vk::Format format,
-                         vk::ComponentMapping mapping);
+    Metal::Object ui_image;       ///< output size, the UI's format (PixelFormatView usage)
+    Metal::Object ui_depth_image; ///< output size, the UI's depth format
     std::vector<MirrorView> ui_views;
     struct DisplayImage {
-        VideoCore::UniqueImage image;
+        Metal::Object image;
         std::vector<MirrorView> views;
         vk::Format format{};
         u32 width = 0, height = 0;
@@ -241,42 +258,16 @@ private:
     };
     std::mutex display_mutex;
     std::unordered_map<VAddr, DisplayImage> displays;
-    FfxVkPortableUpscaleContext* context = nullptr;
-    bool resources_ready = false; ///< images below match width/height/out size
-    bool resources_taa = false;
-    bool resources_metalfx = false; ///< made for MetalFX (no FSR 3 context)
-    VideoCore::UniqueImage motion_image;
-    VideoCore::UniqueImage output_image;
-    vk::UniqueImageView motion_view;
-    vk::UniqueImageView output_view;
-    VideoCore::UniqueImage opaque_image;   ///< scene color before the blended draws
-    VideoCore::UniqueImage reactive_image; ///< R8 reactive mask
-    vk::UniqueImageView opaque_view;
-    vk::UniqueImageView reactive_view;
-    vk::UniqueDescriptorSetLayout reactive_desc_layout;
-    vk::UniquePipelineLayout reactive_pipeline_layout;
-    vk::UniquePipeline reactive_pipeline;
-    vk::UniqueDescriptorSetLayout merge_desc_layout;
-    vk::UniquePipelineLayout merge_pipeline_layout;
-    vk::UniquePipeline merge_pipeline;
-    std::array<VideoCore::UniqueImage, 2> taa_history;
-    std::array<vk::UniqueImageView, 2> taa_history_views;
-    u32 taa_next = 0;
-    vk::UniqueSampler taa_sampler;
-    vk::UniqueDescriptorSetLayout taa_desc_layout;
-    vk::UniquePipelineLayout taa_pipeline_layout;
-    vk::UniquePipeline taa_pipeline;
-    vk::UniqueDescriptorSetLayout taa_sharpen_desc_layout;
-    vk::UniquePipelineLayout taa_sharpen_pipeline_layout;
-    vk::UniquePipeline taa_sharpen_pipeline;
-    vk::UniquePipeline taa_sharpen_ldr_pipeline;
-    // ExtraSharpen: a copy of the upscaled frame (RCAS reads neighbours) and the target views.
-    VideoCore::UniqueImage extra_sharpen_image;
-    vk::UniqueImageView extra_sharpen_view;
-    u32 extra_sharpen_width = 0, extra_sharpen_height = 0;
-    vk::UniqueImageView ui_storage_view;
+
+    bool resources_ready = false; ///< the textures below match width/height/out size
+    int resources_upscaler = -1;  ///< the provider they were made for
+    Metal::Object motion_image;   ///< render size RG16F
+    Metal::Object output_image;   ///< output size RGBA16F
+    Metal::Object opaque_image;   ///< scene color before the blended draws
+    Metal::Object reactive_image; ///< R8 reactive mask
+    Metal::HostKernel merge_kernel;
+    Metal::HostKernel reactive_kernel;
+    Metal::ScaleHelper scale; ///< scaled copies, UI depth resample and clear
 };
 
 } // namespace Vulkan
-
-#endif // BB_METAL_NATIVE_STAGE < 5

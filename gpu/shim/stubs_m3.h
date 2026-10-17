@@ -4,8 +4,7 @@
 // files named in BB_M5_PENDING out of the build; their headers include this one instead and get
 // classes with the same public API that do nothing (each guarded by BB_M5_PENDING_<FILE NAME>,
 // which CMake defines while the file is pending):
-//   - M5: the temporal upscaler and the GPU profiler (vk_temporal_upscaler.h,
-//     vk_gpu_profiler.h): all off.
+//   - M5: the GPU profiler (vk_gpu_profiler.h): off.
 //     The settings overlay keeps its header; stubs_m3.cpp defines what the shim calls.
 // Converting a file removes its name from BB_M5_PENDING and its stand-in from here; the last
 // conversion deletes this file.
@@ -37,70 +36,6 @@ class Scheduler;
 class Runtime;
 class SceneTargets;
 struct RenderState;
-
-// --- M5: temporal upscaling (vk_temporal_upscaler.h) -----------------------------------------
-
-class CameraMotion;
-
-#ifdef BB_M5_PENDING_VK_TEMPORAL_UPSCALER
-class TemporalUpscaler {
-public:
-    TemporalUpscaler(Metal::Device&, Scheduler&, VideoCore::TextureCache&, Runtime&,
-                     CameraMotion&, SceneTargets&) {}
-
-    [[nodiscard]] bool Enabled() const noexcept {
-        return false;
-    }
-    void OnSceneColor(VideoCore::ImageId) {}
-    void OnBlendedSceneDraw() {}
-    void OnSceneComposite() {}
-    void OnDispatch(u64) {}
-    bool OnFrameStart() {
-        return false;
-    }
-    bool RasterScaling() const {
-        return false;
-    }
-    [[nodiscard]] float SceneMipBias() const {
-        return 0.0f;
-    }
-    [[nodiscard]] u64 RedirectState() const noexcept {
-        return 0;
-    }
-    [[nodiscard]] std::array<float, 2> Jitter() const noexcept {
-        return {};
-    }
-    void OnDraw(u64, VideoCore::ImageId, VideoCore::ImageId, bool) {}
-    void OnColorTarget(VideoCore::ImageId) {}
-
-    struct Target {
-        void* texture{}; ///< id<MTLTexture>
-        u32 width{}, height{};
-        bool native_ui = false;
-    };
-    bool RedirectColor(VideoCore::ImageId, const VideoCore::ImageViewInfo&, Target&) {
-        return false;
-    }
-    bool RedirectDepth(VideoCore::ImageId, Target&) {
-        return false;
-    }
-    bool RedirectSampled(VideoCore::ImageId, const VideoCore::ImageViewInfo&, void*& /*texture*/) {
-        return false;
-    }
-    [[nodiscard]] bool RedirectsSampled(VideoCore::ImageId) const {
-        return false;
-    }
-
-    struct Display {
-        void* texture{}; ///< id<MTLTexture>
-        vk::Format format{};
-        u32 width{}, height{};
-    };
-    bool DisplayOverride(VAddr, Display&) {
-        return false;
-    }
-};
-#endif // BB_M5_PENDING_VK_TEMPORAL_UPSCALER
 
 // --- M5: GPU time per pass (vk_gpu_profiler.h): never on -------------------------------------
 
