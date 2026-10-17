@@ -3,9 +3,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <unistd.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "video_core/renderer_metal/mtl_device_impl.h"
@@ -35,7 +38,55 @@ bool HazardTrackingRequested() {
     return requested;
 }
 
+/// BB_GPU_WATCHDOG_MS (default 3000, 0 = off): how long committed work may make no progress.
+/// A GPU that stops (a fence or event wait that is never satisfied) also stalls WindowServer,
+/// whose own watchdog then restarts it and takes the whole session down; exiting the process
+/// first makes the driver drop our work.
+u64 WatchdogLimitMs() {
+    const char* env = std::getenv("BB_GPU_WATCHDOG_MS");
+    return env ? std::strtoull(env, nullptr, 10) : 3000;
+}
+
 } // namespace
+
+void Device::StartWatchdog() {
+    const u64 limit_ms = WatchdogLimitMs();
+    if (limit_ms == 0) {
+        return;
+    }
+    std::thread([shared = counters, limit_ms] {
+        using Clock = std::chrono::steady_clock;
+        u64 last_known = 0;
+        Clock::time_point since = Clock::now(), last_check = since;
+        while (!shared->stop_watchdog.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const u64 known = shared->gpu_tick.load(std::memory_order_acquire);
+            const u64 committed = shared->committed.load(std::memory_order_acquire);
+            const Clock::time_point now = Clock::now();
+            // A late wake-up (system sleep, the process stopped) is not a GPU stall.
+            const bool woke_late = now - last_check > std::chrono::seconds(1);
+            last_check = now;
+            if (known >= committed || known != last_known || woke_late) {
+                last_known = known;
+                since = now;
+                continue;
+            }
+            const auto stalled =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - since).count();
+            if (u64(stalled) >= limit_ms) {
+                std::fprintf(stderr,
+                             "STOP: GPU watchdog: tick %llu committed, %llu complete, no progress "
+                             "for %lld ms; exiting so the GPU does not stall WindowServer "
+                             "(BB_GPU_WATCHDOG_MS)\n",
+                             static_cast<unsigned long long>(committed),
+                             static_cast<unsigned long long>(known),
+                             static_cast<long long>(stalled));
+                std::fflush(stderr);
+                _exit(75);
+            }
+        }
+    }).detach();
+}
 
 Device::Device(void* mtl_device, void* mtl_queue) : impl{std::make_unique<Impl>()} {
     @autoreleasepool {
@@ -71,10 +122,12 @@ Device::Device(void* mtl_device, void* mtl_queue) : impl{std::make_unique<Impl>(
             [prime waitUntilCompleted];
         }
     }
+    StartWatchdog();
 }
 
 Device::~Device() {
     Finish();
+    counters->stop_watchdog.store(true, std::memory_order_release);
 }
 
 u64 Device::AllocatedSize() const {
@@ -154,6 +207,7 @@ u64 Device::ResidentBytes() const {
 u64 Device::Commit(void* command_buffer) {
     id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)command_buffer;
     const u64 tick = current_tick.fetch_add(1, std::memory_order_acq_rel);
+    counters->committed.store(tick, std::memory_order_release);
     [cmd encodeSignalEvent:impl->event value:tick];
     // Before the tick handler: when Wait(tick) returns, this command buffer's time is counted.
     TrackGpuTime(command_buffer);

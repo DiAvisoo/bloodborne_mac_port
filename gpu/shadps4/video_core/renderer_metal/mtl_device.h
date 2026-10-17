@@ -178,6 +178,9 @@ public:
     void TrackGpuTime(void* command_buffer);
 
 private:
+    /// Exits the process when committed command buffers stop completing (BB_GPU_WATCHDOG_MS).
+    void StartWatchdog();
+
     std::unique_ptr<Impl> impl;
     std::string name;
     Limits limits;
@@ -195,6 +198,8 @@ private:
         std::atomic<u64> gpu_tick{0};
         std::atomic<u64> errors{0};
         std::atomic<u64> gpu_busy_ns{0};
+        std::atomic<u64> committed{0}; ///< the last tick Commit() signals
+        std::atomic<bool> stop_watchdog{false};
         std::mutex busy_mutex;
         BusyIntervals busy; ///< busy_mutex
     };

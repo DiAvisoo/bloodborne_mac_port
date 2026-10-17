@@ -1131,3 +1131,22 @@ front); compare only runs made the same way.
   touch them. In play (city, 110 s): MALLOC_LARGE 1470 MB untracked against 1465 MB tracked
   (`footprint`). A buffer whose tags cannot be allocated is logged and ordered conservatively
   (every access to it waits for everything before).
+
+## 2026-10-17: a GPU hang took the whole Mac down (Task 10c run); GPU watchdog
+
+- During a Task 10c benchmark run, the native renderer's GPU stopped making progress about a
+  minute after launch. The scene was nearly empty (title or loading screen: ~9 encoders, 8 draws
+  per frame, 46 FPS). About 90 s later WindowServer, whose main thread was blocked in the AGX
+  driver submitting its own work, missed its watchdog and was restarted, which ended the session
+  (`WindowServer_…userspace_watchdog_timeout.spin`, bb-probe had forked 151 s earlier). `kill -TERM`
+  did not end the game; `-KILL` did.
+- **`Metal::Device` GPU watchdog** (`BB_GPU_WATCHDOG_MS`, default 3000, 0 = off): if committed
+  command buffers make no progress for that long, the process prints `STOP: GPU watchdog …` and
+  `_exit(75)`s, so the driver drops our work before WindowServer stalls. Late wake-ups (system
+  sleep, a stopped process) do not count.
+- **Not reproduced** in three runs with the same code under the watchdog (city 2.5 and 4 min at
+  ~88 FPS, title 3 min). A CPU-side fence checker (`BB_METAL_FENCE_CHECK`, with the Task 10c work)
+  found no wait on a slot fence that another uncommitted command buffer updates, no commit-order
+  inversion and no encoder waiting on its own slot fence. Cross-buffer waits seen are all on
+  `AheadFence` with the hoisted-upload buffer committed first.
+- Test runs: an outer watchdog in the run script KILLs the game when frame stats stop for 15 s.
