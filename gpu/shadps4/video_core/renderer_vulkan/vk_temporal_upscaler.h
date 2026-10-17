@@ -137,8 +137,10 @@ public:
     bool DisplayOverride(VAddr address, Display& display);
 
     /// One frame of the resolve step (all textures id<MTLTexture>, unretained, alive until the
-    /// GPU has run the frame). Render size: `color`, `depth`, `motion`, `reactive`; output
-    /// size: `output`.
+    /// GPU has run the frame). Render size: `motion`, `reactive`; output size: `output`.
+    /// `color` and `depth` hold the scene in their top-left width x height: exactly that size
+    /// (scene proxies) except with BB_RENDER_RES (the startup patch), where they are the game's
+    /// aligned targets, a few pixels larger (pass width x height as the input content size).
     struct ResolveInputs {
         void* color{};    ///< HDR RGBA16F scene color (hdr) or the tonemapped RGBA8 frame
         void* depth{};    ///< scene depth (D32S8 or D32; depth in red when sampled)
@@ -197,15 +199,18 @@ private:
     bool ResolveMetalFx(const ResolveInputs& in); ///< M5 Task 8: MetalFX temporal scaler
     bool ResolveFsr3(const ResolveInputs& in);    ///< M6: FSR 3.1; false until then
 
-    /// A view of `texture` in `format` with `swizzle`, kept in `views` (by format and swizzle)
-    /// until the texture is recreated.
+    /// A view of `texture` (made in `texture_format`) in the game's `format` with `mapping`,
+    /// kept in `views` (by format and mapping) until the texture is recreated.
     struct MirrorView {
         vk::Format format;
-        Metal::VkToMtl::TextureSwizzle swizzle;
+        vk::ComponentMapping mapping;
         Metal::Object view;
     };
-    void* Mirror(void* texture, std::vector<MirrorView>& views, vk::Format format,
-                 Metal::VkToMtl::TextureSwizzle swizzle);
+    void* Mirror(void* texture, vk::Format texture_format, std::vector<MirrorView>& views,
+                 vk::Format format, const vk::ComponentMapping& mapping);
+    /// The provider could not run: off (logged) until the preset, output size or provider
+    /// changes (OnFrameStart).
+    void Fail(const char* consequence);
 
     Metal::Device& device;
     Scheduler& scheduler;

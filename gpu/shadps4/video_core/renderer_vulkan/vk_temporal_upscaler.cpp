@@ -177,6 +177,13 @@ TemporalUpscaler::~TemporalUpscaler() {
     }
 }
 
+void TemporalUpscaler::Fail(const char* consequence) {
+    failed = true;
+    std::printf("Upscaler: %s could not run, %s; off until the preset, output size or upscaler "
+                "changes\n",
+                BbSettings::UpscalerName(BbSettings::Get().upscaler), consequence);
+}
+
 bool TemporalUpscaler::Active() const {
     // Toggle 1 << 24 switches it off at run time (A/B); history restarts after.
     return enabled && !failed &&
@@ -242,10 +249,15 @@ bool TemporalUpscaler::OnFrameStart() {
     // The guest's startup resolution patch remains in effect until restart. Keep the
     // upscaler at the applied preset while the menu saves the requested one for run.sh.
     const int preset = BbSettings::RenderPreset();
-    if (applied_preset != preset || settings.upscaler == BbSettings::UpscalerOff) failed = false;
+    const int upscaler = settings.upscaler.load();
+    // A failed provider (FSR 3 until M6, a size TAA refuses) stays off until the preset, the
+    // output size or the provider changes.
+    if (applied_preset != preset || applied_upscaler != upscaler ||
+        upscaler == BbSettings::UpscalerOff) {
+        failed = false;
+    }
     const bool active = Active();
     const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25);
-    const int upscaler = settings.upscaler.load();
     const int output = settings.output_res.load();
     const bool output_changed = !scaled_session && applied_output != output;
     if (output_changed) {
@@ -341,6 +353,7 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
     reactive_image = CreateTexture(device, vk::Format::eR8Unorm, w, h, false, true, false,
                                    "Upscaler reactive mask");
     opaque_valid = false;
+    mask_ready = false; // the new mask texture holds nothing yet
     reset = true;
     resources_ready = true;
     resources_upscaler = upscaler;
@@ -385,7 +398,7 @@ void TemporalUpscaler::OnBlendedSceneDraw() {
     }
     if (!EnsureResources(w, h, Scaled() ? target_width : ow,
                          Scaled() ? target_height : oh, !Scaled())) {
-        failed = true;
+        Fail("no resources at this size");
         return;
     }
     scheduler.EndRendering();
@@ -549,7 +562,7 @@ void TemporalUpscaler::Run() {
         return;
     }
     if (!EnsureResources(w, h, ow, oh, true)) {
-        failed = true;
+        Fail("no resources at this size");
         return;
     }
     scheduler.EndRendering();
@@ -585,7 +598,7 @@ void TemporalUpscaler::Run() {
         .hdr = true,
     };
     if (!Resolve(inputs)) {
-        failed = true; // logged by the provider; the frame stays at render size
+        Fail("the frame stays at render size");
         return;
     }
     reset = false;
@@ -767,7 +780,7 @@ void TemporalUpscaler::RunScaled() {
         return;
     }
     if (!EnsureResources(w, h, ow, oh, false)) {
-        failed = true;
+        Fail("no resources at this size");
         return;
     }
     EnsureUiResources(ow, oh, color.info.pixel_format, depth.info.pixel_format);
@@ -830,7 +843,7 @@ void TemporalUpscaler::RunScaled() {
             }
         }
     } else {
-        failed = true; // logged by the provider; the background is scaled instead (OnDraw)
+        Fail("the background is scaled instead");
     }
     done_this_frame = true; // the UI is not jittered
     if (ok) {
@@ -840,30 +853,34 @@ void TemporalUpscaler::RunScaled() {
     }
 }
 
-void* TemporalUpscaler::Mirror(void* texture, std::vector<MirrorView>& views, vk::Format format,
-                               Metal::VkToMtl::TextureSwizzle swizzle) {
+void* TemporalUpscaler::Mirror(void* texture, vk::Format texture_format,
+                               std::vector<MirrorView>& views, vk::Format format,
+                               const vk::ComponentMapping& mapping) {
     for (const auto& entry : views) {
-        if (entry.format == format && entry.swizzle == swizzle) {
+        if (entry.format == format && entry.mapping == mapping) {
             return entry.view.Get();
         }
     }
     // The port's textures have PixelFormatView usage: the game's format (its sRGB twin, or
-    // another of the same texel size) can view them.
+    // another of the same texel size) can view them. Where Metal cannot make that view, the
+    // texture's own format is used, with that format's swizzle (as SceneTargets::View).
+    const u32 requested = PixelFormat(format);
     const u32 pixel_format =
-        Metal::SafeViewPixelFormat(Metal::TexturePixelFormat(texture), PixelFormat(format), true);
+        Metal::SafeViewPixelFormat(Metal::TexturePixelFormat(texture), requested, true);
+    const auto swizzle = Metal::VkToMtl::ComposeSwizzle(
+        mapping, pixel_format == requested ? format : texture_format);
     Metal::Object view =
         Metal::CreateTextureView(texture, pixel_format, Metal::TextureType::Tex2D, 0, 1, 0, 1,
                                  {swizzle.r, swizzle.g, swizzle.b, swizzle.a});
     ASSERT_MSG(view, "Upscaler: no {} view of an output-size texture", vk::to_string(format));
-    views.push_back({format, swizzle, std::move(view)});
+    views.push_back({format, mapping, std::move(view)});
     return views.back().view.Get();
 }
 
 bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
                                      const VideoCore::ImageViewInfo& view_info, Target& target) {
     if (ui_phase && color == ui_color) {
-        target = {Mirror(ui_image.Get(), ui_views, view_info.format,
-                         Metal::VkToMtl::IdentitySwizzle),
+        target = {Mirror(ui_image.Get(), ui_format, ui_views, view_info.format, {}),
                   ui_width, ui_height, true};
         return true;
     }
@@ -892,8 +909,7 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
                                       true, "Upscaler display");
     }
     display.valid = true;
-    target = {Mirror(display.image.Get(), display.views, view_info.format,
-                     Metal::VkToMtl::IdentitySwizzle),
+    target = {Mirror(display.image.Get(), display.format, display.views, view_info.format, {}),
               ui_width, ui_height};
     return true;
 }
@@ -912,8 +928,7 @@ bool TemporalUpscaler::RedirectSampled(VideoCore::ImageId image,
         return false;
     }
     // Metal orders the read after the UI passes that drew the image (tracked texture).
-    texture = Mirror(ui_image.Get(), ui_views, info.format,
-                     Metal::VkToMtl::ComposeSwizzle(info.mapping, info.format));
+    texture = Mirror(ui_image.Get(), ui_format, ui_views, info.format, info.mapping);
     return true;
 }
 
