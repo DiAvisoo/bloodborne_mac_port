@@ -346,11 +346,10 @@ Each item: what was done for now, what the refinement is, and where it lives.
   better pacing than the original and the PC version on a 4060). Shader/pipeline compiles or asset
   streaming (texture/buffer uploads, page-protection faults); the Frame stats line and Spike
   lines separate them (compiles, image create/refresh, write faults).
-- **Frame rate stuck at 60 with the 90 cap in the user's session.** Suspect: Apple's Metal HUD
-  (`metal_hud=1`): the user's ini matched the 89-90 FPS test runs except for it, and the HUD
-  showed exactly 60.00 even facing a wall. Test with and without `MTL_HUD_ENABLED`; if confirmed,
-  note it at the launcher toggle.
-
+- ~~Frame rate stuck at 60 with the 90 cap in the user's session.~~ Not the game and not the
+  Metal HUD (both locked at 60 with and without `MTL_HUD_ENABLED`): the built-in display had
+  switched to a fixed 60 Hz (`NSScreen.maximumFramesPerSecond` 60, refresh 60.0; earlier the same
+  day 90/120 caps reached 89/117 FPS). Fix: System Settings > Displays > Refresh Rate > ProMotion.
 - **Metal-native: GPU ~12% slower than 0.4.0 in the city (11.2 vs 9.9 ms/frame; 2026-10-17).**
   Caps 120 FPS at 89-94 against 0.4.0's ~100. Task 10c's per-command ordering is in; an unsafe
   probe without ordering waits reached 108 FPS, so the waits (or encoder splits they force) are
@@ -490,6 +489,9 @@ Each item: what was done for now, what the refinement is, and where it lives.
   *Refinement:* clang `-fprofile-generate`/`-fprofile-use` with `.profdata`.
 
 ## 3. Mac GUI
+
+- **Launcher: warn when the frame cap is above the display's refresh** (`NSScreen
+  .maximumFramesPerSecond`): a display set to 60 Hz silently holds 90/120 caps at 60 (2026-10-17).
 
 - **Native launcher app (user, 2026-10-15). Done 2026-10-16 (mac-v0.4.0, `launcher/`).** A SwiftUI launcher (game folder with the check,
   settings, log, play/stop), designed so other games can be added later. bmy/bbport-mac has one
