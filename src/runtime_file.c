@@ -258,6 +258,22 @@ static int64_t read_bounced(int h,void *buffer,uint64_t size,int64_t offset) {
                buffer,(unsigned long long)size,retries);
     return n;
 }
+/* A regular-file read that stops short before the end of the file hit a page the GPU protected
+ * part-way through the kernel's copy (read() returns what it copied instead of EFAULT). The game
+ * would take the short count as a failed or partial load (missing meshes until a reload), so the
+ * rest is read through the bounce buffer. Returns the new total. */
+static size_t short_reads;
+static ssize_t finish_short_read(int h,void *buffer,uint64_t size,int64_t offset,ssize_t n) {
+    if (n<=0 || (uint64_t)n>=size || offset<0) return n;
+    struct stat st;
+    if (fstat(h,&st) || !S_ISREG(st.st_mode) || offset+n>=st.st_size) return n;
+    size_t count=__atomic_add_fetch(&short_reads,1,__ATOMIC_RELAXED);
+    if (count<=20 || !(count & (count-1)))
+        printf("Runtime: short file read into guest memory at %p (%lld of %llu bytes) completed via bounce buffer (#%zu)\n",
+               buffer,(long long)n,(unsigned long long)size,count);
+    int64_t m=read_bounced(h,(char *)buffer+n,size-(uint64_t)n,offset+n);
+    return m>0 ? n+(ssize_t)m : n;
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
@@ -268,6 +284,10 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
         n=read_bounced(h,buffer,size,start);
         if (n>=0) lseek(h,start+n,SEEK_SET);
         else { errno=(int)-n; n=-1; }
+    }
+    if (n>0 && (uint64_t)n<size && start>=0) {
+        ssize_t total=finish_short_read(h,buffer,size,start,n);
+        if (total!=n) { n=total; lseek(h,start+n,SEEK_SET); }
     }
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -282,6 +302,7 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
         n=read_bounced(h,buffer,size,offset);
         if (n<0) { errno=(int)-n; n=-1; }
     }
+    n=finish_short_read(h,buffer,size,offset,n);
     if (n<0) {
         int e = errno;
         if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,e);
