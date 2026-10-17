@@ -138,7 +138,8 @@ typedef struct {
     struct { uint64_t address, size, checksum; } samples[8];
 } BbGpuVerifyRecord;
 typedef struct { BbGpuRecord r; uint32_t slot, pad; } BbGpuStart; /* configuration: in the block */
-typedef struct { BbGpuRecord r; uint32_t slot, pad; char initial[512], prompt[128]; } BbGpuTextBegin;
+/* flags: 1 = password entry (the window shows the typed text as dots). */
+typedef struct { BbGpuRecord r; uint32_t slot, flags; char initial[512], prompt[128]; } BbGpuTextBegin;
 
 typedef struct { BbGpuRecord r; uint32_t id, seq; } BbGpuIrq;
 typedef struct { BbGpuRecord r; uint64_t address, size; uint32_t read, write, seq, pad; } BbGpuProtect;

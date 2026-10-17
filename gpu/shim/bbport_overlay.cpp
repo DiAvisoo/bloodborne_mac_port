@@ -74,6 +74,10 @@ bool l3_down = false, r3_down = false;
 // neutral until it is released.
 std::atomic<int> held_scancode{SDL_SCANCODE_UNKNOWN};
 std::atomic<bool> held_sticks{false};
+// The game's text dialog (ImeDialog): set from the window thread, drawn by the present thread.
+std::atomic<bool> prompt_active{false};
+std::mutex prompt_mutex;
+std::string prompt_title, prompt_text;
 
 bool IsMenuToggle(const SDL_KeyboardEvent& key) {
     if (key.key == SDLK_INSERT) {
@@ -1170,6 +1174,38 @@ void FpsCounter() {
     ImGui::PopStyleVar(4);
 }
 
+/// The game's text dialog: prompt, the text typed so far and the keys, centred over the frame.
+void TextPrompt() {
+    std::string title, text;
+    {
+        std::scoped_lock lock{prompt_mutex};
+        title = prompt_title;
+        text = prompt_text;
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowBgAlpha(0.88f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f * base_scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22.0f, 16.0f) * base_scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 8.0f) * base_scale);
+    ImGui::Begin("##textprompt", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::TextUnformatted(title.c_str());
+    ImGui::Separator();
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.25f);
+    ImGui::Text("%s_", text.c_str());
+    ImGui::PopFont();
+    ImGui::Separator();
+    ImGui::TextColored(kSecondary, "Type on the keyboard \xC2\xB7 Backspace deletes \xC2\xB7 "
+                                   "Enter confirms \xC2\xB7 Esc cancels");
+    ImGui::End();
+    ImGui::PopStyleVar(3);
+}
+
 /// Colours and metrics at 1080p (Render scales the sizes to the display).
 void SetupStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
@@ -1474,11 +1510,21 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || BbSettings::Get().show_fps);
+    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps);
+}
+
+void SetTextPrompt(bool active, const std::string& prompt, const std::string& text) {
+    {
+        std::scoped_lock lock{prompt_mutex};
+        prompt_title = prompt;
+        prompt_text = text;
+    }
+    prompt_active = active;
 }
 
 bool CapturesInput() {
-    if (menu_open) {
+    // The text dialog too: keys typed into it (Backspace is the touchpad) stay out of the game.
+    if (menu_open || prompt_active) {
         return true;
     }
     // Shortcut still held after the menu closed. Checked against the live keyboard state too,
@@ -1638,6 +1684,9 @@ void Render(void* command_buffer, void* target, u32 width, u32 height) {
         }
         if (BbSettings::Get().show_fps && !menu_open) {
             FpsCounter();
+        }
+        if (prompt_active && !menu_open) {
+            TextPrompt();
         }
         if (menu_trace && (io.MouseClicked[0] || io.MouseReleased[0])) {
             std::printf("menu: frame sees %s at %.0f,%.0f, over a control: %s, control "

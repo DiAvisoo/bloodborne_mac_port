@@ -313,6 +313,14 @@ To keep them elsewhere, set `BB_DATA_DIR=/some/folder` in `launch.conf` (or the 
 A checkout that already has saves in its own folder (`user/`, from before this default) keeps
 using them; move `user/` and `bbport.ini` to the folder above to switch.
 
+### Typing text
+
+Text the game asks for (the character's name, the network password under *Network Settings*)
+is typed on the keyboard: a box over the frame shows the prompt and the text (as dots for the
+password), Backspace deletes, Enter confirms, Esc cancels and leaves the field as it was. The
+field gets exactly what was typed; the game's own length limit applies (the log line
+`ImeDialog opened (..., up to N chars)` shows it).
+
 ### From Terminal
 
 ```sh

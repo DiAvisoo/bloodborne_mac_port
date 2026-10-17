@@ -132,7 +132,7 @@ int main(void) {
           (unsigned long long)vb0.count, (unsigned long long)vb1.count);
     printf("split test: %llu vblanks in 0.5 s\n", (unsigned long long)(vb1.count - vb0.count));
     /* Text entry (IME dialog) in the host window: open with a preset, read it back. */
-    CHECK(bbgpu_text_input_begin("Hunter", "Name") == 1, "text entry did not open in the host window");
+    CHECK(bbgpu_text_input_begin("Hunter", "Name", 0) == 1, "text entry did not open in the host window");
     char text[64] = "";
     int state = -1;
     t0 = now_ms();

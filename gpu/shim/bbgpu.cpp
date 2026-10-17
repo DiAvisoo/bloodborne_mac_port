@@ -333,7 +333,7 @@ extern "C" int bbgpu_host_dispatch(const void* record) {
         if (g_window) {
             const std::string initial(t->initial, strnlen(t->initial, sizeof t->initial));
             const std::string prompt(t->prompt, strnlen(t->prompt, sizeof t->prompt));
-            g_window->BeginTextInput(initial, prompt.empty() ? "Text" : prompt);
+            g_window->BeginTextInput(initial, prompt.empty() ? "Text" : prompt, (t->flags & 1u) != 0);
             __atomic_store_n(&s->text_state, 0u, __ATOMIC_RELAXED);
             __atomic_store_n(&s->text_active, 1u, __ATOMIC_RELEASE);
             opened = 1;
@@ -679,16 +679,17 @@ extern "C" int bbgpu_overlay_captures_input(void) {
     return BbOverlay::CapturesInput() ? 1 : 0;
 }
 
-extern "C" int bbgpu_text_input_begin(const char* initial, const char* prompt) {
+extern "C" int bbgpu_text_input_begin(const char* initial, const char* prompt, int password) {
     if (BbSplit::Remote()) {
         BbGpuTextBegin record{};
         record.r = {BBGPU_REC_TEXT_BEGIN, sizeof(BbGpuTextBegin)};
+        record.flags = password ? 1u : 0u;
         std::snprintf(record.initial, sizeof record.initial, "%s", initial ? initial : "");
         std::snprintf(record.prompt, sizeof record.prompt, "%s", prompt ? prompt : "Text");
         return BbSplit::Request(&record, &record.slot) != 0 ? 1 : 0;
     }
     if (!g_window) return 0;
-    g_window->BeginTextInput(initial ? initial : "", prompt ? prompt : "Text");
+    g_window->BeginTextInput(initial ? initial : "", prompt ? prompt : "Text", password != 0);
     return 1;
 }
 

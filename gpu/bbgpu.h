@@ -58,7 +58,8 @@ int bbgpu_handle_fault(void *ucontext, void *address);
 void bbgpu_dump_guest_writes(void *ucontext);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when
  * no window exists; poll returns 0 typing, 1 confirmed, 2 cancelled (UTF-8 text). */
-int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);
+/* password: the dialog asked for masked entry (OrbisImeOption PASSWORD); the typed text is shown as dots. */
+int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8, int password);
 int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int bbgpu_overlay_captures_input(void);

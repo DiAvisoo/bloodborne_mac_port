@@ -195,7 +195,7 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
 DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4)
 static ABI int32_t profile_result(void *result) { if (result) memset(result,0,4); return 0; }
-/* ImeDialog: text typed on the keyboard into the game window (title bar shows it).
+/* ImeDialog: text typed on the keyboard into the game window (drawn as a box over the frame).
  * OrbisImeDialogParam: user, type, languages(8), enter label, method, filter,
  * option, max length, char16 buffer, position, alignment, placeholder, title. */
 typedef struct {
@@ -203,7 +203,8 @@ typedef struct {
     void *filter; uint32_t option, max_length; uint16_t *buffer;
     float x, y; uint32_t halign, valign; const uint16_t *placeholder, *title; int8_t reserved[16];
 } ImeParam;
-static struct { int running, finished, end_status; uint16_t *buffer; uint32_t max_length; } ime;
+#define IME_OPTION_PASSWORD 4u /* OrbisImeOption: masked entry */
+static struct { int running, finished, end_status, password; uint16_t *buffer; uint32_t max_length; } ime;
 static size_t utf16_to_utf8(const uint16_t *in, size_t limit, char *out, size_t size) {
     size_t n=0;
     for (size_t i=0; in && i<limit && in[i] && n+4<size; ++i) {
@@ -230,14 +231,13 @@ static void utf8_to_utf16(const char *in, uint16_t *out, uint32_t max) {
     out[n<max ? n : max]=0;
 }
 static void ime_complete(int end_status, const char *text) {
-    if (!end_status && ime.buffer && ime.max_length) {
-        const char *out_text = (text && text[0]) ? text : "Hunter";
-        utf8_to_utf16(out_text, ime.buffer, ime.max_length);
-    } else if (end_status && ime.buffer && ime.max_length && ime.buffer[0] == 0) {
-        utf8_to_utf16("Hunter", ime.buffer, ime.max_length);
-    }
+    /* Confirmed: exactly the typed text (an empty entry clears the field). Cancelled: the game's
+     * buffer is left as it was. No made-up defaults: a password field must get what was typed. */
+    if (!end_status && ime.buffer && ime.max_length) utf8_to_utf16(text ? text : "",ime.buffer,ime.max_length);
     ime.end_status=end_status; ime.finished=1; ime.running=0;
-    printf("Runtime: ImeDialog %s%s%s\n",end_status ? "cancelled (default used)" : "text: ",end_status ? "Hunter" : (text ? text : "Hunter"),"");
+    if (end_status) printf("Runtime: ImeDialog cancelled\n");
+    else if (ime.password) printf("Runtime: ImeDialog text: (password, %zu bytes)\n",text ? strlen(text) : 0);
+    else printf("Runtime: ImeDialog text: %s\n",text ? text : "");
 }
 static ABI int32_t ime_init(const ImeParam *param, const void *extended) {
     (void)extended;
@@ -245,19 +245,21 @@ static ABI int32_t ime_init(const ImeParam *param, const void *extended) {
     if (ime.running) return (int32_t)0x80BC0003;                                  /* BUSY */
     memset(&ime,0,sizeof(ime));
     ime.buffer=param->buffer; ime.max_length=param->max_length; ime.running=1;
+    ime.password=(param->option & IME_OPTION_PASSWORD) != 0;
     char initial[512], prompt[256];
     utf16_to_utf8(param->buffer,param->max_length,initial,sizeof(initial));
     utf16_to_utf8(param->title,128,prompt,sizeof(prompt));
-    if (!initial[0]) {
-        const char *name = getenv("BB_USER_NAME");
-        snprintf(initial, sizeof(initial), "%s", name && name[0] ? name : "Hunter");
-    }
+    if (!prompt[0]) snprintf(prompt,sizeof(prompt),"%s",ime.password ? "Password" : "Text");
     const char *preset=getenv("BB_IME_TEXT");
     if (preset) { ime_complete(0,preset); return 0; }
-    if (!bbgpu_text_input_begin(initial,prompt[0] ? prompt : "Name")) {
+    if (!bbgpu_text_input_begin(initial,prompt,ime.password)) {
+        /* No window to type in (headless runs): a name field gets BB_USER_NAME or "Hunter",
+         * anything else keeps what the game put there. */
         const char *name=getenv("BB_USER_NAME");
-        ime_complete(0,name ? name : initial[0] ? initial : "Hunter");
-    } else printf("Runtime: ImeDialog opened: type in the game window, Enter to confirm, Esc to cancel\n");
+        if (ime.password) ime_complete(1,NULL);
+        else ime_complete(0,name && name[0] ? name : initial[0] ? initial : "Hunter");
+    } else printf("Runtime: ImeDialog opened (%s, up to %u chars): type in the game window, Enter to confirm, Esc to cancel\n",
+                  prompt,ime.max_length);
     return 0;
 }
 static ABI int32_t ime_status(void) {

@@ -76,10 +76,11 @@ WindowSDL::~WindowSDL() {
     SDL_DestroyWindow(window);
 }
 
-void WindowSDL::BeginTextInput(const std::string& initial, const std::string& prompt) {
+void WindowSDL::BeginTextInput(const std::string& initial, const std::string& prompt, bool password) {
     std::scoped_lock lock{text_mutex};
     text = initial;
     text_prompt = prompt;
+    text_password = password;
     text_state = 0;
     text_requested = true;
 }
@@ -91,9 +92,18 @@ int WindowSDL::PollTextInput(std::string& out) {
 }
 
 void WindowSDL::UpdateTextTitle() {
-    const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + text + "_  (Enter = OK, Esc = cancel)"
+    std::string shown = text;
+    if (text_password) { // one dot per code point
+        size_t points = 0;
+        for (unsigned char c : text) points += (c & 0xC0) != 0x80;
+        shown.clear();
+        for (size_t i = 0; i < points; ++i) shown += "\u2022";
+    }
+    const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + shown + "_  (Enter = OK, Esc = cancel)"
                                           : base_title;
     SDL_SetWindowTitle(window, title.c_str());
+    // Fullscreen has no title bar: the overlay draws the same entry as a box over the frame.
+    BbOverlay::SetTextPrompt(text_active, text_prompt, shown);
 }
 
 void WindowSDL::UpdateVisible() {

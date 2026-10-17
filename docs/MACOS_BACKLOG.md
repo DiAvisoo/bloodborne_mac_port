@@ -574,6 +574,16 @@ Each item: what was done for now, what the refinement is, and where it lives.
   English, opens with ⌘, or L3+R3 and shows FPS, render → output resolution and upscaler.
   *Refinement:* a native Mac settings window in the launcher; if SDL's default app menu
   swallows ⌘, (its "Preferences…" item), wire that menu item to the overlay instead.
+- **Text entry (ImeDialog) invisible in fullscreen; network password could not be set. Fixed
+  2026-10-17 (online-shadnet).** The typed text was shown only in the window title bar, which
+  fullscreen has none of, and the dialog prefilled "Hunter" into any empty field and wrote
+  "Hunter" when the entry was empty or cancelled (inherited from the Windows port), so the
+  8-character *Network Settings* password became "Hunter" plus two typed letters. Now: upstream's
+  on-screen box (`BbOverlay::SetTextPrompt`, drawn by the presenter, also in split mode where the
+  host owns the window), the field gets exactly what was typed, cancel leaves it alone, and
+  `OrbisImeOption` PASSWORD (bit 4) masks the text as dots (`bbgpu_text_input_begin` gained the
+  flag; `BbGpuTextBegin.flags`). Game input is held neutral while the box is open, so Backspace
+  (the touchpad) does not reach the game.
 - **Menu bugs on macOS.** "Subpixel jitter" ticks then unticks itself; upscaler/preset choices
   made in the menu were not what bbport.ini held afterwards (found upscaler=off, preset=0).
   *2026-10-15:* settings were only written when the menu closed, so closing the game window (or

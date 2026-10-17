@@ -33,8 +33,9 @@ public:
     bool IsVisible() const { return visible.load(std::memory_order_relaxed); }
     /// Processes pending window events. Returns false once the user closed the window.
     bool PollEvents();
-    /// Keyboard text entry for the system IME dialog; typed text shows in the title bar.
-    void BeginTextInput(const std::string& initial, const std::string& prompt);
+    /// Keyboard text entry for the system IME dialog; the typed text shows in a box over the
+    /// frame (BbOverlay) and in the title bar. `password`: shown as dots.
+    void BeginTextInput(const std::string& initial, const std::string& prompt, bool password);
     /// 0 while typing, 1 confirmed (Enter), 2 cancelled (Escape); text is UTF-8.
     int PollTextInput(std::string& text);
 
@@ -44,7 +45,7 @@ private:
     std::atomic<bool> visible{true};
     void UpdateVisible();
     std::mutex text_mutex;
-    bool text_requested{}, text_active{};
+    bool text_requested{}, text_active{}, text_password{};
     int text_state{};
     std::string text, text_prompt, base_title;
     void UpdateTextTitle();

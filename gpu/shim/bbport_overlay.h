@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "common/types.h"
 
 union SDL_Event;
@@ -38,7 +40,12 @@ bool Visible();
 /// (timing and saving only). Callers hold an autorelease pool.
 void Render(void* command_buffer, void* target, u32 width, u32 height);
 
-/// The menu is open: the game's input is held neutral.
+/// The menu or the game's text dialog is open: the game's input is held neutral.
 bool CapturesInput();
+
+/// Window thread: the game's text dialog (ImeDialog) state, drawn as a box over the frame
+/// (the title bar is not visible in fullscreen). `text` is what to show (already masked for a
+/// password).
+void SetTextPrompt(bool active, const std::string& prompt, const std::string& text);
 
 } // namespace BbOverlay
