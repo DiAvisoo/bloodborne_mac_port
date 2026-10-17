@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -239,13 +240,32 @@ static int receive(mach_port_t port, mach_msg_id_t id, InboxBuffer *in) {
     return -1;
 }
 
+/* The major macOS version (kern.osproductversion "27.0.1" -> 27), 0 if unknown. */
+static int macos_major(void) {
+    char version[32] = "";
+    size_t size = sizeof version;
+    if (sysctlbyname("kern.osproductversion", version, &size, NULL, 0)) return 0;
+    return atoi(version);
+}
+
 static int host_path(char *out, size_t size) {
     const char *env = getenv("BB_GPU_HOST");
-    if (env && *env) { snprintf(out, size, "%s", env); return 0; }
-    char exe[PATH_MAX], real[PATH_MAX];
-    uint32_t n = sizeof exe;
-    if (_NSGetExecutablePath(exe, &n) || !realpath(exe, real)) return -1;
-    snprintf(out, size, "%s/bbgpu-host", dirname(real));
+    if (env && *env) {
+        snprintf(out, size, "%s", env);
+    } else {
+        char exe[PATH_MAX], real[PATH_MAX];
+        uint32_t n = sizeof exe;
+        if (_NSGetExecutablePath(exe, &n) || !realpath(exe, real)) return -1;
+        snprintf(out, size, "%s/bbgpu-host", dirname(real));
+    }
+    /* macOS 27 and later: the host built with the guest range as an exec-time segment
+     * (build_macos.sh, host/main.c reserve_guest_range), beside the plain one. Earlier macOS
+     * keeps the plain host: there the pinned segment breaks dyld. */
+    if (macos_major() >= 27) {
+        char variant[PATH_MAX];
+        snprintf(variant, sizeof variant, "%s-macos27", out);
+        if (access(variant, X_OK) == 0) snprintf(out, size, "%s", variant);
+    }
     return 0;
 }
 
@@ -345,6 +365,7 @@ void gpu_process_start(void) {
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
     InboxBuffer in;
+    printf("GPU process: starting %s\n", path);
     int ok = !spawn(path, hs);
     /* 1. hello: the host's port arrives as the reply port */
     if (ok) ok = !receive(hs, BBGPU_MSG_HELLO, &in);
