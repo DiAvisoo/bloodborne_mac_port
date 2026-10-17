@@ -1,54 +1,71 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: Apple MetalFX temporal upscaling for the Vulkan renderer on MoltenVK (macOS).
-// The Metal objects behind the Vulkan images and queue come from VK_EXT_metal_objects. MetalFX
-// encodes into its own Metal command buffer on MoltenVK's queue: the caller submits the Vulkan
-// work that writes the inputs first; Metal runs command buffers of one queue in commit order.
+// bbport: Apple MetalFX temporal upscaling for the Metal-native renderer. The scaler is a
+// Metal::Object (id<MTLFXTemporalScaler>); textures cross as void* (id<MTLTexture>). Encode runs
+// inside a Scheduler::Record closure and encodes into the frame's own command buffer, in order
+// with the commands that wrote the inputs (no command buffer or submission of its own).
 #pragma once
 
+#include <array>
 #include <cstdint>
-#include <vulkan/vulkan_core.h>
+#include <cstdio>
+
+#include "video_core/renderer_metal/mtl_object.h"
+
+namespace Metal {
+class Device;
+class Encoder;
+} // namespace Metal
 
 namespace BbMetalFx {
 
-#ifdef __APPLE__
-/// Whether this Mac supports the MetalFX temporal scaler.
-bool Supported();
-#else
-inline bool Supported() {
-    return false;
-}
-#endif
+/// Whether `device` supports the MetalFX temporal scaler.
+bool Supported(Metal::Device& device);
 
-struct Frame {
-    VkDevice device;
-    PFN_vkGetDeviceProcAddr get_device_proc_addr;
-    VkQueue queue;
-    VkImage color;  ///< render size, HDR RGBA16F
-    VkImage depth;  ///< render size
-    VkImage motion; ///< render size, RG16F, pixels, current -> previous
-    VkImage output; ///< output size, RGBA16F
-    uint32_t width, height, out_width, out_height;
-    float jitter_x, jitter_y; ///< pixels
-    float motion_scale_x, motion_scale_y;
-    bool reset; ///< discard history (camera cut, resize)
-    bool hdr;   ///< linear HDR color (auto exposure); false for the tonemapped frame
-    /// bbport Metal frame path: id<MTLCommandBuffer> to encode into (in order with the frame,
-    /// not committed here); null: a command buffer of its own, committed.
-    void* command_buffer = nullptr;
+/// What a scaler is made for: the MTLPixelFormat of each texture, the input (render) and output
+/// sizes, and whether the colour is linear HDR (auto exposure) or the tonemapped frame.
+struct Config {
+    uint32_t color_format{}, depth_format{}, motion_format{}, output_format{};
+    uint32_t width{}, height{}, out_width{}, out_height{};
+    bool hdr{};
+
+    bool operator==(const Config&) const = default;
 };
 
-#ifdef __APPLE__
-/// Encodes and commits one upscale. Call with Scheduler::submit_mutex held, right after the
-/// Vulkan submission that produced the inputs. False (logged once) when MetalFX cannot run.
-bool Encode(const Frame& frame);
+/// Makes a temporal scaler for `config` (tens of milliseconds; the first in a process longer).
+/// Empty Object on failure (logged).
+Metal::Object CreateScaler(Metal::Device& device, const Config& config);
 
-/// Drops the scaler (sizes or formats change, or the upscaler is switched off).
-void Release();
-#else
-inline bool Encode(const Frame&) {
-    return false;
+/// One frame's inputs. The colour and depth may be larger than the scaler's input size, with the
+/// scene in their top-left content_width x content_height (BB_RENDER_RES targets).
+struct Frame {
+    void* color{};  ///< id<MTLTexture>, the scaler's colour format
+    void* depth{};  ///< id<MTLTexture>, the scaler's depth format
+    void* motion{}; ///< id<MTLTexture>, pixels, previous minus current
+    void* output{}; ///< id<MTLTexture>, output size, ShaderWrite and RenderTarget usage
+    uint32_t content_width{}, content_height{}; ///< the scene rectangle (<= the input size)
+    float jitter_x{}, jitter_y{};               ///< pixels, the signs already applied
+    float motion_scale_x{1.0f}, motion_scale_y{1.0f};
+    bool reset{}; ///< discard history (first frame, resize, camera cut, settings change)
+};
+
+/// Encodes one upscale into `e`'s command buffer (the open encoder ends first) and keeps the
+/// scaler alive until that command buffer completes. Call inside a Scheduler::Record closure:
+/// the scaler's per-frame properties are set here, on the thread that encodes.
+void Encode(Metal::Encoder& e, void* scaler, const Frame& frame);
+
+/// The jitter signs per axis: BB_METALFX_JITTER="sx,sy" (default 1,1; a malformed value is
+/// ignored) times BB_METALFX_JITTER_SIGN (one factor for both axes, default 1). Null: unset.
+inline std::array<float, 2> JitterSigns(const char* per_axis, const char* both) {
+    std::array<float, 2> signs{1.0f, 1.0f};
+    float x = 1.0f, y = 1.0f;
+    if (per_axis && std::sscanf(per_axis, "%f,%f", &x, &y) == 2) {
+        signs = {x, y};
+    }
+    float s = 1.0f;
+    if (both && std::sscanf(both, "%f", &s) == 1) {
+        signs = {signs[0] * s, signs[1] * s};
+    }
+    return signs;
 }
-inline void Release() {}
-#endif
 
 } // namespace BbMetalFx

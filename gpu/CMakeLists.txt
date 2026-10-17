@@ -159,7 +159,7 @@ endif()
 # file removes its name from this list, and its stand-in in the same task. (The names are the
 # files under renderer_vulkan/ and shim/; imgui_impl_vulkan is the Vulkan ImGui backend, replaced
 # by imgui_impl_metal.)
-set(BB_M5_PENDING vk_gpu_profiler bbport_overlay bbport_metalfx imgui_impl_vulkan)
+set(BB_M5_PENDING vk_gpu_profiler bbport_overlay imgui_impl_vulkan)
 set(BB_UNCONVERTED_6 host_passes/fsr_pass)
 set(BB_UNCONVERTED_7 vk_instance vk_platform)
 foreach(stage 6 7)
@@ -225,10 +225,8 @@ if (APPLE)
     # bbport: one-frame Metal GPU capture (shim/bbport_gpu_capture.h).
     enable_language(OBJCXX)
     target_sources(bbgpu PRIVATE shim/bbport_gpu_capture.mm)
-    if (NOT "bbport_metalfx" IN_LIST BB_M5_PENDING)
-        # MetalFX temporal upscaling (shim/bbport_metalfx.h), used by the upscaler (M5).
-        target_sources(bbgpu PRIVATE shim/bbport_metalfx.mm)
-    endif()
+    # MetalFX temporal upscaling on native textures (shim/bbport_metalfx.h), used by the upscaler.
+    target_sources(bbgpu PRIVATE shim/bbport_metalfx.mm)
     set_source_files_properties(shim/bbport_gpu_capture.mm shim/bbport_metalfx.mm
                                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_METAL_EXT)

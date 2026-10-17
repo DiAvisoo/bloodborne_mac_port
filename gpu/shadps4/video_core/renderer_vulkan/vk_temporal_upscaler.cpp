@@ -130,10 +130,9 @@ TemporalUpscaler::TemporalUpscaler(Metal::Device& device_, Scheduler& scheduler_
                                    CameraMotion& camera_motion_, SceneTargets& scene_targets_)
     : device{device_}, scheduler{scheduler_}, texture_cache{texture_cache_}, runtime{runtime_},
       camera_motion{camera_motion_}, scene_targets{scene_targets_}, scale{device_} {
-    // Reject unsupported providers before allocating resources or recording a frame. MetalFX:
-    // every Mac this build runs on has the temporal scaler (Apple GPU, macOS 15); its own check
-    // (BbMetalFx::Supported) comes back with the MetalFX port (M5 Task 8).
-    BbSettings::ConfigureUpscalerSupport(false, false, true);
+    // Reject unsupported providers before allocating resources or recording a frame: MetalFX
+    // only where our device has the temporal scaler.
+    BbSettings::ConfigureUpscalerSupport(false, false, BbMetalFx::Supported(device));
     // Available unless BB_UPSCALER=none; on/off and the parameters are the menu's settings.
     const char* env = std::getenv("BB_UPSCALER");
     enabled = !(env && std::strcmp(env, "none") == 0);
@@ -321,7 +320,8 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
     Run();
 }
 
-bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
+bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr, u32 mw,
+                                       u32 mh) {
     const int upscaler = BbSettings::Get().upscaler.load();
     if (upscaler == BbSettings::UpscalerTaa && (w != ow || h != oh)) {
         std::printf("TAA: render size %ux%u is not the output size %ux%u (native-resolution "
@@ -329,8 +329,13 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
         std::fflush(stdout);
         return false;
     }
+    if (!mw || !mh) {
+        mw = w;
+        mh = h;
+    }
     if (resources_ready && w == width && h == height && ow == out_width && oh == out_height &&
-        hdr == resources_hdr && upscaler == resources_upscaler) {
+        mw == motion_width && mh == motion_height && hdr == resources_hdr &&
+        upscaler == resources_upscaler) {
         return true;
     }
     // Recorded commands of earlier frames can still use the textures (a live output-size or
@@ -341,10 +346,12 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
     height = h;
     out_width = ow;
     out_height = oh;
+    motion_width = mw;
+    motion_height = mh;
     resources_hdr = hdr;
     // Motion, opaque and reactive: render size; the output: output size, written by kernels
-    // and (MetalFX, the copy stand-in) as a render target.
-    motion_image = CreateTexture(device, vk::Format::eR16G16Sfloat, w, h, false, true, false,
+    // and (MetalFX) as a render target.
+    motion_image = CreateTexture(device, vk::Format::eR16G16Sfloat, mw, mh, false, true, false,
                                  "Upscaler motion");
     output_image = CreateTexture(device, vk::Format::eR16G16B16A16Sfloat, ow, oh, true, true,
                                  false, "Upscaler output");
@@ -362,6 +369,9 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
                       : Metal::Object{};
     }
     taa_next = 0;
+    if (upscaler != BbSettings::UpscalerMetalFx) {
+        metalfx_scaler = {}; // its memory, while another provider runs
+    }
     opaque_valid = false;
     mask_ready = false; // the new mask texture holds nothing yet
     reset = true;
@@ -377,9 +387,8 @@ void TemporalUpscaler::CreatePipelines() {
     reactive_kernel = Metal::BuildHostKernel(device, UPSCALE_REACTIVE_COMP, {}, "upscale_reactive");
     // TAA, its sharpen and the extra sharpen of the other providers (RGBA16F and LDR).
     taa = Taa::Build(device);
-    // The scale pipelines of every copy below: the copy resolve (RGBA16F output), the output
-    // into the UI image and the menu background (RGBA8, linear or sRGB), the UI depth.
-    scale.PrepareColor(PixelFormat(vk::Format::eR16G16B16A16Sfloat), Metal::ScaleFilter::Linear);
+    // The scale pipelines of every copy below: the output into the UI image and the menu
+    // background (RGBA8, linear or sRGB), the UI depth.
     for (const auto format : {vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Srgb}) {
         scale.PrepareColor(PixelFormat(format), Metal::ScaleFilter::Linear);
         scale.PrepareColor(PixelFormat(format), Metal::ScaleFilter::Nearest);
@@ -408,8 +417,9 @@ void TemporalUpscaler::OnBlendedSceneDraw() {
     if (color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat) {
         return;
     }
-    if (!EnsureResources(w, h, Scaled() ? target_width : ow,
-                         Scaled() ? target_height : oh, !Scaled())) {
+    // The motion size as RunScaled makes it (BB_RENDER_RES: the targets' size).
+    if (!EnsureResources(w, h, Scaled() ? target_width : ow, Scaled() ? target_height : oh,
+                         !Scaled(), scaled_session ? ow : w, scaled_session ? oh : h)) {
         Fail("no resources at this size");
         return;
     }
@@ -529,16 +539,6 @@ bool TemporalUpscaler::Resolve(const ResolveInputs& in) {
     }
 }
 
-bool TemporalUpscaler::ResolveCopy(const ResolveInputs& in) {
-    scheduler.EndRendering();
-    scheduler.Record([scale = &scale, color = in.color, output = in.output](Metal::Encoder& e) {
-        scale->ScaleColor(e, color, output, Metal::ScaleFilter::Linear);
-    });
-    // The guest pipelines' dynamic state must be emitted again after the copy's pipeline.
-    scheduler.GetDynamicState().Invalidate();
-    return true;
-}
-
 bool TemporalUpscaler::ResolveTaa(const ResolveInputs& in) {
     // Native resolution only (EnsureResources refuses other sizes and makes the history).
     if (!taa_history[0] || in.width != in.out_width || in.height != in.out_height) {
@@ -653,9 +653,54 @@ void TemporalUpscaler::ExtraSharpen(void* target, bool ldr, u32 w, u32 h) {
 }
 
 bool TemporalUpscaler::ResolveMetalFx(const ResolveInputs& in) {
-    // M5 Task 8 ports the MetalFX temporal scaler (and ExtraSharpen); until then the frame is
-    // copied.
-    return ResolveCopy(in);
+    // BB_METALFX_JITTER="sx,sy" and BB_METALFX_JITTER_SIGN: the jitter's signs per axis (the
+    // distant-shimmer investigation), the same for Run and RunScaled.
+    static const std::array<float, 2> signs = [] {
+        const auto s = BbMetalFx::JitterSigns(std::getenv("BB_METALFX_JITTER"),
+                                              std::getenv("BB_METALFX_JITTER_SIGN"));
+        if (s[0] != 1.0f || s[1] != 1.0f) {
+            std::printf("MetalFX: jitter signs %g,%g\n", s[0], s[1]);
+        }
+        return s;
+    }();
+    const BbMetalFx::Config config{
+        .color_format = Metal::TexturePixelFormat(in.color),
+        .depth_format = Metal::TexturePixelFormat(in.depth),
+        .motion_format = Metal::TexturePixelFormat(in.motion),
+        .output_format = Metal::TexturePixelFormat(in.output),
+        .width = in.width,
+        .height = in.height,
+        .out_width = in.out_width,
+        .out_height = in.out_height,
+        .hdr = in.hdr,
+    };
+    bool fresh = false;
+    if (!metalfx_scaler || config != metalfx_config) {
+        // Commands recorded earlier hold the old scaler by pointer until they are encoded.
+        scheduler.Finish();
+        metalfx_scaler = BbMetalFx::CreateScaler(device, config);
+        metalfx_config = config;
+        fresh = true;
+        if (!metalfx_scaler) {
+            return false; // logged; the caller's Fail() keeps it off until a settings change
+        }
+    }
+    const BbMetalFx::Frame frame{
+        .color = in.color,
+        .depth = in.depth,
+        .motion = in.motion,
+        .output = in.output,
+        .content_width = in.width,
+        .content_height = in.height,
+        .jitter_x = signs[0] * in.jitter[0],
+        .jitter_y = signs[1] * in.jitter[1],
+        .reset = in.reset || fresh,
+    };
+    scheduler.EndRendering();
+    scheduler.Record([scaler = metalfx_scaler.Get(), frame](Metal::Encoder& e) {
+        BbMetalFx::Encode(e, scaler, frame);
+    });
+    return true;
 }
 
 bool TemporalUpscaler::ResolveFsr3(const ResolveInputs&) {
@@ -905,7 +950,9 @@ void TemporalUpscaler::RunScaled() {
     if (depth.info.size.width != iw || depth.info.size.height != ih || w > ow || h > oh) {
         return;
     }
-    if (!EnsureResources(w, h, ow, oh, false)) {
+    // MetalFX: the motion texture has the colour input's size (the native targets with
+    // BB_RENDER_RES, the w x h proxies otherwise).
+    if (!EnsureResources(w, h, ow, oh, false, scaled_session ? iw : w, scaled_session ? ih : h)) {
         Fail("no resources at this size");
         return;
     }

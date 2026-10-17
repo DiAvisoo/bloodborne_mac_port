@@ -14,8 +14,7 @@
 // resized at frame boundaries (SceneTargets). BB_RENDER_RES retains the older startup-patched
 // guest-resolution path.
 //
-// The resolve step is pluggable (Resolve): TAA, MetalFX and FSR 3.1 plug in there; a plain
-// scaled copy stands in for a provider that is not ported yet.
+// The resolve step is pluggable (Resolve): TAA, MetalFX and FSR 3.1 plug in there.
 
 #pragma once
 
@@ -27,6 +26,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+
+#include "bbport_metalfx.h"
 
 #include "common/types.h"
 #include "video_core/renderer_metal/mtl_host_kernel.h"
@@ -138,10 +139,11 @@ public:
     bool DisplayOverride(VAddr address, Display& display);
 
     /// One frame of the resolve step (all textures id<MTLTexture>, unretained, alive until the
-    /// GPU has run the frame). Render size: `motion`, `reactive`; output size: `output`.
-    /// `color` and `depth` hold the scene in their top-left width x height: exactly that size
-    /// (scene proxies) except with BB_RENDER_RES (the startup patch), where they are the game's
-    /// aligned targets, a few pixels larger (pass width x height as the input content size).
+    /// GPU has run the frame). Render size: `reactive`; output size: `output`.
+    /// `color`, `depth` and `motion` hold the scene in their top-left width x height: exactly
+    /// that size (scene proxies) except with BB_RENDER_RES (the startup patch), where colour and
+    /// depth are the game's aligned targets, a few pixels larger, and motion has the colour's
+    /// size (MetalFX requires it); width x height is then MetalFX's input content size.
     struct ResolveInputs {
         void* color{};    ///< HDR RGBA16F scene color (hdr) or the tonemapped RGBA8 frame
         void* depth{};    ///< scene depth (D32S8 or D32; depth in red when sampled)
@@ -178,8 +180,10 @@ private:
     [[nodiscard]] bool Active() const;
     [[nodiscard]] bool ReactiveOn() const;
     /// The per-size textures; recreated (after scheduler.Finish()) when a size, the input kind
-    /// or the provider changes.
-    bool EnsureResources(u32 width, u32 height, u32 out_width, u32 out_height, bool hdr);
+    /// or the provider changes. The motion texture is `motion_width` x `motion_height` (0: the
+    /// render size): the colour input's size, which MetalFX requires (BB_RENDER_RES targets).
+    bool EnsureResources(u32 width, u32 height, u32 out_width, u32 out_height, bool hdr,
+                         u32 motion_width = 0, u32 motion_height = 0);
     /// The kernels and scale pipelines, built once at construction (not at first use on the
     /// encoder thread).
     void CreatePipelines();
@@ -194,11 +198,11 @@ private:
     /// selected provider, recorded in order with the frame (scheduler.Record). False when it
     /// cannot run this frame: the frame stays unresolved and the caller sets `failed`.
     bool Resolve(const ResolveInputs& in);
-    /// Stand-in for providers not ported yet: a linear scaled copy, no history.
-    bool ResolveCopy(const ResolveInputs& in);
     /// TAA (native resolution): the history ping-pong and the menu's sharpen (0..2).
     bool ResolveTaa(const ResolveInputs& in);
-    bool ResolveMetalFx(const ResolveInputs& in); ///< M5 Task 8: MetalFX temporal scaler
+    /// MetalFX's temporal scaler, encoded into the frame's command buffer; recreated (after
+    /// scheduler.Finish()) when a format or size changes. Then ExtraSharpen (sharpness > 1).
+    bool ResolveMetalFx(const ResolveInputs& in);
     bool ResolveFsr3(const ResolveInputs& in);    ///< M6: FSR 3.1; false until then
     /// Sharpness above 1 (the menu's 0..2) for providers whose own sharpening ends at 1: RCAS of
     /// a copy of `target` (id<MTLTexture>, `width` x `height`, ShaderWrite) back into it. `ldr`:
@@ -272,7 +276,8 @@ private:
 
     bool resources_ready = false; ///< the textures below match width/height/out size
     int resources_upscaler = -1;  ///< the provider they were made for
-    Metal::Object motion_image;   ///< render size RG16F
+    Metal::Object motion_image;   ///< RG16F, render size (BB_RENDER_RES: the colour's size)
+    u32 motion_width = 0, motion_height = 0;
     Metal::Object output_image;   ///< output size RGBA16F
     Metal::Object opaque_image;   ///< scene color before the blended draws
     Metal::Object reactive_image; ///< R8 reactive mask
@@ -280,6 +285,10 @@ private:
     Taa::Kernels taa;                         ///< built at construction
     std::array<Metal::Object, 2> taa_history; ///< output size RGBA32F (TAA only): RGB, depth
     u32 taa_next = 0;                         ///< the history written this frame
+    /// MetalFX (id<MTLFXTemporalScaler>) and what it was made for. Recorded commands use it by
+    /// pointer (the encoder keeps it alive once encoded); replaced only after scheduler.Finish().
+    Metal::Object metalfx_scaler;
+    BbMetalFx::Config metalfx_config{};
     /// ExtraSharpen: a copy of the target (RCAS reads neighbours) in its format, and the RGBA8Unorm
     /// views of the copy and of the UI image (LDR).
     Metal::Object extra_sharpen_image;
