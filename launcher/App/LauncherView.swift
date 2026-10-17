@@ -70,6 +70,8 @@ struct LauncherView: View {
                                                                set: { model.setEffect(effect.key, $0) }))
                         }
                         Toggle("Show FPS", isOn: $model.settings.showFPS)
+                        Toggle("Metal Performance HUD", isOn: $model.settings.metalHUD)
+                            .help("Apple's Metal HUD: FPS, GPU time and frame pacing, top right")
                         Toggle("Skip intro videos", isOn: Binding(get: { model.effect("skip_intro") },
                                                                   set: { model.setEffect("skip_intro", $0) }))
                     }

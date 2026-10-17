@@ -62,12 +62,12 @@ do {
     check(defaults.output == PixelSize(1920, 1080) && defaults.upscaler == .off && defaults.preset == 0, "default display")
     check(defaults.frameCap == .fps60 && !defaults.fullscreen && defaults.renderer == .vulkan, "default cap, window, renderer")
     check(defaults.effects["effect_dof"] == true && defaults.effects["effect_ssr"] == false && defaults.effects["skip_intro"] == false, "default effects")
-    check(defaults.sharpen && defaults.sharpness == 0.3 && !defaults.showFPS && defaults.shaderCompile == .balanced, "default extras")
+    check(defaults.sharpen && defaults.sharpness == 0.3 && !defaults.showFPS && !defaults.metalHUD && defaults.shaderCompile == .balanced, "default extras")
 
-    let read = GameSettings(ini: IniFile(text: "upscaler=metalfx\npreset=2\noutput_res=2560x1440\nfps_cap=40\nfullscreen=1\neffect_dof=0\nshow_fps=1\nrenderer=metal\nshader_compile=skip\nsharpness=0.75\n"))
+    let read = GameSettings(ini: IniFile(text: "upscaler=metalfx\npreset=2\noutput_res=2560x1440\nfps_cap=40\nfullscreen=1\neffect_dof=0\nshow_fps=1\nmetal_hud=1\nrenderer=metal\nshader_compile=skip\nsharpness=0.75\n"))
     check(read.upscaler == .metalfx && read.preset == 2 && read.output == PixelSize(2560, 1440), "read display")
     check(read.frameCap == .fps40 && read.fullscreen && read.renderer == .metal && read.shaderCompile == .skip, "read launcher keys")
-    check(read.effects["effect_dof"] == false && read.showFPS && read.sharpness == 0.75, "read effects")
+    check(read.effects["effect_dof"] == false && read.showFPS && read.metalHUD && read.sharpness == 0.75, "read effects")
     check(read.renderSize == PixelSize(1506, 848), "render size follows output and preset")
     check(GameSettings(ini: IniFile(text: "upscaler=taa\npreset=3\n")).renderSize == PixelSize(1920, 1080), "TAA renders native")
 
@@ -86,6 +86,7 @@ do {
     changed.apply(to: &file, includeRenderer: true)
     check(file["output_res"] == "3840x2160" && file["effect_ssr"] == "1" && file["jitter"] == "1", "apply writes and keeps")
     check(file["fps_cap"] == "40" && file["fullscreen"] == "1" && file["renderer"] == "metal" && file["sharpness"] == "0.75", "apply launcher keys")
+    check(file["metal_hud"] == "1", "apply writes the Metal HUD key")
     check(file.text.hasPrefix("# header\n"), "header kept")
     // Review focus 3: reloading after the game's menu changed the file picks up its values.
     file["preset"] = "3"
