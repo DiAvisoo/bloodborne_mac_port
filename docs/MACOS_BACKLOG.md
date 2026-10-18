@@ -355,12 +355,11 @@ Each item: what was done for now, what the refinement is, and where it lives.
   FINDINGS 2026-10-17 Task 10). Proper fix: capture with a smaller arena automatically, or a
   `MTLCaptureScope` that leaves the arena out if Apple's tool allows it.
 
-- **The game process grows ~80 MB/min during play (both renderers, 2026-10-18).** Cages walk at
-  a 60 cap: 2.5 -> 3.8 GB (Metal-native) and 2.5 -> 4.0 GB (0.4.0) in 15 minutes, linear; the GPU
-  process stays flat. Either the game's heap being touched for the first time in the shared
-  guest pool (bounded by the PS4 budget) or a leak in the runtime (game side). Check whether it
-  levels off (45-minute walk), then which regions grow (`vmmap --summary` of bb-probe; no
-  debugger on Rosetta processes).
+- ~~**The game process grows ~80 MB/min during play (both renderers, 2026-10-18).**~~ Fixed
+  2026-10-18: `runtime_low_free` filed freed blocks under the wrong size class (it read the class
+  after the free-list link overwrote it), so the small classes carved a new slab every few
+  allocations (~4.5 GB/h) and the 8 KiB class could hand out 64-byte blocks. Flat at 2.5 GB now.
+  The same fix for 0.4.x is on branch `fix/low-alloc-free-list` (not merged). FINDINGS 2026-10-18.
 
 ## 2. Performance
 

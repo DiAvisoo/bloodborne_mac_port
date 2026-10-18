@@ -1270,3 +1270,26 @@ the end of Task 10c (display at 120 Hz then, eager private arena), is now level 
 - **Full screen (`BB_FULLSCREEN=1`):** the window stayed 2992x1686 (windowed) for the whole run;
   the screen was locked, and macOS runs the full-screen Space transition asynchronously (likely
   not at all while locked). To check with the screen unlocked.
+
+### The game process grew ~4.5 GB an hour: low-allocator free lists (2026-10-18)
+
+Cages walk at a 60 cap, `top` physical footprint of the game process (bb-probe): 2.5 -> 6.2 GB
+over 45 minutes, linear (~75 MB/min), no plateau; 0.4.0 the same (2.5 -> 4.0 GB in 15 minutes).
+The GPU process stayed flat (6.3 GB). `BB_MEM_STATS=1` (new: every 60 s) placed all of it in the
+low range (`runtime_low_map`: +130 MB/min): host malloc 12 MB and the guest pool's resident pages
+(2.7-2.9 GB) were flat. Per size class, blocks carved / live / on the free list after 3 minutes:
+64 B 4,412,416 / 260 / 415 (rwlock holder records, ~24,000 allocations a second), 128 B and
+32 B likewise.
+
+Cause: `runtime_low_free` wrote the free-list link, which overlays the header's magic and size
+class, and then indexed the free lists with the size class it had just overwritten, i.e. the
+upper half of the old list head (8 for low-range pointers, 0 for an empty list). Freed blocks
+went to the 8 KiB (or 32 B) list; the small classes never saw them again and carved a new 64 KiB
+slab every few allocations, and an 8 KiB allocation could receive a 64-byte block (heap
+corruption around the guest's lock objects). Fixed by reading the class first. Also: blocks over
+64 KiB are unmapped when freed (they stayed mapped), and `runtime_low_map` starts over from the
+bottom once it reaches the top of the low range.
+
+After the fix: 2.48 -> 2.54 GB over 6 minutes (Metal-native), every class balanced (created =
+live + listed); 0.4.x with the same fix 2.48 -> 2.73 GB, flat after the third minute. The fix
+for 0.4.x is on branch `fix/low-alloc-free-list` (from origin/master, not merged).
