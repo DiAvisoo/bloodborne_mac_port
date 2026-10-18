@@ -42,11 +42,9 @@ Each item: what was done for now, what the refinement is, and where it lives.
   full-screen vertex shader does not write; they are logged at startup, so "nothing is logged"
   above was wrong); fixed (inputs read as zero), which adds atmospheric light behind those bars.
   Whether the figure is back needs a 0.4.0 window capture with the screen unlocked.
-- **Metal-native (M4): full-screen switch not checked while presenting.** A window resize
-  (1200x900 points via System Events) refits with black bars and no stall (2026-10-16). The
-  `BB_FULLSCREEN=1` start and the green-button switch were only tried with the screen locked
-  (no switch on 0.4.0 either then). Again 2026-10-18 (Task 11, screen locked): the window stayed
-  windowed for the whole run. Needs a run with the screen unlocked.
+- ~~**Metal-native (M4): full-screen switch not checked while presenting.**~~ Checked 2026-10-18
+  by the user on the 0.4.5 Metal app (ProMotion display): full screen works and the picture looks
+  right. Window resize refits with black bars and no stall (2026-10-16).
 - **Metal-native (M4): minimised/occluded window.** Fixed 2026-10-16: a minimised, hidden or
   fully occluded macOS window keeps its pixel size, so the 0x0 skip never fired and
   `nextDrawable` could block ~1 s per frame. `WindowSDL` now tracks SDL's MINIMIZED/HIDDEN/
