@@ -476,13 +476,21 @@ Each item: what was done for now, what the refinement is, and where it lives.
   61–63, 4K Performance ~52, 1440p 49, 4K Quality 43 (FINDINGS). Two levers: (a) the draw
   recording thread (MoltenVK encoding in `vkQueueSubmit` ~43%, render pass begins ~12%) caps
   1080p-class scenes at ~62–67 FPS; (b) GPU time at 1440p (~17.5 ms; 60 needs ≤ ~15 ms).
-- **Render-pass count is a GPU cost after all (measured 2026-10-13, FINDINGS "Frame timeline").**
+- **Render-pass count is a GPU cost after all (measured 2026-10-13, FINDINGS "Frame timeline").
+  Planned for 0.5.3 (user, 2026-10-18).**
   At 1080p native the GPU timeline, not the CPU, sets the frame rate; ~408 Metal encoders per
   frame (190 render passes) cost ~13–16 µs of GPU time per render pass and leave the GPU idle
   ~3.8 ms/frame. *Refinement, in order:* (1) merge passes split by uploads/copies (~38/frame) and
   hoist the remaining copies; (2) put consecutive dispatches in one compute encoder; (3) the 47
   tessellated draws per frame each split a pass (MoltenVK's emulation): batch them or emulate
   tessellation ourselves; (4) attachment-less vertex-only passes (~20/frame) folded together.
+  *0.5.3 plan (2026-10-18):* the counts above are from MoltenVK; first re-measure encoders and
+  render passes per frame on the native Metal renderer (Metal System Trace, 1080p and 1440p
+  native) and list which splits are avoidable (a pass reading what the previous one wrote must
+  stay split). Expected: ~1.5–3 ms GPU per frame, ~10–20% FPS where GPU-bound (1440p native
+  Hunter's Dream 82 → ~93–103; Upper Cathedral Ward 65 → ~72–80), plus fewer tile store/load
+  round trips (grows with resolution); at a 60 cap the same FPS for less GPU energy. Plain Metal,
+  any macOS we support (15+); not Metal 4 (that needs macOS 26: a separate decision after this).
 - **Shader compilation (done 2026-10-13: background pipeline creation, `shader_compile=wait|skip`;
   `balanced`, the default since 2026-10-13 evening, waits up to `BB_COMPILE_BUDGET_MS` (6) per
   frame and then skips).** A true ahead-of-time precompile is not possible: a pipeline's
