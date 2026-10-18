@@ -32,7 +32,8 @@ Each item: what was done for now, what the refinement is, and where it lives.
   bind.** Fixed 2026-10-16 (M5 Task 3): `BoundDepthAttachment` (vk_depth_attachment.h) is the one
   rule for the pass's depth attachment and the pipeline key's formats; `MTL_DEBUG_LAYER=1` title +
   city run 96,721 messages → 0. Pipeline key version 8: one cache rebuild.
-- **Metal-native (M4 → M5): the figure in the cage at the Central Yharnam lamp is missing.**
+- ~~**Metal-native (M4 → M5): the figure in the cage at the Central Yharnam lamp is missing.**~~
+  Fixed 2026-10-18: the user sees the figure back at the lamp on the 0.4.5 Metal app.
   0.4.0 draws a creature behind the bars of the cage left of the lamp post (`cages-20261016`
   save, +40/+50 s after Cross); the Metal-native renderer shows the cage empty in both captures
   (scratchpad `t4-m-cages-*.png` vs `t4-w-cages-*.png`, 2026-10-16). Nothing is logged (no skipped
