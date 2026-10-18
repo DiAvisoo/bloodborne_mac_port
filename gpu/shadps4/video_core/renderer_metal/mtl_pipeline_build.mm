@@ -12,6 +12,7 @@
 #include "video_core/renderer_metal/mtl_geometry.h"
 #include "video_core/renderer_metal/mtl_pipeline_build.h"
 #include "video_core/renderer_metal/mtl_spirv_geometry.h"
+#include "video_core/renderer_metal/mtl_spirv_inputs.h"
 #include "video_core/renderer_metal/mtl_spirv_rectlist.h"
 
 namespace Metal {
@@ -82,6 +83,58 @@ const CompiledShader* PipelineFactory::Variant(const ShaderModule& module,
     return made.second.get();
 }
 
+const CompiledShader* PipelineFactory::FragmentFor(const ShaderModule& fs_module,
+                                                   const ShaderModule& vs_module,
+                                                   std::string& error) {
+    const CompiledShader* fs = Plain(fs_module, "fragment");
+    if (!fs) {
+        error = "the fragment shader did not compile";
+        return nullptr;
+    }
+    const std::optional<u64> written = OutputLocations(vs_module.spirv);
+    if (!written) {
+        return fs; // outputs of unknown locations: assume they match
+    }
+    u64 unwritten = 0;
+    for (const StageInput& input : fs->stage_inputs) {
+        if (input.location < 64 && !(*written & (u64(1) << input.location))) {
+            unwritten |= u64(1) << input.location;
+        }
+    }
+    if (unwritten == 0) {
+        return fs;
+    }
+    std::scoped_lock lock{fs_module.variant_mutex};
+    for (const auto& [mask, shader] : fs_module.zeroed) {
+        if (mask == unwritten) {
+            if (!shader) {
+                error = "the fragment shader with its unwritten inputs zeroed did not compile";
+            }
+            return shader.get();
+        }
+    }
+    // A failed rewrite or compile is remembered (null) like a compiled one.
+    auto& made = fs_module.zeroed.emplace_back(unwritten, nullptr);
+    const auto rewrite = ZeroUnwrittenInputs(fs_module.spirv, unwritten);
+    if (!rewrite.ok) {
+        LOG_WARNING(Render, "Fragment shader {:#x}: inputs {:#x} not written by vertex shader "
+                    "{:#x} and not rewritable: {}", fs_module.hash, unwritten, vs_module.hash,
+                    rewrite.error);
+    } else {
+        auto result = compiler.Compile(rewrite.spirv, fs_module.hash ^ (unwritten * 0x9E3779B97F4A7C15ull),
+                                       "fragment (unwritten inputs zeroed)");
+        if (result.status == CompileStatus::Ok) {
+            made.second = std::move(result.shader);
+            LOG_INFO(Render, "Fragment shader {:#x}: inputs {:#x} not written by vertex shader "
+                     "{:#x} read as zero", fs_module.hash, unwritten, vs_module.hash);
+        }
+    }
+    if (!made.second) {
+        error = "the fragment shader with its unwritten inputs zeroed did not compile";
+    }
+    return made.second.get();
+}
+
 GraphicsPsos PipelineFactory::BuildGraphics(const Vulkan::GraphicsPipelineKey& key,
                                             Modules modules,
                                             std::span<const VertexAttribute> attributes,
@@ -115,11 +168,8 @@ GraphicsPsos PipelineFactory::BuildGraphics(const Vulkan::GraphicsPipelineKey& k
             }
             if (ok) {
                 if (const ShaderModule* fs_module = ModuleOf(modules, Stage::Fragment)) {
-                    fs = Plain(*fs_module, "fragment");
+                    fs = FragmentFor(*fs_module, *vs_module, result.error);
                     ok = fs != nullptr;
-                    if (!ok) {
-                        result.error = "the fragment shader did not compile";
-                    }
                 }
             }
             if (ok) {

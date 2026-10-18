@@ -140,6 +140,8 @@ foreach(BPP IN ITEMS 8 16 32 64 96 128)
 endforeach()
 # Test kernels (host-kernel-test).
 add_host_shader(${CMAKE_CURRENT_SOURCE_DIR}/../tests/shaders/host_kernel_sampler.comp host_kernel_sampler_comp)
+add_host_shader(${CMAKE_CURRENT_SOURCE_DIR}/../tests/shaders/unwritten_inputs.vert unwritten_inputs_vert)
+add_host_shader(${CMAKE_CURRENT_SOURCE_DIR}/../tests/shaders/unwritten_inputs.frag unwritten_inputs_frag)
 add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
 
 file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
@@ -352,6 +354,19 @@ target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 target_link_options(camera-motion-test PRIVATE -Wl,-export_dynamic)
 add_dependencies(camera-motion-test host_shaders)
+
+if (APPLE)
+    # Fragment inputs the vertex stage does not write: zeroed so that Metal builds the pipeline.
+    add_executable(spirv-inputs-test EXCLUDE_FROM_ALL ../tests/test_spirv_inputs.mm
+        shadps4/video_core/renderer_metal/mtl_spirv_inputs.cpp)
+    target_include_directories(spirv-inputs-test PRIVATE shim shadps4 ${SHADER_INCLUDE})
+    target_compile_features(spirv-inputs-test PRIVATE cxx_std_20)
+    target_compile_options(spirv-inputs-test PRIVATE -UNDEBUG)
+    set_source_files_properties(../tests/test_spirv_inputs.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(spirv-inputs-test PRIVATE fmt::fmt spirv-cross-msl spirv-cross-glsl
+        spirv-cross-core "-framework Metal" "-framework Foundation")
+    add_dependencies(spirv-inputs-test host_shaders)
+endif()
 
 # The depth attachment rule shared by the render pass and the pipeline key (header only).
 add_executable(depth-attachment-test EXCLUDE_FROM_ALL ../tests/test_depth_attachment.cpp)

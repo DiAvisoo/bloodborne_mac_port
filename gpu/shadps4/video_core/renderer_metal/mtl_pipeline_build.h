@@ -59,6 +59,9 @@ private:
     mutable std::unique_ptr<CompiledShader> rect;
     mutable std::mutex variant_mutex; ///< tessellation and geometry variants (CompileVariant)
     mutable std::vector<std::pair<CompileVariant, std::unique_ptr<CompiledShader>>> variants;
+    /// Fragment shaders: the module with the inputs of a location mask zeroed (inputs the
+    /// vertex stage does not write; mtl_spirv_inputs.h), under variant_mutex.
+    mutable std::vector<std::pair<u64, std::unique_ptr<CompiledShader>>> zeroed;
 };
 
 /// What a graphics pipeline got: exactly one of the three kinds, or nothing with `error` set.
@@ -107,6 +110,10 @@ private:
     const CompiledShader* Plain(const ShaderModule& module, const char* what);
     const CompiledShader* RectVertex(const ShaderModule& module, std::string& error);
     const CompiledShader* Variant(const ShaderModule& module, const CompileVariant& variant);
+    /// The fragment shader for a vertex stage that writes the locations in `written`: the plain
+    /// one when it reads no other input, else a compile with the others zeroed.
+    const CompiledShader* FragmentFor(const ShaderModule& fs_module, const ShaderModule& vs_module,
+                                      std::string& error);
     using StageModules = std::span<const ShaderModule* const, Vulkan::MaxShaderStages>;
     GraphicsPsos TessellationPsos(const Vulkan::GraphicsPipelineKey& key, StageModules modules,
                                   std::span<const VertexAttribute> attributes);

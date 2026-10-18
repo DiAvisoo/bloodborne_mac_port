@@ -201,6 +201,9 @@ if [[ ${1:-} == --test ]]; then
         ninja -C out/gpu-arm64 taa-shader-test >/dev/null
         out/gpu-arm64/taa-shader-test 2>&1 | grep -E 'PASS|FAIL|Assertion|regression' || { echo 'FAIL: taa-shader-test'; exit 1; }
         MTL_DEBUG_LAYER=1 out/gpu-arm64/taa-shader-test 2>&1 | grep -E 'PASS|FAIL|Assertion|regression' || { echo 'FAIL: taa-shader-test (validation)'; exit 1; }
+        # Metal-native M5: fragment inputs the vertex stage does not write read as zero.
+        ninja -C out/gpu-arm64 spirv-inputs-test >/dev/null
+        out/gpu-arm64/spirv-inputs-test 2>&1 | grep -E 'PASS|FAIL|Assertion' || { echo 'FAIL: spirv-inputs-test'; exit 1; }
         # Metal-native M5: the pipeline key's depth/stencil formats follow the pass's attachment.
         ninja -C out/gpu-arm64 depth-attachment-test >/dev/null
         out/gpu-arm64/depth-attachment-test || { echo 'FAIL: depth-attachment-test'; exit 1; }
