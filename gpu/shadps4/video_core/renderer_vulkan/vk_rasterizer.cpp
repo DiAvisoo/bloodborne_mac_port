@@ -1037,10 +1037,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
 
     SetDrawEncoders(*pipeline);
     PrepareRenderState(pipeline);
-    if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
+    // bbport: one color target, or none with a depth target (Scaleform's stencil masks).
+    if (const u32 mrt_mask = pipeline->GetGraphicsKey().mrt_mask;
+        upscaler->Enabled() && (std::popcount(mrt_mask) == 1 || (mrt_mask == 0 && db_desc.first))) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
-                         cb_descs[0].first, db_desc.first,
+                         mrt_mask ? cb_descs[0].first : VideoCore::ImageId{}, db_desc.first,
                          UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
     }
     const PreparedDraw* draw_prepared = bind_prepared;
@@ -1258,10 +1260,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     // (The count clamp and the indirect geometry kernels read the records in compute encoders.)
     SetDrawEncoders(*pipeline, true);
     PrepareRenderState(pipeline);
-    if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
+    if (const u32 mrt_mask = pipeline->GetGraphicsKey().mrt_mask;
+        upscaler->Enabled() && (std::popcount(mrt_mask) == 1 || (mrt_mask == 0 && db_desc.first))) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
-                         cb_descs[0].first, db_desc.first,
+                         mrt_mask ? cb_descs[0].first : VideoCore::ImageId{}, db_desc.first,
                          UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
     }
     if (!BindResources(pipeline)) {

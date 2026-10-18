@@ -907,6 +907,20 @@ void TemporalUpscaler::OnColorTarget(VideoCore::ImageId color) {
 void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
                               VideoCore::ImageId depth, bool native_viewport) {
     if (!Scaled() && vs_hash == ui_trigger_vs) done_this_frame = true;
+    if (Scaled() && ui_phase && !color && depth && depth != ui_depth &&
+        (vs_hash == ui_trigger_vs || UiComposition::MovieShader(vs_hash))) {
+        // bbport: a Scaleform stencil mask drawn with depth only (no color target), before any
+        // UI draw bound this depth buffer. Without this the mask went into the guest buffer,
+        // the first masked draw (the HUD's quick-item icon) then had the host depth prepared
+        // with a cleared stencil, and failed its stencil test: a black item slot at 1440p/4K.
+        const auto& image = texture_cache.GetImage(depth);
+        if (RenderTarget(image.info.size.width, image.info.size.height)) {
+            EnsureUiResources(ui_width, ui_height, ui_format, image.info.pixel_format);
+            PrepareUiDepth(depth);
+            ui_depth = depth;
+        }
+        return;
+    }
     if (!Scaled() || !color) {
         return;
     }
