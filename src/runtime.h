@@ -88,6 +88,7 @@ void runtime_thread_keys_cleanup(void);
 /* Guest-visible errno values are FreeBSD's. */
 int32_t runtime_guest_errno(int host_errno);
 int runtime_memory_reserve_space(void);
+void runtime_memory_start_stats(void); /* BB_MEM_STATS=1 */
 void *runtime_low_map(size_t size, int prot);
 void *runtime_low_alloc(size_t size);
 /* runtime_hooks.c: one lock around the engine paths that share the immediate GX context. */

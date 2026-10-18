@@ -671,12 +671,17 @@ void *runtime_low_map(size_t size, int prot) {
      * next free range above it, where the search resumes. Stops below the hole at
      * 0xfc0000000 (see USER_MIN). */
     void *p=MAP_FAILED;
-    while (low_next+size<=UINT64_C(0x0fc0000000)) {
-        p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANON,-1,0);
-        if (p==(void *)low_next) { low_next+=size+PAGE; break; } /* unmapped gap catches overruns */
-        if (p!=MAP_FAILED) munmap(p,size);
-        low_next = p!=MAP_FAILED && (uintptr_t)p>low_next ? align_up((uintptr_t)p,PAGE) : low_next+size+PAGE;
-        p=MAP_FAILED;
+    /* At the top, start over from the bottom once: runtime_low_free unmaps large blocks, and
+     * their ranges are found again from there. */
+    for (int pass=0; pass<2 && p==MAP_FAILED; ++pass) {
+        if (pass) low_next=LOW_MIN;
+        while (low_next+size<=UINT64_C(0x0fc0000000)) {
+            p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANON,-1,0);
+            if (p==(void *)low_next) { low_next+=size+PAGE; break; } /* unmapped gap catches overruns */
+            if (p!=MAP_FAILED) munmap(p,size);
+            low_next = p!=MAP_FAILED && (uintptr_t)p>low_next ? align_up((uintptr_t)p,PAGE) : low_next+size+PAGE;
+            p=MAP_FAILED;
+        }
     }
     write_unlock();
     CHECK_LOW_ADDR(p);
@@ -707,6 +712,10 @@ typedef struct LowFreeNode {
 static const size_t low_classes[] = { 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
 #define NUM_LOW_CLASSES (sizeof(low_classes)/sizeof(low_classes[0]))
 static LowFreeNode *low_freelists[NUM_LOW_CLASSES];
+/* BB_MEM_STATS: live blocks per size class (allocations minus frees) and large blocks. */
+static _Atomic int64_t low_live[NUM_LOW_CLASSES + 1];
+static _Atomic int64_t low_large_bytes;
+static int64_t low_created[NUM_LOW_CLASSES]; /* blocks carved from slabs, under low_alloc_lock */
 static HostMutex low_alloc_lock = HOST_MUTEX_INIT;
 
 void *runtime_low_alloc(size_t size) {
@@ -744,9 +753,11 @@ void *runtime_low_alloc(size_t size) {
                 head = n;
             }
             low_freelists[sc] = head;
+            low_created[sc] += (int64_t)count;
             host_mutex_unlock(&low_alloc_lock);
         }
         LowHeader *hdr = (LowHeader *)node;
+        ++low_live[sc];
         hdr->magic = 0x4C4F5741;
         hdr->size_class = (uint32_t)sc;
         hdr->total_size = low_classes[sc];
@@ -761,6 +772,8 @@ void *runtime_low_alloc(size_t size) {
         hdr->magic = 0x4C4F5741;
         hdr->size_class = 0xFFFFFFFF;
         hdr->total_size = map_size;
+        ++low_live[NUM_LOW_CLASSES];
+        low_large_bytes += (int64_t)map_size;
         void *ret = (void *)(hdr + 1);
         CHECK_LOW_ADDR(ret);
         return ret;
@@ -780,12 +793,24 @@ void runtime_low_free(void *ptr) {
     if (!ptr) return;
     LowHeader *hdr = (LowHeader *)ptr - 1;
     if (hdr->magic != 0x4C4F5741) return;
-    if (hdr->size_class < NUM_LOW_CLASSES) {
+    const uint32_t sc = hdr->size_class;
+    if (sc < NUM_LOW_CLASSES) {
+        --low_live[sc];
         host_mutex_lock(&low_alloc_lock);
+        /* The link overlays the header's magic and size class: read the class first (it was
+         * read after the store, which filed every freed block under the class named by the
+         * upper half of the old list head: the small classes leaked a slab every few
+         * allocations (~4.5 GB/h of play) and the 8 KiB class handed out 64-byte blocks). */
         LowFreeNode *node = (LowFreeNode *)hdr;
-        node->next = low_freelists[hdr->size_class];
-        low_freelists[hdr->size_class] = node;
+        node->next = low_freelists[sc];
+        low_freelists[sc] = node;
         host_mutex_unlock(&low_alloc_lock);
+    } else if (sc == 0xFFFFFFFF) {
+        /* A block of its own (over 64 KiB): give it back (it used to stay mapped for good). */
+        hdr->magic = 0;
+        --low_live[NUM_LOW_CLASSES];
+        low_large_bytes -= (int64_t)hdr->total_size;
+        munmap(hdr, hdr->total_size);
     }
 }
 
@@ -1053,3 +1078,61 @@ void runtime_memory_report(void) {
     printf("Runtime: flexible maps=%zu, in use=%" PRIu64 ", protects=%zu, queries=%zu, regions=%zu\n",
            flexible_maps, flexible_bytes, protects, queries, vma_count);
 }
+
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#include <pthread.h>
+/* BB_MEM_STATS=1: every 60 s, where the game process's memory is (diagnostics for its growth
+ * during play): the physical footprint, the host malloc zones in use, the resident pages of the
+ * guest pool's backing view (direct + flexible), the low range used by runtime_low_map, and the
+ * direct memory the game holds. */
+static uint64_t resident_bytes(const unsigned char *base, uint64_t size) {
+    static unsigned char vec[(UINT64_C(64) << 20) / 4096];
+    const uint64_t page = (uint64_t)getpagesize(), chunk = UINT64_C(64) << 20;
+    uint64_t resident = 0;
+    for (uint64_t off = 0; off < size; off += chunk) {
+        const size_t n = (size_t)(size - off < chunk ? size - off : chunk);
+        if (mincore(base + off, n, (char *)vec)) continue;
+        for (size_t i = 0; i * page < n; ++i) resident += (vec[i] & 1) ? page : 0;
+    }
+    return resident;
+}
+static void *mem_stats_thread(void *unused) {
+    (void)unused;
+    for (;;) {
+        sleep(60);
+        task_vm_info_data_t vm; mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+        const uint64_t footprint = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count)
+                                       == KERN_SUCCESS ? vm.phys_footprint : 0;
+        malloc_statistics_t ms = {0};
+        malloc_zone_statistics(NULL, &ms);
+        const uint64_t pool_resident = backing_base ? resident_bytes(backing_base, POOL_SIZE + FLEX_SPAN) : 0;
+        printf("Game memory: footprint %" PRIu64 " MB; malloc in use %" PRIu64 " MB; guest pool "
+               "resident %" PRIu64 " MB; low range %" PRIu64 " MB; direct live %" PRIu64 " MB, "
+               "flexible %" PRIu64 " MB\n",
+               footprint >> 20, (uint64_t)ms.size_in_use >> 20, pool_resident >> 20,
+               (uint64_t)(low_next - LOW_MIN) >> 20, live_bytes >> 20, flexible_bytes >> 20);
+        printf("Game memory: low blocks per class created/live/free-listed (large: %lld live, %lld MB):",
+               (long long)low_live[NUM_LOW_CLASSES], (long long)(low_large_bytes >> 20));
+        host_mutex_lock(&low_alloc_lock);
+        for (size_t i = 0; i < NUM_LOW_CLASSES; ++i) {
+            int64_t listed = 0;
+            for (LowFreeNode *n = low_freelists[i]; n && listed < 100000000; n = n->next) ++listed;
+            if (low_created[i]) printf(" %zu:%lld/%lld/%lld", low_classes[i], (long long)low_created[i],
+                                       (long long)low_live[i], (long long)listed);
+        }
+        host_mutex_unlock(&low_alloc_lock);
+        printf("\n");
+        fflush(stdout);
+    }
+    return NULL;
+}
+void runtime_memory_start_stats(void) {
+    const char *env = getenv("BB_MEM_STATS");
+    if (!env || env[0] != '1') return;
+    pthread_t thread;
+    if (!pthread_create(&thread, NULL, mem_stats_thread, NULL)) pthread_detach(thread);
+}
+#else
+void runtime_memory_start_stats(void) {}
+#endif
