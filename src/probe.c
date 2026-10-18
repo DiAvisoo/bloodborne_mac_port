@@ -582,6 +582,7 @@ int main(int argc, char **argv) {
     /* The native arm64 GPU process renders (BB_GPU_PROCESS=0: single process). */
     gpu_process_start();
 #endif
+    runtime_memory_start_stats();
     time_t t_now = time(NULL);
     struct tm tm_buf;
     localtime_r(&t_now, &tm_buf);

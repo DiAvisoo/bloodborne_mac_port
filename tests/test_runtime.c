@@ -11,6 +11,8 @@ void runtime_restart(void) { abort(); }
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #ifdef __APPLE__
 /* macOS has no pthread barriers: a minimal one (generation counter) for these tests. */
@@ -362,6 +364,32 @@ static void save_dir(void) {
     assert(strlen(dir)>=9 && !strcmp(dir+strlen(dir)-9,"/savedata"));
     unsetenv("BB_SAVE_DIR");
 }
+/* runtime_low_alloc: a freed block goes back to its own size class (it went to the class named
+ * by the upper half of the old list head: small classes leaked, the 8 KiB class handed out
+ * 64-byte blocks); a block over 64 KiB is unmapped when freed. */
+static void low_allocator(void) {
+    unsigned char *big=runtime_low_alloc(1u<<20);
+    assert(big && (uintptr_t)big<UINT64_C(0x0fc0000000));
+    memset(big,0xAB,1u<<20);
+    unsigned char *page=(unsigned char *)((uintptr_t)big & ~(uintptr_t)(getpagesize()-1));
+    char vec[1];
+    assert(mincore(page,(size_t)getpagesize(),vec)==0 && (vec[0]&1)); /* written: resident */
+    runtime_low_free(big);
+    vec[0]=0;
+    assert(mincore(page,(size_t)getpagesize(),vec)!=0 || !(vec[0]&1)); /* unmapped: not resident */
+    void *small=runtime_low_alloc(100);
+    assert(small && (uintptr_t)small<UINT64_C(0x0fc0000000));
+    runtime_low_free(small);
+    assert(runtime_low_alloc(100)==small); /* back in its own class (LIFO) */
+    void *tiny=runtime_low_alloc(40);
+    runtime_low_free(tiny);
+    void *page_sized=runtime_low_alloc(5000); /* the 8 KiB class */
+    assert(page_sized!=tiny);
+    memset(page_sized,0xCD,5000);
+    assert(runtime_low_alloc(40)==tiny);
+    runtime_low_free(page_sized); runtime_low_free(tiny); runtime_low_free(small);
+}
+
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#q#q",0)==0);
     runtime_start(1);
@@ -388,7 +416,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
     libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
-    rw_lifecycle(); rw_concurrency(); rw_timeouts(); save_dir();
-    puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope, save folder");
+    low_allocator(); rw_lifecycle(); rw_concurrency(); rw_timeouts(); save_dir();
+    puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, low allocator, resolver scope, save folder");
     return 0;
 }
