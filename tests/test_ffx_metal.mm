@@ -375,6 +375,40 @@ void TestRegisterNull(Metal::Device& device) {
            "registered description comes from the texture");
     Expect(iface.fpGetResource(&iface, registered).resource == texture.Get(),
            "registered texture is the caller's");
+    // The dispatch pattern: jobs using the registered texture's views are encoded, the resources
+    // are unregistered (freeing the views) and only then the command buffer is submitted.
+    {
+        FfxResourceInternal target{};
+        const FfxCreateResourceDescription desc_t = Describe(
+            FFX_SURFACE_FORMAT_R16G16_FLOAT, 16, 8, 2, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED});
+        Expect(iface.fpCreateResource(&iface, &desc_t, backend.context, &target) == FFX_OK,
+               "create copy target");
+        Metal::Encoder encoder(device);
+        Expect(FfxMetal::StorageView(iface, registered, 1) != nullptr, "view of the registered mip");
+        FfxGpuJobDescription clear{};
+        clear.jobType = FFX_GPU_JOB_CLEAR_FLOAT;
+        clear.clearJobDescriptor = {{0.25f, 0.5f, 0.0f, 0.0f}, registered};
+        FfxGpuJobDescription copy{};
+        copy.jobType = FFX_GPU_JOB_COPY;
+        copy.copyJobDescriptor.src = registered;
+        copy.copyJobDescriptor.dst = target;
+        iface.fpScheduleGpuJob(&iface, &clear);
+        iface.fpScheduleGpuJob(&iface, &copy);
+        Expect(iface.fpExecuteGpuJobs(&iface, FfxMetal::CommandList(encoder), backend.context) ==
+                   FFX_OK,
+               "execute on registered");
+        Expect(iface.fpUnregisterResources(&iface, FfxMetal::CommandList(encoder),
+                                           backend.context) == FFX_OK,
+               "unregister before submit");
+        device.Wait(encoder.Submit());
+        const std::vector<float> out =
+            ReadRg16f(device, iface.fpGetResource(&iface, target).resource, 1, 8, 4);
+        Expect(out[0] == 0.25f && out[1] == 0.5f, "copy of the registered texture survived");
+        iface.fpDestroyResource(&iface, target, backend.context);
+        // re-register for the check below
+        Expect(iface.fpRegisterResource(&iface, &described, backend.context, &registered) == FFX_OK,
+               "register again");
+    }
     {
         Metal::Encoder encoder(device);
         Expect(iface.fpUnregisterResources(&iface, FfxMetal::CommandList(encoder),

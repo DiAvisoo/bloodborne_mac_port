@@ -103,8 +103,21 @@ Slot* Find(State& state, FfxResourceInternal resource) {
     return slot.used ? &slot : nullptr;
 }
 
-void FreeSlot(State& state, uint32_t index) {
+// The encoder's command buffers do not retain what they use (unretained references): with
+// `encoder`, the slot's views and texture live until its command buffer completes. Without
+// (fpDestroyResource, fpDestroyBackendContext), the caller guarantees an idle GPU.
+void FreeSlot(State& state, uint32_t index, Metal::Encoder* encoder = nullptr) {
     Slot& slot = state.resources[index];
+    if (encoder) {
+        for (Metal::Object& view : slot.mip_views) {
+            if (view) {
+                encoder->KeepAlive(std::move(view));
+            }
+        }
+        if (slot.texture) {
+            encoder->KeepAlive(std::move(slot.texture));
+        }
+    }
     if (slot.texture) {
         live_texture_bytes.fetch_sub(slot.bytes, std::memory_order_relaxed);
     }
@@ -230,15 +243,17 @@ FfxErrorCode RegisterResource(FfxInterface* iface, const FfxResource* in, FfxUIn
     return FFX_OK;
 }
 
-FfxErrorCode UnregisterResources(FfxInterface* iface, FfxCommandList, FfxUInt32 context) {
+FfxErrorCode UnregisterResources(FfxInterface* iface, FfxCommandList command_list,
+                                 FfxUInt32 context) {
     if (!iface) {
         return FFX_ERROR_INVALID_POINTER;
     }
     State& state = StateOf(Backend(iface));
+    auto* encoder = reinterpret_cast<Metal::Encoder*>(command_list);
     for (uint32_t i = 1; i < state.resources.size(); ++i) {
         if (state.resources[i].used && state.resources[i].dynamic &&
             state.resources[i].context == context) {
-            FreeSlot(state, i);
+            FreeSlot(state, i, encoder);
         }
     }
     return FFX_OK;
