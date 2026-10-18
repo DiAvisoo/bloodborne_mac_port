@@ -137,6 +137,21 @@ FfxErrorCode GetInterface(FfxInterface* out, Metal::Device& device, void* scratc
     return FFX_OK;
 }
 
+void ReleaseInterface(FfxInterface* iface) {
+    if (!iface || !iface->scratchBuffer) {
+        return;
+    }
+    BackendContext& backend = Backend(iface);
+    for (uint32_t i = 0; i < backend.max_contexts; ++i) {
+        if (backend.contexts[i].active) {
+            DestroyBackendContext(iface, i);
+        }
+    }
+    // No live context but state made by a read (StateOf): the containers go too.
+    delete backend.state;
+    backend.state = nullptr;
+}
+
 FfxCommandList CommandList(Metal::Encoder& encoder) {
     return reinterpret_cast<FfxCommandList>(&encoder);
 }

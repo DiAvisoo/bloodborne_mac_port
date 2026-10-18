@@ -28,7 +28,10 @@ struct FSRConstants {
 namespace Vulkan::HostPasses {
 
 FsrPass::FsrPass(Metal::Device& device_, u32 num_images)
-    : device{device_}, easu{Metal::BuildHostKernel(device_, FSR_EASU_COMP, {}, "fsr.comp [EASU]")},
+    : device{device_}, easu{[&] {
+          ASSERT(num_images > 0); // before anything is built or allocated
+          return Metal::BuildHostKernel(device_, FSR_EASU_COMP, {}, "fsr.comp [EASU]");
+      }()},
       rcas{Metal::BuildHostKernel(device_, FSR_RCAS_COMP, {}, "fsr.comp [RCAS]")},
       images(num_images) {
     // Linear, clamp to edge, no mips.
@@ -43,7 +46,6 @@ FsrPass::FsrPass(Metal::Device& device_, u32 num_images)
                     .max_lod = 1000.0f,
                 });
     ASSERT_MSG(sampler, "FSR: no sampler");
-    ASSERT(num_images > 0);
 }
 
 FsrPass::~FsrPass() = default;

@@ -28,6 +28,11 @@ size_t ScratchSize(uint32_t max_contexts);
 FfxErrorCode GetInterface(FfxInterface* out, Metal::Device& device, void* scratch,
                           size_t scratch_size, uint32_t max_contexts);
 
+/// Releases every effect context still live on `iface` (GetInterface's) with its textures: what
+/// an effect's failed context creation leaves behind (AMD's create returns without cleanup). The
+/// GPU must be idle for those textures, as for fpDestroyBackendContext.
+void ReleaseInterface(FfxInterface* iface);
+
 /// The command list FFX dispatches record into: `encoder`, which must outlive the dispatch.
 FfxCommandList CommandList(Metal::Encoder& encoder);
 

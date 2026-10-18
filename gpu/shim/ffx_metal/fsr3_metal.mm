@@ -21,6 +21,8 @@ namespace {
 // The shared resources, in FfxFsr3UpscalerSharedResourceDescriptions order.
 enum SharedIndex : u32 { kDilatedDepth, kDilatedMotion, kPrevNearestDepth, kSharedCount };
 
+Fsr3Metal::InterfaceHook interface_hook = nullptr;
+
 } // namespace
 
 struct Fsr3Metal::Impl {
@@ -62,9 +64,15 @@ bool Fsr3Metal::Create(Metal::Device& device, const CreateInfo& info, std::strin
         code != FFX_OK) {
         return fail("FfxMetal::GetInterface failed (" + std::to_string(code) + ")");
     }
+    if (interface_hook) {
+        interface_hook(&description.backendInterface);
+    }
     const u64 before = LiveTextureBytes();
     if (const FfxErrorCode code = ffxFsr3UpscalerContextCreate(&state->context, &description);
         code != FFX_OK) {
+        // AMD's create returns without cleanup: its back-end context and the textures made
+        // before the failing step (pipelines come last) are still in the scratch memory.
+        ReleaseInterface(&description.backendInterface);
         char text[96];
         std::snprintf(text, sizeof(text), "ffxFsr3UpscalerContextCreate failed (0x%x)",
                       unsigned(code));
@@ -171,6 +179,10 @@ bool Fsr3Metal::Matches(const CreateInfo& info) const {
 
 u64 Fsr3Metal::MemoryBytes() const {
     return impl ? impl->bytes : 0;
+}
+
+void Fsr3Metal::SetInterfaceHookForTests(InterfaceHook hook) {
+    interface_hook = hook;
 }
 
 } // namespace FfxMetal

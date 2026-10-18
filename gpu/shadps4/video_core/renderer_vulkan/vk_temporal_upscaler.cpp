@@ -348,6 +348,8 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
     // preset change): wait for them before they are released.
     scheduler.Finish();
     resources_ready = false;
+    // A failure recorded for the previous context is not this one's.
+    fsr3_dispatch_failed.store(false);
     width = w;
     height = h;
     out_width = ow;
@@ -361,6 +363,18 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
                                  "Upscaler motion");
     output_image = CreateTexture(device, vk::Format::eR16G16B16A16Sfloat, ow, oh, true, true,
                                  false, "Upscaler output");
+    // Black until a provider writes it: a dispatch that fails on the recording thread (FSR 3.1)
+    // shows black for that frame, not uninitialised memory.
+    scheduler.EndRendering();
+    scheduler.Record([output = output_image.Get()](Metal::Encoder& e) {
+        Metal::RenderPassDesc pass;
+        pass.colors[0].texture = output;
+        pass.colors[0].clear = true;
+        pass.colors[0].clear_color = {0.0, 0.0, 0.0, 1.0};
+        e.BeginRenderPass(pass);
+        e.EndRenderPass();
+    });
+    scheduler.GetDynamicState().Invalidate();
     // Opaque: also TAA's diagnostic output (BB_TAA_DIAGNOSTICS; TAA runs at render = output
     // size), which the kernel binds as a storage texture every frame.
     opaque_image = CreateTexture(device, vk::Format::eR16G16B16A16Sfloat, w, h, false, true,

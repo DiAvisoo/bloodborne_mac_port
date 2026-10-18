@@ -12,6 +12,8 @@
 
 #include "common/types.h"
 
+struct FfxInterface;
+
 namespace Metal {
 class Device;
 class Encoder;
@@ -66,6 +68,11 @@ public:
     [[nodiscard]] bool Matches(const CreateInfo& info) const;
     /// Bytes of the textures this context holds (FSR's own and the shared ones); 0 when none.
     [[nodiscard]] u64 MemoryBytes() const;
+
+    /// Tests: called on the back end's interface right before each context creation (null: none),
+    /// e.g. to make a callback fail.
+    using InterfaceHook = void (*)(FfxInterface* iface);
+    static void SetInterfaceHookForTests(InterfaceHook hook);
 
 private:
     struct Impl;

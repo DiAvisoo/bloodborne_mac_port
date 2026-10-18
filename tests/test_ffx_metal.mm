@@ -868,6 +868,40 @@ struct WrapperFrame {
     }
 };
 
+// A context creation that fails halfway (AMD's create makes the back-end context and its textures
+// before the pipelines, and returns without cleanup) leaves nothing behind, on every retry.
+FfxErrorCode FailingCreatePipeline(FfxInterface*, FfxEffect, FfxPass, uint32_t,
+                                   const FfxPipelineDescription*, FfxUInt32, FfxPipelineState*) {
+    return FFX_ERROR_BACKEND_API_ERROR;
+}
+
+void FailPipelines(FfxInterface* iface) {
+    iface->fpCreatePipeline = FailingCreatePipeline;
+}
+
+void TestWrapperCreateFailure(Metal::Device& device) {
+    const int before = failures;
+    const uint64_t start = FfxMetal::LiveTextureBytes();
+    FfxMetal::Fsr3Metal fsr3;
+    const FfxMetal::Fsr3Metal::CreateInfo info{1280, 720, 1920, 1080, true};
+    FfxMetal::Fsr3Metal::SetInterfaceHookForTests(FailPipelines);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::string error;
+        Expect(!fsr3.Create(device, info, &error) && !error.empty(),
+               "Create fails when a pipeline cannot be made");
+        Expect(fsr3.MemoryBytes() == 0 && !fsr3.Matches(info), "a failed Create leaves no context");
+        Expect(FfxMetal::LiveTextureBytes() == start, "a failed Create leaves no texture");
+    }
+    FfxMetal::Fsr3Metal::SetInterfaceHookForTests(nullptr);
+    std::string error;
+    Expect(fsr3.Create(device, info, &error), "Create succeeds after failed attempts");
+    fsr3.Destroy();
+    Expect(FfxMetal::LiveTextureBytes() == start, "and Destroy frees its textures");
+    if (failures == before) {
+        std::printf("PASS WrapperCreateFailure\n");
+    }
+}
+
 // Fsr3Metal at the renderer's sizes: a preset change (render size), an output size change and
 // back. Re-creation compiles no pipeline (the per-device cache), and the last Destroy leaves the
 // back end's texture total where it started. The first frame of each size has a reactive mask,
@@ -948,6 +982,48 @@ void TestWrapperRecreate(Metal::Device& device) {
         }
         Expect(finite && written, "the upscaled frame is written and finite");
     }
+    // The game's depth formats (Depth32Float, Depth32Float_Stencil8, read through the depth
+    // aspect as FSR's texture2d<float>): one frame each on the last context.
+    {
+        const Size& size = kSizes[std::size(kSizes) - 1];
+        WrapperFrame frame(device, size.w, size.h, size.ow, size.oh);
+        for (const MTLPixelFormat format :
+             {MTLPixelFormatDepth32Float, MTLPixelFormatDepth32Float_Stencil8}) {
+            Metal::Object depth =
+                Texture2D(device, format, size.w, size.h, false, false, "game depth");
+            Metal::Encoder encoder(device);
+            frame.Upload(encoder, 2);
+            encoder.CopyBufferToTexture(Ref(frame.depth_staging), size.w * 4,
+                                        size.w * size.h * 4, depth.Get(), 0, 0, {},
+                                        {size.w, size.h, 1}, Metal::BlitAspect::Depth);
+            FfxMetal::Fsr3Metal::DispatchInfo dispatch{};
+            dispatch.color = frame.color.Get();
+            dispatch.depth = depth.Get();
+            dispatch.motion = frame.motion.Get();
+            dispatch.output = frame.output.Get();
+            dispatch.render_w = size.w;
+            dispatch.render_h = size.h;
+            dispatch.output_w = size.ow;
+            dispatch.output_h = size.oh;
+            dispatch.frame_time_ms = Fsr3Synthetic::kFrameTimeMs;
+            dispatch.camera_near = Fsr3Synthetic::kCameraNear;
+            dispatch.camera_far = Fsr3Synthetic::kCameraFar;
+            dispatch.vertical_fov = Fsr3Synthetic::kCameraFovY;
+            dispatch.reset = true;
+            Expect(fsr3.Dispatch(encoder, dispatch), "Fsr3Metal::Dispatch with a depth format");
+            device.Wait(encoder.Submit());
+            const auto out = ReadRgba16f(device, frame.output.Get(), size.ow, size.oh);
+            bool finite = true, written = false;
+            for (const uint16_t bits : out) {
+                const float value = Fsr3Synthetic::FromHalf(bits);
+                finite &= std::isfinite(value);
+                written |= value != 0.0f;
+            }
+            Expect(finite && written, format == MTLPixelFormatDepth32Float
+                                          ? "upscaled with Depth32Float depth"
+                                          : "upscaled with Depth32Float_Stencil8 depth");
+        }
+    }
     fsr3.Destroy();
     Expect(fsr3.MemoryBytes() == 0, "no memory after Destroy");
     Expect(FfxMetal::LiveTextureBytes() == start, "the last Destroy frees every texture");
@@ -978,6 +1054,7 @@ int main() {
         TestFsr3MatchesVulkan(device);
         TestNullBindingUnbinds(device);
         TestWrapperRecreate(device);
+        TestWrapperCreateFailure(device);
         Expect(device.ErrorCount() == 0, "no command buffer errors on the device queue");
         std::filesystem::remove_all(dir);
     }
