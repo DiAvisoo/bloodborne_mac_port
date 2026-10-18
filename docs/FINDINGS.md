@@ -1197,3 +1197,46 @@ The user saw ~25 GB in Activity Monitor. Dense Cathedral Ward scene from the use
   4 GiB arena is not safe. `GPU arena: the game reached N GiB` is logged at each new 256 MiB step.
 - In this scene the native renderer beats 0.4.0 by ~18% with steadier frames (0.4.0: 120 frames
   presented > 25 ms apart in 60 s; ours none).
+
+## 2026-10-18: Metal-native M5 Task 11, parity matrix vs 0.4.0
+
+Four scenes (`cages-20261016` Central Yharnam lamp, `livecopy-20261016` Cathedral Ward,
+`dense-20261017` the user's dense Cathedral Ward view, `loadcrash-20261014-134937` Hunter's Dream)
+x four configs, both builds with the same ini and save, uncapped (`fps_cap=0`,
+`BB_PRESENT_MODE=Immediate`, `BB_VBLANK_HZ=480`), windowed, stand 30 s after the load. The display
+was at a fixed 60 Hz (the user's setting), hence Immediate. FPS standing (mean of the 5 s windows):
+
+| Scene | 1080p native | 1440p native | 1440p MetalFX Quality | 1440p TAA |
+|---|---|---|---|---|
+| cages | 97.7 / 97.5 | **75.1 / 66.2** | 95.7 / 95.1 | **69.9 / 61.9** |
+| livecopy | 104.8 / 103.2 | **82.7 / 72.0** | 102.3 / 99.5 | **78.3 / 67.0** |
+| dense | 83.2 / 78.5 | **65.2 / 57.2** | 81.0 / 76.7 | **61.7 / 54.4** |
+| loadcrash | 104.3 / 98.0 | **82.0 / 69.5** | 100.9 / 92.6 | **76.1 / 64.9** |
+
+(Metal-native / 0.4.0.) Metal-native is ahead or level in all 16; +12-18% at 1440p native and
+TAA, +0-9% at 1080p and with MetalFX (more CPU-bound there). The city at 1080p, 88.8 vs 98.8 at
+the end of Task 10c (display at 120 Hz then, eager private arena), is now level (97.7 / 97.5).
+
+- **Pacing:** p99 frame times match (10.4 ms at ~100 FPS), but some Metal runs have one frame of
+  25-46 ms every 5-40 s standing (0.4.0: none in the same windows). `BB_SPIKE_MS=20` (the default
+  limit at 480 Hz is 2.6 ms, so the 20 printed spikes were ordinary frames) shows the recording
+  thread waiting for the GPU (frames-ahead wait 21-36 ms, game thread on time, no compiles).
+  `BB_LOG_LONG_CB_MS`: one command buffer takes 25-39 ms of GPU time instead of ~10, with no
+  idle gap before it. `BB_GPU_PROFILE_SLOW_MS`: the extra time lands in a different encoder each
+  time (an image upload, a copy-shader dispatch, a 32640-group compute, the G-buffer pass), so no
+  single pass or shader. Not the lazy arena (`BB_ARENA_LAZY=0`: 43.8 ms), not the fence ordering
+  (`BB_METAL_HAZARD_TRACKING=1`: 39.6 ms), not the fence checker (`BB_METAL_FENCE_CHECK=0`:
+  41.7 ms). Uncapped only so far (GPU at 100%); the 60-cap check is in series 2. Backlog.
+- **Skipped pipelines (all scenes):** three pipelines, the full-screen vertex shader 0x89cda9e4
+  with fragment shaders 70bb42af, dbeccd9c and 1c3953c6 (G-buffer passes), read locations the
+  vertex shader never writes. MoltenVK draws them; Metal refuses ("Fragment input(s) ... not
+  written by vertex shader"), so their draws were skipped. The `fs 0x0` in the error's label is
+  the wrong slot of the key (cosmetic); these were not geometry-shader pipelines. Fix: those
+  inputs read as zero (`mtl_spirv_inputs.h`, `spirv-inputs-test`). At the cages save the
+  atmospheric light behind the bars on the left is drawn now; 0.4.0's picture could not be taken
+  (screen locked), so the caged figure stays open.
+- **A 1080p R32F image re-detiled every frame:** `BB_LOG_UPLOAD_MB=5`: the tiled 1920x1080 R32F
+  image at 0x7069fd0000 is refreshed ~11000 times in a run (every frame): its memory is written by
+  the GPU through a buffer, which marks it GPU-dirty, and the refresh detiles 9.4 MB from the
+  arena. Shared texture-cache code (0.4.0 likely does the same). Backlog (Performance).
+- Memory: GPU process 6.3-6.6 GB in the dense scene (lazy arena).

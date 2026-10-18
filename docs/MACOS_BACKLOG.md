@@ -38,6 +38,10 @@ Each item: what was done for now, what the refinement is, and where it lives.
   (scratchpad `t4-m-cages-*.png` vs `t4-w-cages-*.png`, 2026-10-16). Nothing is logged (no skipped
   draw, failed pipeline or error). Still missing with the depth-format fix above (2026-10-16), so
   not that. Start with a frame capture of that view on both.
+  2026-10-18: three G-buffer pipelines were skipped in every scene (fragment inputs the
+  full-screen vertex shader does not write; they are logged at startup, so "nothing is logged"
+  above was wrong); fixed (inputs read as zero), which adds atmospheric light behind those bars.
+  Whether the figure is back needs a 0.4.0 window capture with the screen unlocked.
 - **Metal-native (M4): full-screen switch not checked while presenting.** A window resize
   (1200x900 points via System Events) refits with black bars and no stall (2026-10-16). The
   `BB_FULLSCREEN=1` start and the green-button switch were only tried with the screen locked
@@ -350,7 +354,21 @@ Each item: what was done for now, what the refinement is, and where it lives.
   Metal HUD (both locked at 60 with and without `MTL_HUD_ENABLED`): the built-in display had
   switched to a fixed 60 Hz (`NSScreen.maximumFramesPerSecond` 60, refresh 60.0; earlier the same
   day 90/120 caps reached 89/117 FPS). Fix: System Settings > Displays > Refresh Rate > ProMotion.
-- **Metal-native: GPU ~12% slower than 0.4.0 in the city (11.2 vs 9.9 ms/frame; 2026-10-17).**
+- **Metal-native: one GPU frame of 25-46 ms every 5-40 s, uncapped (Task 11, 2026-10-18).** At
+  100% GPU (~100 FPS, Immediate) one command buffer takes 25-39 ms instead of ~10; the extra time
+  falls in a different encoder each time (upload, copy-shader dispatch, big compute, G-buffer
+  pass). Not the lazy arena, the fence ordering or the fence checker; 0.4.0 shows none. Check
+  whether capped play (60/90/120 with display sync) shows it; then an Instruments Metal System
+  Trace of a long frame (GPU preemption by another client, a residency/paging event, or a GPU
+  power-state change). Diagnostics: `BB_SPIKE_MS=20`, `BB_LOG_LONG_CB_MS=20`,
+  `BB_GPU_PROFILE=1 BB_GPU_PROFILE_SLOW_MS=18`. FINDINGS 2026-10-18.
+- **A 1080p R32F image re-detiled every frame (9.4 MB; shared texture-cache code).** The GPU
+  writes its memory through a buffer, which marks the image GPU-dirty, and each use detiles it
+  from the arena again (`BB_LOG_UPLOAD_MB=5`). Keep the image in sync with the buffer write
+  instead (a buffer-to-image copy at the write, or tile the writer's output). FINDINGS 2026-10-18.
+- ~~**Metal-native: GPU ~12% slower than 0.4.0 in the city (11.2 vs 9.9 ms/frame; 2026-10-17).**~~
+  Level in the Task 11 matrix (97.7 vs 97.5 FPS at 1080p; ahead in all 16 scene/config pairs,
+  +12-18% at 1440p native/TAA; FINDINGS 2026-10-18).
   Caps 120 FPS at 89-94 against 0.4.0's ~100. Task 10c's per-command ordering is in; an unsafe
   probe without ordering waits reached 108 FPS, so the waits (or encoder splits they force) are
   the suspect. Measure in Task 11 (fence waits per frame, encoder count vs 0.4.0's).
