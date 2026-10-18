@@ -320,6 +320,11 @@ Each item: what was done for now, what the refinement is, and where it lives.
   thread for 2.9 ms. Skipped or interleaved setup dispatches would leave whatever they produce
   wrong until the next load, which fits "missing until a relaunch". *Next:* Option B of the
   load race (serialize the two threads), then see whether missing geometry still occurs.
+  *2026-10-18, Reddit report (M3 Pro 14", 18 GB; FSR 3.1 Native AA at 720p, Metal, balanced
+  shader compile, 60 cap; 50–55 FPS, Chapel):* "transparent floors/walls/pants/NPC clothes", so
+  still seen after the load race fix (version not stated). Asked whether parts come back on
+  their own (balanced compile skips draws while a shader compiles) or stay until a relaunch,
+  and whether `shader_compile=wait` changes it.
 - **GPU host crash in `Scheduler::KickRecording` (2026-10-14, user session).** SIGSEGV at
   address 0x20008 (a null `record_chunk`: its size field follows the 128 KiB buffer) on the draw
   recording thread, `RunWriteData` → `WaitHostCopies` → `KickRecording`, right after an area
@@ -549,6 +554,10 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 3. Mac GUI
 
+- **Hide the mouse cursor over the game (request via the user, 2026-10-18).** Nothing hides it
+  today. `gpu/shim/window.cpp` (host owns the window): `SDL_HideCursor` while the game window has
+  focus and the overlay is closed; show it for the `⌘,` overlay, on focus loss and at quit. First
+  step of mouse look below (relative mode captures it anyway).
 - **Mouse and keyboard support (user, 2026-10-18: "a couple of requests").** Today there is only
   a keyboard fallback in `src/runtime_pad.c`, used when no gamepad is connected: fixed keys
   mapped onto the DualShock 4 (WASD left stick, arrow keys the right stick *and* the d-pad, Space
