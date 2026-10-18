@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <unordered_map>
+#include <vector>
 
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -117,6 +119,12 @@ void GpuProfiler::Collect(u32 which) {
     // Segments: from the start of a label's first encoder to the start of the next label's
     // (the Vulkan profiler's timestamps on MoltenVK measured the same).
     u64 segment_key = 0, segment_start = 0;
+    // BB_GPU_PROFILE_SLOW_MS=<ms>: frames whose span reaches <ms> print their own segments.
+    static const double slow_ms = [] {
+        const char* env = std::getenv("BB_GPU_PROFILE_SLOW_MS");
+        return env ? std::atof(env) : 0.0;
+    }();
+    std::unordered_map<u64, double> frame_ms;
     for (const Sampled& enc : s.encoders) {
         const u32 i = enc.index - base;
         u64 start = t[i], end = t[i + 1];
@@ -138,6 +146,7 @@ void GpuProfiler::Collect(u32 which) {
             segment_start = start;
         } else if (enc.key != segment_key && start >= segment_start) {
             totals[segment_key].ms += double(start - segment_start) * ns_per_tick / 1e6;
+            frame_ms[segment_key] += double(start - segment_start) * ns_per_tick / 1e6;
             segment_key = enc.key;
             segment_start = start;
         }
@@ -149,6 +158,23 @@ void GpuProfiler::Collect(u32 which) {
     }
     if (last > first) {
         span_ms += double(last - first) * ns_per_tick / 1e6;
+    }
+    if (slow_ms > 0 && last > first && double(last - first) * ns_per_tick / 1e6 >= slow_ms) {
+        if (segment_start != 0 && last > segment_start) {
+            frame_ms[segment_key] += double(last - segment_start) * ns_per_tick / 1e6;
+        }
+        std::vector<std::pair<u64, double>> sorted(frame_ms.begin(), frame_ms.end());
+        std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::printf("GPU profile: slow frame (tick %llu) %.2f ms first encoder start to last end, "
+                    "%zu encoders:",
+                    static_cast<unsigned long long>(s.tick),
+                    double(last - first) * ns_per_tick / 1e6, s.encoders.size());
+        for (size_t i = 0; i < std::min<size_t>(sorted.size(), 10); ++i) {
+            const auto name = names.find(sorted[i].first);
+            std::printf(" %.2f %s;", sorted[i].second,
+                        name != names.end() ? name->second.c_str() : "(before the first mark)");
+        }
+        std::printf("\n");
     }
     ++frames;
 }

@@ -173,6 +173,24 @@ void Device::TrackGpuTime(void* command_buffer) {
       if (!(end > start) || start <= 0) {
           return; // never ran (error) or no work
       }
+      // BB_LOG_LONG_CB_MS=<ms>: command buffers whose GPU time reaches <ms> (diagnostics), with
+      // the time the GPU sat idle before them (completion order, so roughly).
+      static const double long_ms = [] {
+          const char* env = std::getenv("BB_LOG_LONG_CB_MS");
+          return env ? std::atof(env) : 0.0;
+      }();
+      if (long_ms > 0) {
+          static std::atomic<double> last_end{0.0};
+          const double gpu_ms = (end - start) * 1e3;
+          const double idle_ms = (start - last_end.exchange(end)) * 1e3;
+          if (gpu_ms >= long_ms || idle_ms >= long_ms) {
+              LOG_WARNING(Render,
+                          "Metal command buffer '{}': GPU {:.2f} ms, scheduled {:.2f} ms after "
+                          "the kernel saw it, GPU idle {:.2f} ms before it",
+                          done.label ? done.label.UTF8String : "", gpu_ms,
+                          (start - done.kernelStartTime) * 1e3, idle_ms);
+          }
+      }
       std::scoped_lock lock{shared->busy_mutex};
       shared->gpu_busy_ns.fetch_add(u64(shared->busy.Add(start, end) * 1e9),
                                     std::memory_order_relaxed);

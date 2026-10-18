@@ -822,6 +822,26 @@ void TextureCache::RefreshImage(Image& image) {
 
     scheduler.EndRendering();
 
+    // bbport: BB_LOG_UPLOAD_MB=<n> logs every image refresh of at least n MB (diagnostics).
+    static const double log_upload_mb = [] {
+        const char* env = std::getenv("BB_LOG_UPLOAD_MB");
+        return env ? std::atof(env) : 0.0;
+    }();
+    if (log_upload_mb > 0 && image.info.guest_size >= log_upload_mb * 1e6) {
+        LOG_WARNING(Render_Vulkan,
+                    "Image refresh {:#x} size {:#x}: {}x{} format {} layers {} mips {} ({} "
+                    "copied), tiled {}, cpu dirty {}, maybe cpu dirty {}, gpu modified {}, gpu "
+                    "dirty {}, region gpu modified {}",
+                    image.info.guest_address, image.info.guest_size, image.info.size.width,
+                    image.info.size.height, static_cast<u32>(image.info.pixel_format), num_layers,
+                    num_mips, image_copies.size(), bool(image.info.props.is_tiled),
+                    True(image.flags & ImageFlagBits::CpuDirty),
+                    True(image.flags & ImageFlagBits::MaybeCpuDirty), is_gpu_modified,
+                    is_gpu_dirty,
+                    buffer_cache.IsRegionGpuModified(image.info.guest_address,
+                                                     image.info.guest_size));
+    }
+
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
