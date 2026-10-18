@@ -93,6 +93,8 @@ Each item: what was done for now, what the refinement is, and where it lives.
   upscaler, so the mask went into the guest 1080p depth while the icon was redirected to the host
   target with a cleared stencil. Depth-only movie-shader draws in the UI phase now bind the host
   UI depth; `done_this_frame` at 1080p still needs a color draw (guard added at merge).
+  *Check:* #18's screenshots (0.5.1, 1280x720 output, FSR 3.1 Native AA) show the item slot
+  empty at 720p *with* FSR on: below 1080p the UI is also scaled; confirm whether #17 covers it.
 
 - **PARKED (2026-10-13): the game window sometimes closes by itself in split mode** (grey screen,
   then the host exits with status 0 and no error). Seen 3 times: after turning subpixel jitter on
@@ -320,11 +322,31 @@ Each item: what was done for now, what the refinement is, and where it lives.
   thread for 2.9 ms. Skipped or interleaved setup dispatches would leave whatever they produce
   wrong until the next load, which fits "missing until a relaunch". *Next:* Option B of the
   load race (serialize the two threads), then see whether missing geometry still occurs.
-  *2026-10-18, Reddit report (M3 Pro 14", 18 GB; FSR 3.1 Native AA at 720p, Metal, balanced
-  shader compile, 60 cap; 50–55 FPS, Chapel):* "transparent floors/walls/pants/NPC clothes", so
-  still seen after the load race fix (version not stated). Asked whether parts come back on
-  their own (balanced compile skips draws while a shader compiles) or stay until a relaunch,
-  and whether `shader_compile=wait` changes it.
+  *2026-10-18, #18 (Didjus, M3 Pro 14", 18 GB, 0.5.1; FSR 3.1 Native AA at 720p, 60 cap) and
+  the user (M4 Max, 0.5.1, 1440p MetalFX):* parts **disappear progressively after a few minutes
+  of play** (a hat, then a ladder, then a floor; NPC clothes, walls) and come back after
+  reloading the area (not always); **every version** so far, MoltenVK included;
+  `shader_compile=wait` makes no difference. The user: the well floor and a chasm near the
+  Hemwick Charnel Lane lamp missing after a 15–20 minute walk from the Witch's Abode, both drawn
+  on an earlier pass close to the lamp. Neither log has an error, a skipped draw or a bounced
+  read, so the draws are issued with stale/empty data or not issued at all. Both logs have
+  `Gnm: context … used by thread A, then B` lines where a job worker (…263b246 chain) and the
+  main thread's setup (…ebbc8b) share the immediate context outside the context lock: still
+  the Option B suspect above. *Next:* the overlay's Capture Frame at a broken spot, then again
+  after reloading the area (asked on #18): diff the two pass lists (draw missing vs present with
+  bad data). Then a long-walk repro from a save (Hemwick lamp), and Option B.
+- **Black loading screen that never finishes (#18, 2026-10-18).** About 1 launch in 10 on an M3
+  Pro stops at a black screen with the loading icon; a relaunch works. No log of a stuck run
+  yet (asked for one).
+- **Metal: a tessellation pipeline refused, its draws skipped (2026-10-18, user, 0.5.1).** Every
+  session: `GetTessellationPipeline: … the evaluation shader reads 160 bytes of patch constants,
+  the control shader writes 224` (vs 0x2fb9d0c43ee, fs 0xdbb1593690c; pipeline fs dbb222eb hs
+  2807dd6c vs f0c066a1 ls 2fb118ad), then `not built … its draws are skipped`
+  (`mtl_pso_cache.mm` ~947). Likely the TES reads a prefix of the TCS's patch struct (unused
+  members dropped by SPIRV-Cross): compare the two MSL structs; if the TES members sit at the
+  same offsets, accept a prefix and index with the TCS stride (`patch_stride` is already the
+  TCS's). MoltenVK drew it (0.4.x). Which geometry it is: not known yet (a candidate for some
+  missing floors, but not the progressive disappearance above).
 - **GPU host crash in `Scheduler::KickRecording` (2026-10-14, user session).** SIGSEGV at
   address 0x20008 (a null `record_chunk`: its size field follows the 128 KiB buffer) on the draw
   recording thread, `RunWriteData` → `WaitHostCopies` → `KickRecording`, right after an area
@@ -450,7 +472,11 @@ Each item: what was done for now, what the refinement is, and where it lives.
   line now logs the duration: check it on a 16 GB / 8-core Mac in M5; grow the interval with N.
   Seen 2026-10-18 on the M4 Max: quitting after character creation logged "the pipeline archive
   write did not finish within 5000 ms; exiting without it" (pipelines from that session recompile
-  next launch).
+  next launch). Later the same evening (M4 Max, 0.5.1, on battery): **12–14 s per write at
+  ~720–760 pipelines**, repeated about every 10 s while new pipelines compiled, i.e. near-constant
+  utility-thread work; an M3 Pro (#18) took ~2.5 s at ~780. Why the M4 Max is 5x slower is
+  unknown (battery? the archive file size?). 0.5.2: write only the new pipelines (a second
+  archive, or merge on exit) and grow the interval.
 - **Metal-native (M4): archive writer throttle allows double writes.** The writer's due time is
   10 s after the last write, computed before it waits: a `Flush` (Sync, exit flush) during that
   wait does not move it, so when more pipelines compile after the flush the writer does a second
