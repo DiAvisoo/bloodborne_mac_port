@@ -87,9 +87,12 @@ Each item: what was done for now, what the refinement is, and where it lives.
   with a dispatch in flight, a `MTL_SHADER_VALIDATION=1` run of `ffx-metal-test` in
   `build_macos.sh`, FSR 1 HDR and resize.
 
-- **1440p (live resolution path): the item icon in the HUD is missing** (black square where the
-  Oil Urn picture is; present at 1080p). Seen 2026-10-16 night in both MoltenVK and Metal frame
-  path screenshots (Hunter's Dream). Not yet investigated.
+- **1440p (live resolution path): the item icon in the HUD is missing. Fixed 2026-10-18 (#17,
+  Noel Miller; 0.5.1).** Upscaler off only (FSR/MetalFX drew it). Scaleform's stencil mask for the
+  item slot is a depth-only draw; the rasterizer reported only one-color-target draws to the
+  upscaler, so the mask went into the guest 1080p depth while the icon was redirected to the host
+  target with a cleared stencil. Depth-only movie-shader draws in the UI phase now bind the host
+  UI depth; `done_this_frame` at 1080p still needs a color draw (guard added at merge).
 
 - **PARKED (2026-10-13): the game window sometimes closes by itself in split mode** (grey screen,
   then the host exits with status 0 and no error). Seen 3 times: after turning subpixel jitter on

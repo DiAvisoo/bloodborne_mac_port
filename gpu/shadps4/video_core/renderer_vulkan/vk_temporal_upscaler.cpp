@@ -906,7 +906,8 @@ void TemporalUpscaler::OnColorTarget(VideoCore::ImageId color) {
 
 void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
                               VideoCore::ImageId depth, bool native_viewport) {
-    if (!Scaled() && vs_hash == ui_trigger_vs) done_this_frame = true;
+    // bbport: color draws only; depth-only draws (reported since #17) leave 1080p as before.
+    if (!Scaled() && color && vs_hash == ui_trigger_vs) done_this_frame = true;
     if (Scaled() && ui_phase && !color && depth && depth != ui_depth &&
         (vs_hash == ui_trigger_vs || UiComposition::MovieShader(vs_hash))) {
         // bbport: a Scaleform stencil mask drawn with depth only (no color target), before any
