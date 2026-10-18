@@ -2,11 +2,13 @@
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
-#include "core/emulator_settings.h"
 #include "video_core/host_shaders/fsr_easu_comp.h"
 #include "video_core/host_shaders/fsr_rcas_comp.h"
+#include "video_core/renderer_metal/mtl_encoder.h"
+#include "video_core/renderer_metal/mtl_texture.h"
+#include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
-#include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 #define A_CPU
 #include "core/debug_state.h"
@@ -25,430 +27,132 @@ struct FSRConstants {
 
 namespace Vulkan::HostPasses {
 
-void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) {
-    this->device = device;
-    this->num_images = num_images;
-
-    sampler = Check<"create upscaling sampler">(device.createSamplerUnique(vk::SamplerCreateInfo{
-        .magFilter = vk::Filter::eLinear,
-        .minFilter = vk::Filter::eLinear,
-        .mipmapMode = vk::SamplerMipmapMode::eNearest,
-        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
-        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
-        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
-        .maxAnisotropy = 1.0f,
-        .minLod = -1000.0f,
-        .maxLod = 1000.0f,
-    }));
-
-    std::array<vk::DescriptorSetLayoutBinding, 3> layoutBindings{{
-        {
-            .binding = 0,
-            .descriptorType = vk::DescriptorType::eSampledImage,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        },
-        {
-            .binding = 1,
-            .descriptorType = vk::DescriptorType::eStorageImage,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        },
-        {
-            .binding = 2,
-            .descriptorType = vk::DescriptorType::eSampler,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-            .pImmutableSamplers = &sampler.get(),
-        },
-    }};
-
-    descriptor_set_layout =
-        Check<"create fsr descriptor set layout">(device.createDescriptorSetLayoutUnique({
-            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
-            .bindingCount = layoutBindings.size(),
-            .pBindings = layoutBindings.data(),
-        }));
-
-    const vk::PushConstantRange push_constants{
-        .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        .offset = 0,
-        .size = sizeof(FSRConstants),
-    };
-
-    const auto& cs_easu_module = CompileSPV(FSR_EASU_COMP, device);
-    ASSERT(cs_easu_module);
-    SetObjectName(device, cs_easu_module, "fsr.comp [EASU]");
-
-    const auto& cs_rcas_module = CompileSPV(FSR_RCAS_COMP, device);
-    ASSERT(cs_rcas_module);
-    SetObjectName(device, cs_rcas_module, "fsr.comp [RCAS]");
-
-    pipeline_layout = Check<"fsp pipeline layout">(device.createPipelineLayoutUnique({
-        .setLayoutCount = 1,
-        .pSetLayouts = &descriptor_set_layout.get(),
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &push_constants,
-    }));
-    SetObjectName(device, pipeline_layout.get(), "fsr pipeline layout");
-
-    const vk::ComputePipelineCreateInfo easu_pinfo{
-        .stage{
-            .stage = vk::ShaderStageFlagBits::eCompute,
-            .module = cs_easu_module,
-            .pName = "main",
-        },
-        .layout = pipeline_layout.get(),
-    };
-    easu_pipeline =
-        Check<"fsp easu compute pipelines">(device.createComputePipelineUnique({}, easu_pinfo));
-    SetObjectName(device, easu_pipeline.get(), "fsr easu pipeline");
-
-    const vk::ComputePipelineCreateInfo rcas_pinfo{
-        .stage{
-            .stage = vk::ShaderStageFlagBits::eCompute,
-            .module = cs_rcas_module,
-            .pName = "main",
-        },
-        .layout = pipeline_layout.get(),
-    };
-    rcas_pipeline =
-        Check<"fsp rcas compute pipelines">(device.createComputePipelineUnique({}, rcas_pinfo));
-    SetObjectName(device, rcas_pipeline.get(), "fsr rcas pipeline");
-
-    device.destroyShaderModule(cs_easu_module);
-    device.destroyShaderModule(cs_rcas_module);
-
-    available_imgs.resize(num_images);
-    for (int i = 0; i < num_images; ++i) {
-        auto& img = available_imgs[i];
-        img.id = i;
-        img.intermediary_image = VideoCore::UniqueImage(device, allocator);
-        img.output_image = VideoCore::UniqueImage(device, allocator);
-    }
+FsrPass::FsrPass(Metal::Device& device_, u32 num_images)
+    : device{device_}, easu{Metal::BuildHostKernel(device_, FSR_EASU_COMP, {}, "fsr.comp [EASU]")},
+      rcas{Metal::BuildHostKernel(device_, FSR_RCAS_COMP, {}, "fsr.comp [RCAS]")},
+      images(num_images) {
+    // Linear, clamp to edge, no mips.
+    sampler = Metal::CreateSampler(
+        device, Metal::SamplerDesc{
+                    .min_filter = Metal::VkToMtl::SamplerFilter(vk::Filter::eLinear),
+                    .mag_filter = Metal::VkToMtl::SamplerFilter(vk::Filter::eLinear),
+                    .mip_filter = Metal::VkToMtl::SamplerMipNotMipmapped,
+                    .address_u = Metal::VkToMtl::AddressMode(vk::SamplerAddressMode::eClampToEdge),
+                    .address_v = Metal::VkToMtl::AddressMode(vk::SamplerAddressMode::eClampToEdge),
+                    .address_w = Metal::VkToMtl::AddressMode(vk::SamplerAddressMode::eClampToEdge),
+                    .max_lod = 1000.0f,
+                });
+    ASSERT_MSG(sampler, "FSR: no sampler");
+    ASSERT(num_images > 0);
 }
 
-vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
-                              vk::Extent2D input_size, vk::Extent2D output_size, Settings settings,
-                              bool hdr) {
-    if (!settings.enable) {
-        DebugState.is_using_fsr = false;
-        return input;
-    }
-    if (input_size.width >= output_size.width && input_size.height >= output_size.height) {
-        DebugState.is_using_fsr = false;
-        return input;
-    }
+FsrPass::~FsrPass() = default;
 
-    DebugState.is_using_fsr = true;
+bool FsrPass::Applies(const Settings& settings, Size2 input, Size2 output) {
+    return settings.enable && (input.width < output.width || input.height < output.height);
+}
 
-    if (output_size != cur_size) {
-        ResizeAndInvalidate(output_size.width, output_size.height);
+FsrPass::Targets FsrPass::Acquire(Size2 output) {
+    if (output != cur_size) {
+        // The old textures are released here; a recording that still uses them holds its own
+        // reference until its command buffer completes.
+        cur_size = output;
+        for (Img& img : images) {
+            img = {};
+        }
     }
-    auto [width, height] = cur_size;
-
-    auto& img = available_imgs[cur_image];
-    if (++cur_image >= available_imgs.size()) {
+    Img& img = images[cur_image];
+    if (++cur_image >= images.size()) {
         cur_image = 0;
     }
-
-    if (img.dirty) {
-        CreateImages(img);
+    if (!img.output) {
+        const Metal::TextureDesc desc{
+            .pixel_format = Metal::VkToMtl::PixelFormat(vk::Format::eR16G16B16A16Sfloat),
+            .width = output.width,
+            .height = output.height,
+            .shader_write = true,
+        };
+        img.intermediary = Metal::CreateTexture(device, desc, "FSR Intermediary Image", nullptr);
+        img.output = Metal::CreateTexture(device, desc, "FSR Output Image", nullptr);
+        ASSERT_MSG(img.intermediary && img.output, "FSR: no {}x{} textures", output.width,
+                   output.height);
     }
+    return {Metal::Object::Retain(img.intermediary.Get()), Metal::Object::Retain(img.output.Get())};
+}
 
-    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
-        cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
-            .pLabelName = "Host/FSR",
-        });
-    }
-
-    static const int thread_group_work_region_dim = 16;
-    int dispatch_x = (width + (thread_group_work_region_dim - 1)) / thread_group_work_region_dim;
-    int dispatch_y = (height + (thread_group_work_region_dim - 1)) / thread_group_work_region_dim;
-
-    constexpr vk::ImageSubresourceRange simple_subresource = {
-        .aspectMask = vk::ImageAspectFlagBits::eColor,
-        .levelCount = 1,
-        .layerCount = 1,
+void FsrPass::Encode(Metal::Encoder& e, void* input, Size2 input_size, Size2 output_size,
+                     const Settings& settings, bool hdr, void* intermediary, void* output) const {
+    constexpr u32 thread_group_work_region_dim = 16;
+    const Metal::Size3 groups{
+        (output_size.width + (thread_group_work_region_dim - 1)) / thread_group_work_region_dim,
+        (output_size.height + (thread_group_work_region_dim - 1)) / thread_group_work_region_dim,
+        1};
+    const auto run = [&](const Metal::HostKernel& kernel, void* in, void* out,
+                         const FSRConstants& consts) {
+        e.SetComputePipeline(kernel.pipeline.Get(), Metal::Access::None); // textures only
+        e.SetTexture(Metal::Stage::Compute, kernel.texture_slot[0], in);
+        e.SetTexture(Metal::Stage::Compute, kernel.texture_slot[1], out);
+        e.SetSampler(Metal::Stage::Compute, kernel.sampler_slot[2], sampler.Get());
+        e.SetBytes(Metal::Stage::Compute, Metal::kPushConstantBuffer, &consts, sizeof(consts));
+        e.Dispatch(groups, {kernel.local_size[0], kernel.local_size[1], kernel.local_size[2]});
     };
-    const std::array enter_barrier{
-        vk::ImageMemoryBarrier2{
-            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
-            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-            .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
-            .oldLayout = vk::ImageLayout::eUndefined,
-            .newLayout = vk::ImageLayout::eGeneral,
-            .image = img.intermediary_image,
-            .subresourceRange = simple_subresource,
-        },
-    };
-    cmdbuf.pipelineBarrier2({
-        .imageMemoryBarrierCount = enter_barrier.size(),
-        .pImageMemoryBarriers = enter_barrier.data(),
-    });
 
     FSRConstants consts{};
     FsrEasuCon(reinterpret_cast<AU1*>(&consts.Const0), reinterpret_cast<AU1*>(&consts.Const1),
                reinterpret_cast<AU1*>(&consts.Const2), reinterpret_cast<AU1*>(&consts.Const3),
                static_cast<AF1>(input_size.width), static_cast<AF1>(input_size.height),
-               static_cast<AF1>(input_size.width), static_cast<AF1>(input_size.height), (AF1)width,
-               (AF1)height);
+               static_cast<AF1>(input_size.width), static_cast<AF1>(input_size.height),
+               static_cast<AF1>(output_size.width), static_cast<AF1>(output_size.height));
     consts.Sample[0] = hdr && !settings.use_rcas ? 1 : 0;
 
     if (settings.use_rcas) {
-
-        { // easu
-            std::array<vk::DescriptorImageInfo, 3> img_info{{
-                {
-                    .imageView = input,
-                    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-                },
-                {
-                    .imageView = img.intermediary_image_view.get(),
-                    .imageLayout = vk::ImageLayout::eGeneral,
-                },
-                {
-                    .sampler = sampler.get(),
-                },
-            }};
-
-            std::array<vk::WriteDescriptorSet, 3> set_writes{{
-                {
-                    .dstBinding = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = vk::DescriptorType::eSampledImage,
-                    .pImageInfo = &img_info[0],
-                },
-                {
-                    .dstBinding = 1,
-                    .descriptorCount = 1,
-                    .descriptorType = vk::DescriptorType::eStorageImage,
-                    .pImageInfo = &img_info[1],
-                },
-                {
-                    .dstBinding = 2,
-                    .descriptorCount = 1,
-                    .descriptorType = vk::DescriptorType::eSampler,
-                    .pImageInfo = &img_info[2],
-                },
-            }};
-
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, easu_pipeline.get());
-            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0,
-                                        set_writes);
-            cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
-                                 sizeof(FSRConstants), &consts);
-            cmdbuf.dispatch(dispatch_x, dispatch_y, 1);
-        }
-
-        std::array img_barrier{
-            vk::ImageMemoryBarrier2{
-                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-                .oldLayout = vk::ImageLayout::eGeneral,
-                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-                .image = img.intermediary_image,
-                .subresourceRange = simple_subresource,
-            },
-            vk::ImageMemoryBarrier2{
-                .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
-                .srcAccessMask = vk::AccessFlagBits2::eNone,
-                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-                .oldLayout = vk::ImageLayout::eUndefined,
-                .newLayout = vk::ImageLayout::eGeneral,
-                .image = img.output_image,
-                .subresourceRange = simple_subresource,
-            },
-        };
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .imageMemoryBarrierCount = img_barrier.size(),
-            .pImageMemoryBarriers = img_barrier.data(),
-        });
-
-        { // rcas
-            consts = {};
-            FsrRcasCon(reinterpret_cast<AU1*>(&consts.Const0), settings.rcas_attenuation);
-            consts.Sample[0] = hdr ? 1 : 0;
-
-            std::array<vk::DescriptorImageInfo, 3> img_info{{
-                {
-                    .imageView = img.intermediary_image_view.get(),
-                    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-                },
-                {
-                    .imageView = img.output_image_view.get(),
-                    .imageLayout = vk::ImageLayout::eGeneral,
-                },
-                {
-                    .sampler = sampler.get(),
-                },
-            }};
-
-            std::array<vk::WriteDescriptorSet, 3> set_writes{{
-                {
-                    .dstBinding = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = vk::DescriptorType::eSampledImage,
-                    .pImageInfo = &img_info[0],
-                },
-                {
-                    .dstBinding = 1,
-                    .descriptorCount = 1,
-                    .descriptorType = vk::DescriptorType::eStorageImage,
-                    .pImageInfo = &img_info[1],
-                },
-                {
-                    .dstBinding = 2,
-                    .descriptorCount = 1,
-                    .descriptorType = vk::DescriptorType::eSampler,
-                    .pImageInfo = &img_info[2],
-                },
-            }};
-
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, rcas_pipeline.get());
-            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0,
-                                        set_writes);
-            cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
-                                 sizeof(FSRConstants), &consts);
-            cmdbuf.dispatch(dispatch_x, dispatch_y, 1);
-        }
-
+        run(easu, input, intermediary, consts);
+        consts = {};
+        FsrRcasCon(reinterpret_cast<AU1*>(&consts.Const0), settings.rcas_attenuation);
+        consts.Sample[0] = hdr ? 1 : 0;
+        run(rcas, intermediary, output, consts);
     } else {
-        // only easu
-        std::array<vk::DescriptorImageInfo, 3> img_info{{
-            {
-                .imageView = input,
-                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-            },
-            {
-                .imageView = img.output_image_view.get(),
-                .imageLayout = vk::ImageLayout::eGeneral,
-            },
-            {
-                .sampler = sampler.get(),
-            },
-        }};
-
-        std::array<vk::WriteDescriptorSet, 3> set_writes{{
-            {
-                .dstBinding = 0,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eSampledImage,
-                .pImageInfo = &img_info[0],
-            },
-            {
-                .dstBinding = 1,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eStorageImage,
-                .pImageInfo = &img_info[1],
-            },
-            {
-                .dstBinding = 2,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eSampler,
-                .pImageInfo = &img_info[2],
-            },
-        }};
-
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, easu_pipeline.get());
-        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0,
-                                    set_writes);
-        cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
-                             sizeof(FSRConstants), &consts);
-        cmdbuf.dispatch(dispatch_x, dispatch_y, 1);
+        run(easu, input, output, consts);
     }
+}
 
-    const std::array return_barrier{
-        vk::ImageMemoryBarrier2{
-            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-            .oldLayout = vk::ImageLayout::eGeneral,
-            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-            .image = img.output_image,
-            .subresourceRange = simple_subresource,
-        },
-    };
-    cmdbuf.pipelineBarrier2({
-        .imageMemoryBarrierCount = return_barrier.size(),
-        .pImageMemoryBarriers = return_barrier.data(),
+void* FsrPass::Render(Metal::Encoder& e, void* input, Size2 input_size, Size2 output_size,
+                      const Settings& settings, bool hdr) {
+    if (!Applies(settings, input_size, output_size)) {
+        DebugState.is_using_fsr = false;
+        return input;
+    }
+    DebugState.is_using_fsr = true;
+    Targets targets = Acquire(output_size);
+    void* const intermediary = targets.intermediary.Get();
+    void* const output = targets.output.Get();
+    Encode(e, input, input_size, output_size, settings, hdr, intermediary, output);
+    e.KeepAlive(std::move(targets.intermediary));
+    e.KeepAlive(std::move(targets.output));
+    return output;
+}
+
+Metal::Object FsrPass::Render(Scheduler& scheduler, Metal::Object input, Size2 input_size,
+                              Size2 output_size, const Settings& settings, bool hdr) {
+    if (!Applies(settings, input_size, output_size)) {
+        DebugState.is_using_fsr = false;
+        return input;
+    }
+    DebugState.is_using_fsr = true;
+    Targets targets = Acquire(output_size);
+    Metal::Object result = Metal::Object::Retain(targets.output.Get());
+    scheduler.EndRendering();
+    scheduler.Record([this, input = std::move(input), targets = std::move(targets), input_size,
+                      output_size, settings, hdr](Metal::Encoder& e) mutable {
+        Encode(e, input.Get(), input_size, output_size, settings, hdr, targets.intermediary.Get(),
+               targets.output.Get());
+        e.KeepAlive(std::move(input));
+        e.KeepAlive(std::move(targets.intermediary));
+        e.KeepAlive(std::move(targets.output));
     });
-
-    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
-        cmdbuf.endDebugUtilsLabelEXT();
-    }
-
-    return img.output_image_view.get();
-}
-
-void FsrPass::ResizeAndInvalidate(u32 width, u32 height) {
-    this->cur_size = vk::Extent2D{
-        .width = width,
-        .height = height,
-    };
-    for (int i = 0; i < num_images; ++i) {
-        available_imgs[i].dirty = true;
-    }
-}
-
-void FsrPass::CreateImages(Img& img) const {
-    img.dirty = false;
-
-    // Destroy previous resources before re-creating at new size.
-    // Views first, then images (views reference the images).
-    img.intermediary_image_view.reset();
-    img.output_image_view.reset();
-    img.intermediary_image.Destroy();
-    img.output_image.Destroy();
-
-    vk::ImageCreateInfo image_create_info{
-        .imageType = vk::ImageType::e2D,
-        .format = vk::Format::eR16G16B16A16Sfloat,
-        .extent{
-            .width = cur_size.width,
-            .height = cur_size.height,
-            .depth = 1,
-        },
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .samples = vk::SampleCountFlagBits::e1,
-        // .tiling = vk::ImageTiling::eOptimal,
-        .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
-        .initialLayout = vk::ImageLayout::eUndefined,
-    };
-    img.intermediary_image.Create(image_create_info);
-    SetObjectName(device, static_cast<vk::Image>(img.intermediary_image),
-                  "FSR Intermediary Image #{}", img.id);
-    image_create_info.usage = vk::ImageUsageFlagBits::eTransferSrc |
-                              vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage |
-                              vk::ImageUsageFlagBits::eColorAttachment;
-    img.output_image.Create(image_create_info);
-    SetObjectName(device, static_cast<vk::Image>(img.output_image), "FSR Output Image #{}", img.id);
-
-    vk::ImageViewCreateInfo image_view_create_info{
-        .image = img.intermediary_image,
-        .viewType = vk::ImageViewType::e2D,
-        .format = vk::Format::eR16G16B16A16Sfloat,
-        .subresourceRange{
-            .aspectMask = vk::ImageAspectFlagBits::eColor,
-            .levelCount = 1,
-            .layerCount = 1,
-        },
-    };
-    img.intermediary_image_view = Check<"create fsr intermediary image view">(
-        device.createImageViewUnique(image_view_create_info));
-    SetObjectName(device, img.intermediary_image_view.get(), "FSR Intermediary ImageView #{}",
-                  img.id);
-
-    image_view_create_info.image = img.output_image;
-    img.output_image_view =
-        Check<"create fsr output image view">(device.createImageViewUnique(image_view_create_info));
-    SetObjectName(device, img.output_image_view.get(), "FSR Output ImageView #{}", img.id);
+    // The guest pipelines' dynamic state must be emitted again after these pipelines.
+    scheduler.GetDynamicState().Invalidate();
+    return result;
 }
 
 } // namespace Vulkan::HostPasses

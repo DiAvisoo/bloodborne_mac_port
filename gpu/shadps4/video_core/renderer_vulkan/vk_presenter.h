@@ -16,6 +16,7 @@
 #include "video_core/renderer_metal/mtl_device.h"
 #include "video_core/renderer_metal/mtl_object.h"
 #include "video_core/renderer_metal/mtl_present.h"
+#include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -164,6 +165,9 @@ private:
     bool SnapshotRequested() const;
     std::string TakeSnapshotRequest();
     HostPasses::PostProcessingPass::Settings pp_settings{};
+    /// FSR 1 (BB_FSR1): created when enabled at start, as on the Vulkan renderer.
+    std::unique_ptr<HostPasses::FsrPass> fsr_pass;
+    HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass pp_pass;
     std::unique_ptr<Metal::PresentQueue> present_queue;
     std::shared_ptr<FramePool> pool;

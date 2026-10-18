@@ -123,9 +123,11 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         pool->frames[i].id = i;
         pool->free.push_back(&pool->frames[i]);
     }
-    if (EmulatorSettings.IsFsrEnabled()) {
-        LOG_WARNING(Render_Vulkan,
-                    "FSR 1 returns with the Metal renderer's M6; presenting without it");
+    fsr_settings.enable = EmulatorSettings.IsFsrEnabled();
+    fsr_settings.use_rcas = EmulatorSettings.IsRcasEnabled();
+    fsr_settings.rcas_attenuation = static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
+    if (fsr_settings.enable) {
+        fsr_pass = std::make_unique<HostPasses::FsrPass>(device);
     }
     std::printf("Presenter: CAMetalLayer, %u drawables, display sync %s, frame limit %u\n",
                 config.max_drawables, config.display_sync ? "on" : "off",
@@ -232,6 +234,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // post-process pass still sRGB encoded and is decoded there.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    if (fsr_pass) {
+        input = fsr_pass->Render(draw_scheduler, std::move(input), {image_width, image_height},
+                                 {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+    }
     pp_pass.Render(draw_scheduler, std::move(input), Metal::Object::Retain(frame->texture.Get()),
                    frame->width, frame->height, pp_settings);
 

@@ -45,7 +45,7 @@ cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET \
     -DCMAKE_PREFIX_PATH="$PREFIX;$boost" -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew \
     -DBoost_INCLUDE_DIR="$boost/include" \
-    -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" -DBB_METAL_NATIVE_STAGE=5 -Wno-dev >/dev/null
+    -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" -DBB_METAL_NATIVE_STAGE=6 -Wno-dev >/dev/null
 echo "GPU library: LTO ${BB_LTO:-ON}"
 # A failed GPU build must stop here: an older libbbgpu.dylib would otherwise be used silently.
 if ! ninja -C out/gpu bbgpu > out/gpu-build.log 2>&1; then
@@ -176,6 +176,10 @@ if [[ ${1:-} == --test ]]; then
         ninja -C out/gpu-arm64 host-kernel-test >/dev/null
         out/gpu-arm64/host-kernel-test
         MTL_DEBUG_LAYER=1 out/gpu-arm64/host-kernel-test 2>&1 | grep -E 'PASS|FAIL' || { echo 'FAIL: host-kernel-test (validation)'; exit 1; }
+        # Metal-native M6: the presenter's FSR 1 pass (EASU + RCAS), plain and under validation.
+        ninja -C out/gpu-arm64 fsr-pass-test >/dev/null
+        out/gpu-arm64/fsr-pass-test 2>&1 | grep -E 'PASS|FAIL' || { echo 'FAIL: fsr-pass-test'; exit 1; }
+        MTL_DEBUG_LAYER=1 out/gpu-arm64/fsr-pass-test 2>&1 | grep -E 'PASS|FAIL' || { echo 'FAIL: fsr-pass-test (validation)'; exit 1; }
         # Metal-native M6: every FSR 3.1 blob compiles to a Metal compute pipeline through the
         # FidelityFX Metal back end, and FSR 3 on it matches the Vulkan path's golden outputs
         # (tests/data/fsr3), plain and under validation.
