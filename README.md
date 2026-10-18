@@ -3,8 +3,8 @@
 A **work-in-progress macOS port** of the native Bloodborne PC port. It runs the original PS4
 executable of *Bloodborne* (CUSA03173, version 1.09) on Apple Silicon Macs: the game's own
 x86-64 code executes directly under **Rosetta 2**, PS4 system libraries are replaced by a
-lightweight HLE runtime written in C, and GPU command buffers are translated to Vulkan by a
-**shadPS4-derived video core** running on **MoltenVK**.
+lightweight HLE runtime written in C, and GPU command buffers are translated by a
+**shadPS4-derived video core** into **native Metal** (since 0.5.0; MoltenVK before).
 
 This is not an emulator and contains no game code: the loader and runtime run your own copy of
 the game as an x86-64 process under Rosetta 2, and rendering happens in a separate native arm64
@@ -15,50 +15,75 @@ process.
 > This project is not affiliated with or endorsed by Sony Interactive Entertainment,
 > FromSoftware, or AMD.
 
-## Status (2026-10-16)
+## Status (2026-10-18)
 
-**Current version: [mac-v0.4.0](https://github.com/Wooloomooloo2/bloodborne_mac_port/releases/tag/mac-v0.4.0)** (download the app, or build it as below).
+**Current version: [mac-v0.5.0](https://github.com/Wooloomooloo2/bloodborne_mac_port/releases/tag/mac-v0.5.0)** (download the app, or build it as below).
 
 **Work in progress, playable.** On an Apple M4 Max the game boots, character creation works,
 saves load, and the game runs at a **locked 60 FPS** at 1080p and 1440p native, or upscaled with
-MetalFX or FSR 3.1. Expect occasional rendering glitches (see [Known issues](#known-issues)).
+MetalFX, FSR 3.1 or TAA, through its own **native Metal renderer**. Expect occasional rendering
+glitches (see [Known issues](#known-issues)).
 
-The target is a locked 60 FPS (the game's physics run at 30 Hz, so more is not wanted), at the
-highest resolution each Mac allows. Measured on the M4 Max with mac-v0.3.3, frame rate uncapped
-(Hunter's Dream headstone):
+The target is a locked 60 FPS (the game's physics run at 30 Hz), with even frame pacing, at the
+highest resolution each Mac allows; 90 and 120 FPS caps are there for ProMotion displays.
 
-| Output | Renders at | FPS uncapped |
-|---|---|---|
-| 1080p, FSR 3.1 Quality | 1280×720 | ~107 |
-| 1080p, MetalFX Quality | 1280×720 | ~106 |
-| 1080p native | 1920×1080 | ~94 |
-| 1440p native | 2560×1440 | ~66 |
+### Benchmarks: 0.4.0 → 0.5.0
 
-At the usual 60 FPS cap all of these hold a steady 60 with even frame pacing.
+Apple M4 Max (48 GB), frame rate uncapped, FPS while standing still (30 s), 2026-10-17/18. Each
+cell is mac-v0.4.0 (MoltenVK) → mac-v0.5.0 (native Metal); "Quality" upscales 1.5× (for example
+1280×720 → 1920×1080).
 
-Goals: M4 Max 1440p native and 4K upscaled at 60; base M5 1080p native; smaller Macs 1080p
-upscaled.
+| Scene | 1080p native | 1440p native | 1440p MetalFX Quality | 1440p TAA | 1080p FSR 3.1 Quality | 1440p FSR 3.1 Quality |
+|---|---|---|---|---|---|---|
+| Central Yharnam, first lamp | 97.5 → **97.7** | 66.2 → **75.1** | 95.1 → **95.7** | 61.9 → **69.9** | 117.0 → **119.5** | 95.6 → **98.0** |
+| Cathedral Ward | 103.2 → **104.8** | 72.0 → **82.7** | 99.5 → **102.3** | 67.0 → **78.3** | 122.0 → **126.6** | 98.8 → **108.6** |
+| Upper Cathedral Ward | 78.5 → **83.2** | 57.2 → **65.2** | 76.7 → **81.0** | 54.4 → **61.7** | 92.0 → **97.7** | 75.7 → **84.8** |
+| Hunter's Dream, headstone | 98.0 → **104.3** | 69.5 → **82.0** | 92.6 → **100.9** | 64.9 → **76.1** | 108.0 → **120.2** | 92.6 → **99.0** |
 
-### From 22 to 94 FPS
+0.5.0 is ahead in every case, by **12–18% at 1440p**. With the 60 FPS cap both hold a steady 60
+(every frame 16.7 ms). Uncapped, 0.5.0 occasionally has a single longer frame (20–40 ms) that
+0.4.0 does not; it does not occur with a frame cap (backlog).
+
+### From 22 to 120 FPS
 
 The first playable build (2026-10-11) ran the first level at **~22 FPS** at native 1080p. What
 got it to 60 and beyond, in order:
 
-| Change | Effect |
-|---|---|
-| **MetalFX temporal upscaling** (via `VK_EXT_metal_objects`) alongside FSR 3.1 | Render at 720p, upscale to 1080p: 22 → ~30 FPS at the time |
-| **Native arm64 GPU process.** The game still runs as x86-64 under Rosetta 2, but all rendering moved into a separate native `bbgpu-host` process sharing the game's memory (Mach memory entry, ring buffers, cross-process page-protection relays) | MoltenVK's Vulkan→Metal encoding costs **1.75× less CPU** natively; now the default |
-| **Tiny render area for passes with no output.** ~20 vertex-only passes per frame were tiled over a 16384×16384 area | 27.5 → 33.9 FPS in the city |
-| **Upload hoisting.** Buffer uploads recorded ahead of the submission instead of splitting render passes | 33.9 → 34.8 FPS, fewer G-buffer pass splits |
-| **Pipeline cache kept between sessions.** It was wiped every launch (~500 shader compiles each session; the "stutter when attacking") | 2 compiles per session instead of ~500 |
-| **No "precise" float math in pixel/compute shaders.** SPIR-V `NoContraction` became `[[clang::optnone]]` helper calls for every float operation in Metal (223 of 308 shaders) | City respawn spot **39 → 60 FPS**, GPU 19.6 → 12.1 ms per frame |
-| Shader permutation fix (Metal rejected ~6 pipelines per session, their draws vanished); unnamed pooled command buffers (MoltenVK labelled every encoder, ~4% CPU) | Correct image; less CPU per frame |
-| **Shaders compile on background threads** (4 low-priority threads). Option `shader_compile=wait` (brief hitch, complete image), `skip` (no hitch, an object may pop in) or `balanced` (default: waits up to 6 ms per frame, then skips) in `bbport.ini` and the in-game menu | Level load with an empty cache: render thread compile time 440 → 130 ms; worst frame 248 → 76 ms with `skip`. Walking into new areas with slow (cold) compiles: 15 frames frozen 120–190 ms with `wait`, one 41 ms frame with `balanced` |
-| **MoltenVK encodes while we record** (prefilled Metal command buffers) instead of encoding the whole frame inside the flip's submit (~13 ms) | Judder: late game frames **~6× fewer**; the "solid 60" feel |
-| **No Metal argument buffers in MoltenVK** (push descriptors bound directly; the tip came from [Huax-1839/bloodborne-macos](https://github.com/Huax-1839/bloodborne-macos)) | **+13–16%** everywhere: 1080p native 82 → 94, 1440p native 59 → 66 (above 60 for the first time), FSR/MetalFX 92 → 107 |
+| Version | Change | Effect |
+|---|---|---|
+| 0.3.0 | **MetalFX temporal upscaling** (via `VK_EXT_metal_objects`) alongside FSR 3.1 | Render at 720p, upscale to 1080p: 22 → ~30 FPS at the time |
+| 0.3.0 | **Native arm64 GPU process.** The game still runs as x86-64 under Rosetta 2, but all rendering moved into a separate native `bbgpu-host` process sharing the game's memory (Mach memory entry, ring buffers, cross-process page-protection relays) | MoltenVK's Vulkan→Metal encoding costs **1.75× less CPU** natively; now the default |
+| 0.3.0 | **Tiny render area for passes with no output.** ~20 vertex-only passes per frame were tiled over a 16384×16384 area | 27.5 → 33.9 FPS in the city |
+| 0.3.0 | **Upload hoisting.** Buffer uploads recorded ahead of the submission instead of splitting render passes | 33.9 → 34.8 FPS, fewer G-buffer pass splits |
+| 0.3.0 | **Pipeline cache kept between sessions.** It was wiped every launch (~500 shader compiles each session; the "stutter when attacking") | 2 compiles per session instead of ~500 |
+| 0.3.0 | **No "precise" float math in pixel/compute shaders.** SPIR-V `NoContraction` became `[[clang::optnone]]` helper calls for every float operation in Metal (223 of 308 shaders) | City respawn spot **39 → 60 FPS**, GPU 19.6 → 12.1 ms per frame |
+| 0.3.0 | Shader permutation fix (Metal rejected ~6 pipelines per session, their draws vanished); unnamed pooled command buffers (MoltenVK labelled every encoder, ~4% CPU) | Correct image; less CPU per frame |
+| 0.3.0 | **Shaders compile on background threads** (4 low-priority threads). Option `shader_compile=wait` (brief hitch, complete image), `skip` (no hitch, an object may pop in) or `balanced` (default: waits up to 6 ms per frame, then skips) in `bbport.ini` and the in-game menu | Level load with an empty cache: render thread compile time 440 → 130 ms; worst frame 248 → 76 ms with `skip`. Walking into new areas with slow (cold) compiles: 15 frames frozen 120–190 ms with `wait`, one 41 ms frame with `balanced` |
+| 0.3.1 | **MoltenVK encodes while we record** (prefilled Metal command buffers) instead of encoding the whole frame inside the flip's submit (~13 ms) | Judder: late game frames **~6× fewer**; the "solid 60" feel |
+| 0.3.3 | **No Metal argument buffers in MoltenVK** (push descriptors bound directly; the tip came from [Huax-1839/bloodborne-macos](https://github.com/Huax-1839/bloodborne-macos)) | **+13–16%** everywhere: 1080p native 82 → 94, 1440p native 59 → 66 (above 60 for the first time), FSR/MetalFX 92 → 107 |
+| 0.5.0 | **Native Metal renderer.** The video core encodes Metal directly (no Vulkan, no MoltenVK): untracked guest buffers with our own ordering, a pipeline archive kept between sessions, MetalFX on our own textures, FSR 3.1 through a Metal back end for AMD's FidelityFX interface | **1440p native 69.5 → 82.0**, FSR 3.1 Quality 1080p **108 → 120** (Hunter's Dream; table above) |
 
 Also fixed along the way: a MoltenVK crash from two threads sharing one command pool, and
 geometry corruption at 1440p (scenes above 1080p now use live resolution changes).
+
+### New in 0.5.0: native Metal
+
+- **A native Metal renderer replaces MoltenVK.** Faster in every scene and setting measured
+  (above), most at 1440p. MetalFX, FSR 3.1 (AMD's FidelityFX code on a Metal back end; its output
+  matches the Vulkan version bit for bit on test frames), TAA, FSR 1 (`BB_FSR1=1`), the settings
+  overlay and frame capture all run on it.
+- **Memory leak fixed (game process).** The game process grew about **4.5 GB per hour** of play
+  (2.5 → 6.2 GB in a 45-minute walk): freed small blocks of the runtime's allocator were filed
+  under the wrong size class. It now stays flat at about 2.5 GB.
+- **Macs with less memory** (thanks to [Noel Miller](https://github.com/noelmiller)): the GPU
+  memory arena is sized to the Mac (a quarter of its memory, 8 GiB minimum, 16 GiB at most);
+  a 16 GiB arena left the GPU waiting on a 36 GB Mac (~7 FPS). A rare freeze after long
+  sessions (two threads recording GPU commands at once) is fixed, touchpad touches behave like a
+  DualShock 4's, and a missing GPU hint no longer stops the game.
+- **Rendering fixes:** three full-screen passes that Metal refused are drawn (the light behind
+  the cage bars at the first lamp; the figure in the cage is back).
+- **Fallback:** if the GPU process cannot start, the game runs in one process on Metal (60 FPS
+  here).
 
 ### New in 0.4.0: the launcher
 
@@ -114,14 +139,16 @@ the log.
   floor), reported on an M4 Max and an M2 Pro; a relaunch brings it back. It coincided with the
   load race below, now fixed, so it may be gone: reports welcome.
 - **Occasional judder at a steady 60 FPS** (some game frames take 20–45 ms): much rarer since
-  2026-10-15 (about 6x fewer late frames), except with the MetalFX upscaler.
+  2026-10-15 (about 6x fewer late frames).
+- **Uncapped, an occasional single long frame** (20–40 ms) on the Metal renderer; capped play
+  (60/90/120) is not affected.
+- **macOS 27:** the GPU process cannot reserve its memory range yet, so the game runs in one
+  process (slower). A fix is in progress (#6, #7).
 
 ### What's next
 
-- **0.5.0: a full native Metal renderer.** The game's GPU commands go straight to Metal
-  instead of through Vulkan and MoltenVK. It is in development on a separate branch, where it
-  already matches or beats MoltenVK (96 vs 94 FPS at 1080p native) with MetalFX and FSR 3.1
-  working; 0.5.0 makes it complete and the default.
+- **0.5.1: cleanup.** MoltenVK, the Vulkan loader and the unused FSR 4 code leave the app
+  (smaller download); keyboard and mouse controls.
 - **Fewer Metal render passes.** Profiling found ~408 Metal encoders per frame (190 render
   passes). Each extra render pass costs ~13–16 µs of GPU time on Apple GPUs regardless of
   resolution — about 3 ms per frame — and leaves the GPU idle in periodic gaps. Merging passes
@@ -145,13 +172,12 @@ Details:
   PS4 libraries. macOS specifics: guest TLS via a reserved pthread TSD slot, guest-visible
   memory kept below 1 TiB, Mach-based thread inspection.
 - **GPU** (`gpu/`): the shadPS4 video core and shader recompiler, built as
-  `libbbgpu.dylib`, rendering through MoltenVK (Vulkan on Metal). By default it runs in
+  `libbbgpu.dylib`, rendering through native Metal (`renderer_metal/`). By default it runs in
   `bbgpu-host`, a **native arm64 process** that maps the game's memory at the same addresses
   (`host/`, `docs/DESIGN_NATIVE_GPU_PROCESS.md`); `BB_GPU_PROCESS=0` runs everything in one
   process.
-- **Metal features from inside the Vulkan renderer:** MetalFX temporal upscaling. Planned:
-  zero-copy guest memory on unified memory; native Metal only where profiling shows MoltenVK
-  overhead is the bottleneck.
+- **Upscalers:** MetalFX temporal upscaling, FSR 3.1 (AMD FidelityFX on a Metal back end,
+  `gpu/shim/ffx_metal/`) and TAA. Planned: zero-copy guest memory on unified memory.
 - Inherited from upstream: high-frame-rate community patches, synthetic motion vectors and
   temporal upscaling (FSR 3.1), a two-stage multi-threaded draw pipeline, and an in-game
   settings overlay (`⌘,` or `L3 + R3`).
