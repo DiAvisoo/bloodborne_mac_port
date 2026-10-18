@@ -534,6 +534,26 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 3. Mac GUI
 
+- **Mouse and keyboard support (user, 2026-10-18: "a couple of requests").** Today there is only
+  a keyboard fallback in `src/runtime_pad.c`, used when no gamepad is connected: fixed keys
+  mapped onto the DualShock 4 (WASD left stick, arrow keys the right stick *and* the d-pad, Space
+  Cross, LShift Circle, ...), digital stick values only, no mouse at all. Proper support:
+  - **Mouse look:** relative mouse motion (`SDL_SetWindowRelativeMouseMode`, captured while
+    playing, released by the overlay/⌘-Tab/menus) to the right stick, with sensitivity,
+    invert Y and smoothing; the stick is a rate, so motion per frame → deflection needs a curve
+    (and a dead-zone offset) to feel like a direct camera. Upstream bbport 0.5/0.6 has "mouse
+    look" (Strategy item 5) — check it before designing our own.
+  - **Mouse buttons:** left R1 (attack), right L1 (or R2), middle/wheel click R3 (lock on),
+    wheel up/down for the item/weapon d-pad slots.
+  - **Keyboard:** fix the arrow-key overlap (arrows are both camera and d-pad), analog-ish walk
+    (a walk modifier for half deflection), rebindable keys stored in `bbport.ini`, and keyboard
+    + mouse active alongside a connected gamepad (last device used wins).
+  - **Launcher:** a Controls page (bindings, sensitivity, invert); show the current layout.
+  - **On-screen prompts** stay PlayStation glyphs (the game has no keyboard glyphs); document
+    the default layout in the README.
+  - Split mode: mouse events live in the GPU host's window; extend the shared block's keyboard
+    bridge (`bbgpu_split_keyboard`) with mouse deltas and buttons.
+
 - **Launcher: warn when the frame cap is above the display's refresh** (`NSScreen
   .maximumFramesPerSecond`): a display set to 60 Hz silently holds 90/120 caps at 60 (2026-10-17).
 
