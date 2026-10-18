@@ -363,8 +363,27 @@ if (APPLE)
                                ${FFX_1_1_4_ROOT}/src/components)
     target_compile_options(ffx-metal-test PRIVATE -UNDEBUG)
     set_source_files_properties(../tests/test_ffx_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-    target_link_libraries(ffx-metal-test PRIVATE bbgpu "-framework Metal" "-framework Foundation")
+    # AMD's host code itself (Fsr3MatchesVulkan drives ffxFsr3UpscalerContextCreate/Dispatch);
+    # libbbgpu does not export it.
+    target_link_libraries(ffx-metal-test PRIVATE bbgpu ffx_fsr3_host "-framework Metal" "-framework Foundation")
     target_link_options(ffx-metal-test PRIVATE -Wl,-export_dynamic)
+    target_compile_definitions(ffx-metal-test PRIVATE
+        BB_FSR3_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/data/fsr3")
+    # The golden reference of Fsr3MatchesVulkan (tests/data/fsr3, checked in): the FSR-Vulkan
+    # submodule's portable wrapper on MoltenVK. One-shot, never part of bbgpu.
+    option(BB_FSR3_GOLDEN "Build fsr3-golden-vk (FSR 3 golden outputs through ffx-vulkan on MoltenVK)" OFF)
+    if (BB_FSR3_GOLDEN)
+        set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+        add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+        add_executable(fsr3-golden-vk EXCLUDE_FROM_ALL ../tests/fsr3_golden_vk.cpp)
+        target_include_directories(fsr3-golden-vk PRIVATE ../tests)
+        set(BB_MOLTENVK_ICD ${CMAKE_PREFIX_PATH})
+        list(GET BB_MOLTENVK_ICD 0 BB_MOLTENVK_ICD)
+        target_compile_definitions(fsr3-golden-vk PRIVATE
+            BB_MOLTENVK_ICD="${BB_MOLTENVK_ICD}/share/vulkan/icd.d/MoltenVK_icd.json")
+        target_link_libraries(fsr3-golden-vk PRIVATE ffx-vulkan::portable)
+    endif()
 endif()
 # These two run the TAA and camera motion kernels on Metal, recorded by the renderer's own
 # Taa::Record and CameraMotion::Record (M5 Tasks 7 and 5).
