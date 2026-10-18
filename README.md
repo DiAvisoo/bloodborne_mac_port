@@ -17,7 +17,7 @@ process.
 
 ## Status (2026-10-18)
 
-**Current version: [mac-v0.5.0](https://github.com/Wooloomooloo2/bloodborne_mac_port/releases/tag/mac-v0.5.0)** (download the app, or build it as below).
+**Current version: [mac-v0.5.1](https://github.com/Wooloomooloo2/bloodborne_mac_port/releases/tag/mac-v0.5.1)** (download the app, or build it as below).
 
 **Work in progress, playable.** On an Apple M4 Max the game boots, character creation works,
 saves load, and the game runs at a **locked 60 FPS** at 1080p and 1440p native, or upscaled with
@@ -65,6 +65,22 @@ got it to 60 and beyond, in order:
 
 Also fixed along the way: a MoltenVK crash from two threads sharing one command pool, and
 geometry corruption at 1440p (scenes above 1080p now use live resolution changes).
+
+### New in 0.5.1: fixes
+
+- **macOS 27: the GPU process works again** (thanks to [Noel Miller](https://github.com/noelmiller)).
+  On macOS 27 the system's memory allocator takes addresses in the range the GPU process needs
+  before the program starts, so it fell back to running the game in one process. A second build
+  of the GPU process (`bbgpu-host-macos27`) reserves the range when macOS loads it; the game
+  starts it on macOS 27 and later only (earlier versions keep the existing one).
+- **Typing your character's name works in full screen** (thanks to Noel Miller): a box over the
+  game shows the prompt and what you type. Backspace deletes, Enter confirms, Esc cancels; the
+  name is exactly what you typed (an empty or cancelled entry no longer becomes "Hunter").
+  Password fields show dots.
+- **A game folder without the game's data is refused with an explanation** instead of crashing
+  (exit code 139): the 1.09 update on its own is not enough, the folder needs the whole base game
+  with the update copied over it.
+- The log's `GPU arena:` line says what decided the arena's size.
 
 ### New in 0.5.0: native Metal
 
@@ -142,12 +158,12 @@ the log.
   2026-10-15 (about 6x fewer late frames).
 - **Uncapped, an occasional single long frame** (20–40 ms) on the Metal renderer; capped play
   (60/90/120) is not affected.
-- **macOS 27:** the GPU process cannot reserve its memory range yet, so the game runs in one
-  process (slower). A fix is in progress (#6, #7).
+- **Above 1080p, the selected item's icon in the HUD is missing** (an empty frame; #14). It is
+  there at 1080p.
 
 ### What's next
 
-- **0.5.1: cleanup.** MoltenVK, the Vulkan loader and the unused FSR 4 code leave the app
+- **0.5.2: cleanup.** MoltenVK, the Vulkan loader and the unused FSR 4 code leave the app
   (smaller download); keyboard and mouse controls.
 - **Fewer Metal render passes.** Profiling found ~408 Metal encoders per frame (190 render
   passes). Each extra render pass costs ~13–16 µs of GPU time on Apple GPUs regardless of
