@@ -83,42 +83,15 @@ FfxErrorCode DestroyBackendContext(FfxInterface* iface, FfxUInt32 effect_context
     if (effect_context_id >= backend.max_contexts || !backend.contexts[effect_context_id].active) {
         return FFX_ERROR_INVALID_ARGUMENT;
     }
+    ReleaseContext(backend, effect_context_id);
     backend.contexts[effect_context_id] = EffectContext{};
     --backend.ref_count;
     return FFX_OK;
 }
 
-// Resources (Task 2) and pipelines / jobs (Task 3) are not there yet.
+// Pipelines and compute jobs (Task 3) are not there yet; resources, clears and copies are in
+// ffx_metal_resources.mm.
 FfxErrorCode GetEffectGpuMemoryUsage(FfxInterface*, FfxUInt32, FfxEffectMemoryUsage*) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxErrorCode CreateResource(FfxInterface*, const FfxCreateResourceDescription*, FfxUInt32,
-                            FfxResourceInternal*) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxErrorCode RegisterResource(FfxInterface*, const FfxResource*, FfxUInt32, FfxResourceInternal*) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxResource GetResource(FfxInterface*, FfxResourceInternal) {
-    return FfxResource{};
-}
-FfxErrorCode UnregisterResources(FfxInterface*, FfxCommandList, FfxUInt32) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxErrorCode RegisterStaticResource(FfxInterface*, const FfxStaticResourceDescription*,
-                                    FfxUInt32) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxResourceDescription GetResourceDescription(FfxInterface*, FfxResourceInternal) {
-    return FfxResourceDescription{};
-}
-FfxErrorCode DestroyResource(FfxInterface*, FfxResourceInternal, FfxUInt32) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxErrorCode MapResource(FfxInterface*, FfxResourceInternal, void**) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxErrorCode UnmapResource(FfxInterface*, FfxResourceInternal) {
     return FFX_ERROR_BACKEND_API_ERROR;
 }
 FfxErrorCode StageConstantBufferData(FfxInterface*, void*, FfxUInt32, FfxConstantBuffer*) {
@@ -131,13 +104,6 @@ FfxErrorCode CreatePipeline(FfxInterface*, FfxEffect, FfxPass, uint32_t,
 FfxErrorCode DestroyPipeline(FfxInterface*, FfxPipelineState*, FfxUInt32) {
     return FFX_ERROR_BACKEND_API_ERROR;
 }
-FfxErrorCode ScheduleGpuJob(FfxInterface*, const FfxGpuJobDescription*) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxErrorCode ExecuteGpuJobs(FfxInterface*, FfxCommandList, FfxUInt32) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-
 } // namespace
 
 size_t ScratchSize(uint32_t max_contexts) {
@@ -161,20 +127,10 @@ FfxErrorCode GetInterface(FfxInterface* out, Metal::Device& device, void* scratc
     out->fpCreateBackendContext = CreateBackendContext;
     out->fpGetDeviceCapabilities = GetDeviceCapabilities;
     out->fpDestroyBackendContext = DestroyBackendContext;
-    out->fpCreateResource = CreateResource;
-    out->fpRegisterResource = RegisterResource;
-    out->fpGetResource = GetResource;
-    out->fpUnregisterResources = UnregisterResources;
-    out->fpRegisterStaticResource = RegisterStaticResource;
-    out->fpGetResourceDescription = GetResourceDescription;
-    out->fpDestroyResource = DestroyResource;
-    out->fpMapResource = MapResource;
-    out->fpUnmapResource = UnmapResource;
+    InstallResourceCallbacks(out);
     out->fpStageConstantBufferDataFunc = StageConstantBufferData;
     out->fpCreatePipeline = CreatePipeline;
     out->fpDestroyPipeline = DestroyPipeline;
-    out->fpScheduleGpuJob = ScheduleGpuJob;
-    out->fpExecuteGpuJobs = ExecuteGpuJobs;
     out->fpGetPermutationBlobByIndex = ffxGetPermutationBlobByIndex;
     // No breadcrumbs, frame generation swap chain or custom constant buffer allocator: FSR 3's
     // upscaler does not call them.

@@ -21,6 +21,7 @@ struct TextureDesc {
     u32 width{1}, height{1}, depth{1}, levels{1}, layers{1}, samples{1};
     bool render_target{}; ///< MTLTextureUsageRenderTarget
     bool shader_write{};  ///< MTLTextureUsageShaderWrite
+    bool shader_atomic{}; ///< MTLTextureUsageShaderAtomic (atomics on r32 integer textures)
     bool format_views{};  ///< MTLTextureUsagePixelFormatView (views with another pixel format)
 };
 

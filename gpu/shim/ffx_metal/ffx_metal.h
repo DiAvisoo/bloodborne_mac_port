@@ -47,4 +47,15 @@ void* PipelineFor(Metal::Device& device, const FfxShaderBlob& blob, std::string*
 /// Pipelines compiled by PipelineFor so far (cache misses), for tests.
 uint32_t PipelineCompileCount();
 
+/// The MTLPixelFormat (its numeric value; 0, MTLPixelFormatInvalid, for formats FSR 3 does not
+/// use: typeless, 3-channel, ...) of an FFX surface format.
+uint32_t PixelFormat(FfxSurfaceFormat format);
+
+/// Describes `texture` (id<MTLTexture>, unretained) for fpRegisterResource: a 2D texture of its
+/// format, size and mip count with `usage`. A null texture gives a null FfxResource.
+FfxResource Resource(void* texture, FfxResourceUsage usage, const wchar_t* name);
+
+/// Bytes of the textures the back end holds (created and not yet destroyed), for tests.
+uint64_t LiveTextureBytes();
+
 } // namespace FfxMetal

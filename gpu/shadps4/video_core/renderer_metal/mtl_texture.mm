@@ -132,6 +132,9 @@ Object CreateTexture(Device& device, const TextureDesc& desc, std::string_view l
     if (desc.shader_write) {
         usage |= MTLTextureUsageShaderWrite;
     }
+    if (desc.shader_atomic) {
+        usage |= MTLTextureUsageShaderAtomic;
+    }
     if (desc.format_views) {
         usage |= MTLTextureUsagePixelFormatView;
     }
