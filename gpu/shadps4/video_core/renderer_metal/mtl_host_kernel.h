@@ -15,6 +15,7 @@
 namespace Metal {
 
 class Device;
+class ShaderCompiler;
 
 struct HostKernel {
     Object pipeline;                  ///< id<MTLComputePipelineState>
@@ -30,6 +31,10 @@ struct HostKernel {
 /// Asserts when the kernel does not compile (a host kernel is part of the renderer).
 HostKernel BuildHostKernel(Device& device, std::span<const u32> spirv,
                            std::span<const SpecConstant> constants, std::string_view name);
+
+/// The one compiler of the process' host kernels (also AMD's FidelityFX blobs, shim/ffx_metal),
+/// with the host kernel MSL disk cache. One Metal device only (asserted).
+ShaderCompiler& HostKernelCompiler(Device& device);
 
 /// The MSL disk cache directory of host kernels, instead of ShaderCompiler::DefaultCacheDir()
 /// (which needs the game's ElfInfo): for tests. Call before the first BuildHostKernel.

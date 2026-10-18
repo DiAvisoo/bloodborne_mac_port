@@ -89,11 +89,6 @@ find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 
-# bbport: FSR 3.1 temporal upscaling / frame generation, native Vulkan (MIT, FireBurn/FSR-Vulkan).
-set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
-
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
 set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
 set(SHADER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/include)
@@ -282,13 +277,35 @@ if (APPLE)
     endforeach()
     target_link_libraries(bbgpu PRIVATE spirv-cross-msl spirv-cross-glsl spirv-cross-core)
     target_compile_definitions(bbgpu PRIVATE BB_METAL_BACKEND=1)
+    # FSR 3.1 (Metal-native M6): AMD's FidelityFX SDK 1.1.4 host code and SPIR-V blobs (MIT),
+    # straight from the FSR-Vulkan submodule (patched per its UPSTREAM.md; its own CMake targets
+    # are not built), behind our Metal FfxInterface back end (shim/ffx_metal).
+    set(FFX_1_1_4_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/upstream/ffx-1.1.4/sdk)
+    set(FFX_1_1_4_INCLUDE ${FFX_1_1_4_ROOT}/include)
+    add_library(ffx_fsr3_host STATIC
+        ${FFX_1_1_4_ROOT}/src/shared/ffx_assert.cpp
+        ${FFX_1_1_4_ROOT}/src/shared/ffx_message.cpp
+        ${FFX_1_1_4_ROOT}/src/shared/ffx_object_management.cpp
+        ${FFX_1_1_4_ROOT}/src/components/fsr3upscaler/ffx_fsr3upscaler.cpp
+        ${FFX_1_1_4_ROOT}/src/backends/shared/ffx_shader_blobs.cpp
+        ${FFX_1_1_4_ROOT}/src/backends/shared/blob_accessors/ffx_fsr3upscaler_shaderblobs.cpp)
+    set_target_properties(ffx_fsr3_host PROPERTIES CXX_STANDARD 17 CXX_EXTENSIONS NO
+                          POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(ffx_fsr3_host PRIVATE FFX_FSR3UPSCALER=1)
+    target_include_directories(ffx_fsr3_host PUBLIC ${FFX_1_1_4_INCLUDE}
+        PRIVATE ${FFX_1_1_4_ROOT}/src/shared ${FFX_1_1_4_ROOT}/src/components
+                ${FFX_1_1_4_ROOT}/src/backends/shared ${FFX_1_1_4_ROOT}/src/backends/shared/blob_accessors
+                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/generated/ffx-1.1.4/vk/fsr3upscaler)
+    target_compile_options(ffx_fsr3_host PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/src/ffx_1_1_4_portability.hpp)
+    target_sources(bbgpu PRIVATE shim/ffx_metal/ffx_metal.mm)
+    set_source_files_properties(shim/ffx_metal/ffx_metal.mm PROPERTIES COMPILE_OPTIONS
+        "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
+    target_include_directories(bbgpu PRIVATE ${FFX_1_1_4_ROOT}/src/backends/shared)
+    target_link_libraries(bbgpu PRIVATE ffx_fsr3_host)
 else()
     # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
-endif()
-if (NOT BB_METAL_NATIVE_STAGE LESS 6)
-    # FSR 3.1 on Vulkan: not below stage 6 (M6 brings it back through ffx_metal); FSR 4 is gone.
-    target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable)
 endif()
 if (APPLE)
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
@@ -339,6 +356,15 @@ if (APPLE)
     set_source_files_properties(../tests/test_mtl_overlay.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(overlay-test PRIVATE bbgpu "-framework Metal" "-framework Foundation")
     target_link_options(overlay-test PRIVATE -Wl,-export_dynamic)
+    # Metal-native M6: every FSR 3.1 blob through the FidelityFX Metal back end to a compute
+    # pipeline.
+    add_executable(ffx-metal-test EXCLUDE_FROM_ALL ../tests/test_ffx_metal.mm ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(ffx-metal-test PRIVATE shim shadps4 ${FFX_1_1_4_INCLUDE}
+                               ${FFX_1_1_4_ROOT}/src/components)
+    target_compile_options(ffx-metal-test PRIVATE -UNDEBUG)
+    set_source_files_properties(../tests/test_ffx_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(ffx-metal-test PRIVATE bbgpu "-framework Metal" "-framework Foundation")
+    target_link_options(ffx-metal-test PRIVATE -Wl,-export_dynamic)
 endif()
 # These two run the TAA and camera motion kernels on Metal, recorded by the renderer's own
 # Taa::Record and CameraMotion::Record (M5 Tasks 7 and 5).

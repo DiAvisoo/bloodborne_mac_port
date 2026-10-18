@@ -23,10 +23,12 @@ std::filesystem::path& CacheDirOverride() {
     return dir;
 }
 
+} // namespace
+
 /// One compiler for every host kernel of the process, with the GPU shader cache directory
 /// (<user>/cache/<title>/metal, ShaderCompiler::DefaultCacheDir; SetHostKernelCacheDir) as its
 /// MSL disk cache.
-ShaderCompiler& HostCompiler(Device& device) {
+ShaderCompiler& HostKernelCompiler(Device& device) {
     static std::mutex mutex;
     static std::unique_ptr<ShaderCompiler> compiler;
     static Device* owner = nullptr;
@@ -39,8 +41,6 @@ ShaderCompiler& HostCompiler(Device& device) {
     return *compiler;
 }
 
-} // namespace
-
 void SetHostKernelCacheDir(std::filesystem::path dir) {
     CacheDirOverride() = std::move(dir);
 }
@@ -49,7 +49,7 @@ HostKernel BuildHostKernel(Device& device, std::span<const u32> spirv,
                            std::span<const SpecConstant> constants, std::string_view name) {
     const std::vector<u32> specialized = Specialize(spirv, constants);
     const u64 hash = XXH3_64bits(specialized.data(), specialized.size() * sizeof(u32));
-    const CompileResult result = HostCompiler(device).Compile(specialized, hash, name);
+    const CompileResult result = HostKernelCompiler(device).Compile(specialized, hash, name);
     ASSERT_MSG(result.status == CompileStatus::Ok && result.shader,
                "Host kernel {} did not compile: {}", name, result.error);
     const CompiledShader& shader = *result.shader;

@@ -176,6 +176,12 @@ if [[ ${1:-} == --test ]]; then
         ninja -C out/gpu-arm64 host-kernel-test >/dev/null
         out/gpu-arm64/host-kernel-test
         MTL_DEBUG_LAYER=1 out/gpu-arm64/host-kernel-test 2>&1 | grep -E 'PASS|FAIL' || { echo 'FAIL: host-kernel-test (validation)'; exit 1; }
+        # Metal-native M6: every FSR 3.1 blob compiles to a Metal compute pipeline through the
+        # FidelityFX Metal back end, plain and under validation.
+        ninja -C out/gpu-arm64 ffx-metal-test >/dev/null
+        out/gpu-arm64/ffx-metal-test || { echo 'FAIL: ffx-metal-test'; exit 1; }
+        MTL_DEBUG_LAYER=1 out/gpu-arm64/ffx-metal-test 2>&1 | grep -E '^(PASS|FAIL)'
+        [[ ${PIPESTATUS[0]} == 0 ]] || { echo 'FAIL: ffx-metal-test (validation)'; exit 1; }
         # Metal-native M5: the settings overlay (ImGui's Metal backend) into an offscreen BGRA8
         # target, plain and under validation.
         ninja -C out/gpu-arm64 overlay-test >/dev/null
