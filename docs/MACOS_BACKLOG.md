@@ -383,6 +383,11 @@ Each item: what was done for now, what the refinement is, and where it lives.
   not scale with pixels. ~350 encoders and ~2000-2400 fence waits per frame, ~120 inline
   copy-shader copies ending render passes. Fewer encoders (hoist or batch the copy-shader copies,
   merge compute dispatches into one encoder) is the lever; at 1440p we already win by 12-18%.
+  Deferred by the user (2026-10-18): an efficiency gain, not on the critical path to full Metal
+  rendering. Worth it for energy: the user plays at a 60 cap to save power, and this cost is paid
+  every frame there too, so measure power at the 60 cap (both builds) before and after. The
+  proper fix may need buffer renaming (copy into a fresh buffer instead of reusing one), so the
+  copy-shader copies stop forcing encoder splits and fence waits.
 - **A 1080p R32F image re-detiled every frame (9.4 MB; shared texture-cache code).** The GPU
   writes its memory through a buffer, which marks the image GPU-dirty, and each use detiles it
   from the arena again (`BB_LOG_UPLOAD_MB=5`). Keep the image in sync with the buffer write
