@@ -209,6 +209,15 @@ PsoCache::PsoCache(Device& device_, std::filesystem::path cache_dir)
     }
     archive_path = cache_dir / "pipelines.binaryarchive";
 
+    // MTL_SHADER_VALIDATION=1: the GPU validation device crashes loading a binary archive
+    // (macOS 26.6, -[MTLGPUDebugDevice newBinaryArchiveWithDescriptor:], null dereference in
+    // MTLMetalScriptBuilder::initFromScript); its instrumented pipelines don't belong in the
+    // archive either. Compile without one.
+    if (const char* env = std::getenv("MTL_SHADER_VALIDATION"); env && env[0] == '1') {
+        LOG_WARNING(Render, "Metal binary archive off under MTL_SHADER_VALIDATION");
+        return;
+    }
+
     @autoreleasepool {
         std::error_code ec;
         std::filesystem::create_directories(cache_dir, ec);
