@@ -177,7 +177,8 @@ if [[ ${1:-} == --test ]]; then
         out/gpu-arm64/host-kernel-test
         MTL_DEBUG_LAYER=1 out/gpu-arm64/host-kernel-test 2>&1 | grep -E 'PASS|FAIL' || { echo 'FAIL: host-kernel-test (validation)'; exit 1; }
         # Metal-native M6: every FSR 3.1 blob compiles to a Metal compute pipeline through the
-        # FidelityFX Metal back end, plain and under validation.
+        # FidelityFX Metal back end, and FSR 3 on it matches the Vulkan path's golden outputs
+        # (tests/data/fsr3), plain and under validation.
         ninja -C out/gpu-arm64 ffx-metal-test >/dev/null
         out/gpu-arm64/ffx-metal-test || { echo 'FAIL: ffx-metal-test'; exit 1; }
         MTL_DEBUG_LAYER=1 out/gpu-arm64/ffx-metal-test 2>&1 | grep -E '^(PASS|FAIL)'

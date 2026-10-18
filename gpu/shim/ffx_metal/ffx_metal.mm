@@ -89,19 +89,9 @@ FfxErrorCode DestroyBackendContext(FfxInterface* iface, FfxUInt32 effect_context
     return FFX_OK;
 }
 
-// Pipelines and compute jobs (Task 3) are not there yet; resources, clears and copies are in
-// ffx_metal_resources.mm.
+// Resources, clears and copies are in ffx_metal_resources.mm, pipelines and compute jobs in
+// ffx_metal_compute.mm. No memory usage report (the upscaler only reads it on request).
 FfxErrorCode GetEffectGpuMemoryUsage(FfxInterface*, FfxUInt32, FfxEffectMemoryUsage*) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxErrorCode StageConstantBufferData(FfxInterface*, void*, FfxUInt32, FfxConstantBuffer*) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxErrorCode CreatePipeline(FfxInterface*, FfxEffect, FfxPass, uint32_t,
-                            const FfxPipelineDescription*, FfxUInt32, FfxPipelineState*) {
-    return FFX_ERROR_BACKEND_API_ERROR;
-}
-FfxErrorCode DestroyPipeline(FfxInterface*, FfxPipelineState*, FfxUInt32) {
     return FFX_ERROR_BACKEND_API_ERROR;
 }
 } // namespace
@@ -128,9 +118,7 @@ FfxErrorCode GetInterface(FfxInterface* out, Metal::Device& device, void* scratc
     out->fpGetDeviceCapabilities = GetDeviceCapabilities;
     out->fpDestroyBackendContext = DestroyBackendContext;
     InstallResourceCallbacks(out);
-    out->fpStageConstantBufferDataFunc = StageConstantBufferData;
-    out->fpCreatePipeline = CreatePipeline;
-    out->fpDestroyPipeline = DestroyPipeline;
+    InstallComputeCallbacks(out);
     out->fpGetPermutationBlobByIndex = ffxGetPermutationBlobByIndex;
     // No breadcrumbs, frame generation swap chain or custom constant buffer allocator: FSR 3's
     // upscaler does not call them.
@@ -217,6 +205,12 @@ const Pipeline* PipelineInfoFor(Metal::Device& device, const FfxShaderBlob& blob
     entry->pipeline = Metal::Object::Adopt((__bridge_retained void*)pipeline);
     entry->shader = std::move(result.shader);
     entry->info = Pipeline{.pipeline = entry->pipeline.Get(), .shader = entry->shader.get()};
+    for (uint32_t i = 0; i < kSamplerCount; ++i) {
+        if (const Metal::ShaderBinding* binding = entry->shader->Find(
+                0, kSamplerBindingBase + i, Metal::ShaderBinding::Kind::Sampler)) {
+            entry->info.sampler_slots[i] = int32_t(binding->msl_index);
+        }
+    }
     const Pipeline* info = &entry->info;
     entries.emplace(blob.data, std::move(entry));
     return info;

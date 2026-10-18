@@ -298,8 +298,10 @@ if (APPLE)
                 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/generated/ffx-1.1.4/vk/fsr3upscaler)
     target_compile_options(ffx_fsr3_host PRIVATE
         -include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/src/ffx_1_1_4_portability.hpp)
-    target_sources(bbgpu PRIVATE shim/ffx_metal/ffx_metal.mm shim/ffx_metal/ffx_metal_resources.mm)
-    set_source_files_properties(shim/ffx_metal/ffx_metal.mm shim/ffx_metal/ffx_metal_resources.mm PROPERTIES COMPILE_OPTIONS
+    target_sources(bbgpu PRIVATE shim/ffx_metal/ffx_metal.mm shim/ffx_metal/ffx_metal_resources.mm
+        shim/ffx_metal/ffx_metal_compute.mm)
+    set_source_files_properties(shim/ffx_metal/ffx_metal.mm shim/ffx_metal/ffx_metal_resources.mm
+        shim/ffx_metal/ffx_metal_compute.mm PROPERTIES COMPILE_OPTIONS
         "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
     target_include_directories(bbgpu PRIVATE ${FFX_1_1_4_ROOT}/src/backends/shared)
     target_link_libraries(bbgpu PRIVATE ffx_fsr3_host)

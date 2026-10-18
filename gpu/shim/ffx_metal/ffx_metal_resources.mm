@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: the FidelityFX Metal back end's resources, clears and copies (Metal-native M6). Mirrors
-// ffx_vk.cpp's split: effect-owned resources are created once (fpCreateResource), the caller's
-// textures are registered per dispatch and dropped by fpUnregisterResources. Every texture is a
-// private MTLTexture with render target and shader write usage (clears are render passes, UAVs
-// are storage views); resource states are ignored (barriers are no-ops, decision 3 of the plan).
+// bbport: the FidelityFX Metal back end's resources, clears, copies and job queue (Metal-native
+// M6). Mirrors ffx_vk.cpp's split: effect-owned resources are created once (fpCreateResource),
+// the caller's textures are registered per dispatch and dropped by fpUnregisterResources. Every
+// texture is a private MTLTexture with render target and shader write usage (clears are render
+// passes, UAVs are storage views); resource states are ignored (barriers are no-ops, decision 3 of
+// the plan). Compute jobs are encoded by ffx_metal_compute.mm.
 
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstring>
@@ -58,6 +60,22 @@ constexpr FormatPair kFormats[] = {
     {FFX_SURFACE_FORMAT_R9G9B9E5_SHAREDEXP, MTLPixelFormatRGB9E5Float},
 };
 
+// The integer formats of kFormats.
+bool IsIntegerFormat(MTLPixelFormat format) {
+    switch (format) {
+    case MTLPixelFormatRGBA32Uint:
+    case MTLPixelFormatR8Uint:
+    case MTLPixelFormatR32Uint:
+    case MTLPixelFormatRG16Uint:
+    case MTLPixelFormatRG16Sint:
+    case MTLPixelFormatR16Uint:
+    case MTLPixelFormatRG8Uint:
+        return true;
+    default:
+        return false;
+    }
+}
+
 FfxSurfaceFormat SurfaceFormat(uint32_t metal_format) {
     for (const FormatPair& pair : kFormats) {
         if (uint32_t(pair.metal) == metal_format) {
@@ -65,14 +83,6 @@ FfxSurfaceFormat SurfaceFormat(uint32_t metal_format) {
         }
     }
     return FFX_SURFACE_FORMAT_UNKNOWN;
-}
-
-std::string Narrow(const wchar_t* name) {
-    std::string out;
-    for (; name && *name; ++name) {
-        out.push_back(*name < 0x80 ? char(*name) : '?');
-    }
-    return out;
 }
 
 uint32_t MipCount(const FfxResourceDescription& description) {
@@ -108,6 +118,9 @@ Slot* Find(State& state, FfxResourceInternal resource) {
 // (fpDestroyResource, fpDestroyBackendContext), the caller guarantees an idle GPU.
 void FreeSlot(State& state, uint32_t index, Metal::Encoder* encoder = nullptr) {
     Slot& slot = state.resources[index];
+    if (slot.texture) {
+        live_texture_bytes.fetch_sub(slot.bytes, std::memory_order_relaxed);
+    }
     if (encoder) {
         for (Metal::Object& view : slot.mip_views) {
             if (view) {
@@ -117,9 +130,6 @@ void FreeSlot(State& state, uint32_t index, Metal::Encoder* encoder = nullptr) {
         if (slot.texture) {
             encoder->KeepAlive(std::move(slot.texture));
         }
-    }
-    if (slot.texture) {
-        live_texture_bytes.fetch_sub(slot.bytes, std::memory_order_relaxed);
     }
     std::erase(state.pending_uploads, index);
     slot = Slot{};
@@ -310,23 +320,35 @@ FfxErrorCode ScheduleGpuJob(FfxInterface* iface, const FfxGpuJobDescription* job
     case FFX_GPU_JOB_COPY:
     case FFX_GPU_JOB_BARRIER:
     case FFX_GPU_JOB_DISCARD:
+    case FFX_GPU_JOB_COMPUTE:
         StateOf(Backend(iface)).jobs.push_back(*job);
         return FFX_OK;
-    default: // compute: Task 3
+    default:
         return FFX_ERROR_BACKEND_API_ERROR;
     }
 }
 
 // The jobs cover whole resources (the SDK has no mip or region selector for them): a clear
 // fills every mip, a copy copies every mip both resources share.
+// An integer target takes the bits of the float colour, as ffx_vk.cpp's VkClearColorValue union
+// does: FSR clears its reconstructed depth (R32_UINT, asuint(depth)) with 1.0f, i.e. 0x3f800000.
 void ClearTexture(Metal::Encoder& encoder, const Slot& target, const float color[4]) {
+    std::array<double, 4> value{color[0], color[1], color[2], color[3]};
+    const MTLPixelFormat format = MTLPixelFormat(PixelFormat(target.description.format));
+    if (IsIntegerFormat(format)) {
+        const bool is_signed = format == MTLPixelFormatRG16Sint;
+        for (int i = 0; i < 4; ++i) {
+            value[i] = is_signed ? double(std::bit_cast<int32_t>(color[i]))
+                                 : double(std::bit_cast<uint32_t>(color[i]));
+        }
+    }
     for (uint32_t mip = 0; mip < target.description.mipCount; ++mip) {
         Metal::RenderPassDesc pass;
         Metal::ColorAttachment& attachment = pass.colors[0];
         attachment.texture = target.handle;
         attachment.level = mip;
         attachment.clear = true;
-        attachment.clear_color = {color[0], color[1], color[2], color[3]};
+        attachment.clear_color = {value[0], value[1], value[2], value[3]};
         encoder.BeginRenderPass(pass);
         encoder.EndRenderPass();
     }
@@ -367,7 +389,7 @@ FfxErrorCode ExecuteGpuJobs(FfxInterface* iface, FfxCommandList command_list, Ff
     UploadInitData(encoder, state);
 
     FfxErrorCode result = FFX_OK;
-    // A copy of the list: Task 3's compute jobs reach back into the interface.
+    // A copy of the list: compute jobs reach back into the interface.
     std::vector<FfxGpuJobDescription> jobs = std::move(state.jobs);
     state.jobs.clear();
     for (const FfxGpuJobDescription& job : jobs) {
@@ -391,6 +413,12 @@ FfxErrorCode ExecuteGpuJobs(FfxInterface* iface, FfxCommandList command_list, Ff
             CopyTexture(encoder, *src, *dst);
             break;
         }
+        case FFX_GPU_JOB_COMPUTE:
+            if (const FfxErrorCode code = ExecuteComputeJob(*iface, encoder, job.computeJobDescriptor);
+                code != FFX_OK) {
+                result = code;
+            }
+            break;
         case FFX_GPU_JOB_BARRIER: // hazard tracking orders the jobs (decision 3)
         case FFX_GPU_JOB_DISCARD:
             break;
@@ -474,6 +502,15 @@ void ReleaseContext(BackendContext& backend, uint32_t context) {
         delete backend.state;
         backend.state = nullptr;
     }
+}
+
+void* BindingTexture(FfxInterface& iface, FfxResourceInternal resource, uint32_t mip) {
+    Slot* slot = Find(StateOf(Backend(&iface)), resource);
+    if (!slot || slot->mip_views.empty()) {
+        return nullptr;
+    }
+    mip = std::min(mip, uint32_t(slot->mip_views.size() - 1));
+    return mip == 0 ? slot->handle : StorageView(iface, resource, mip);
 }
 
 void* StorageView(FfxInterface& iface, FfxResourceInternal resource, uint32_t mip) {

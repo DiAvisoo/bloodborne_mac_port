@@ -15,6 +15,7 @@
 
 namespace Metal {
 struct CompiledShader;
+class Encoder;
 }
 
 namespace FfxMetal {
@@ -42,11 +43,17 @@ inline BackendContext& Backend(FfxInterface* iface) {
     return *static_cast<BackendContext*>(iface->scratchBuffer);
 }
 
+/// FFX's static samplers: bindings 1000 + index (s_PointClamp, s_LinearClamp) in set 0.
+enum SamplerIndex : uint32_t { kPointClamp, kLinearClamp, kSamplerCount };
+constexpr uint32_t kSamplerBindingBase = 1000;
+
 /// A compiled FFX blob: the compute pipeline and its shader's reflection (MSL slots of the
 /// blob's (set, binding) pairs, threads per threadgroup). Owned by the per-device cache.
 struct Pipeline {
     void* pipeline{};                       ///< id<MTLComputePipelineState>, unretained
     const Metal::CompiledShader* shader{};
+    /// MSL sampler slot of each SamplerIndex, -1 when the shader does not use it.
+    int32_t sampler_slots[kSamplerCount]{-1, -1};
 };
 
 /// PipelineFor with the reflection; null on failure (cause in `error`).
@@ -77,6 +84,11 @@ struct State {
     std::vector<uint32_t> free_slots;
     std::vector<uint32_t> pending_uploads; ///< owned resources with `staging`
     std::vector<FfxGpuJobDescription> jobs;
+    /// Staged constant buffers (fpStageConstantBufferDataFunc): read by the compute jobs of the
+    /// same fpExecuteGpuJobs (Encoder::SetBytes copies them), so a ring as in ffx_vk.cpp.
+    std::unique_ptr<uint8_t[]> constant_ring;
+    uint32_t constant_offset{};
+    Metal::Object samplers[kSamplerCount]; ///< id<MTLSamplerState>, made with the first pipeline
     State() : resources(1) {}
 };
 
@@ -86,6 +98,22 @@ State& StateOf(BackendContext& backend);
 /// Sets the resource and job callbacks (ffx_metal_resources.mm) on `iface`.
 void InstallResourceCallbacks(FfxInterface* iface);
 
+/// Sets the pipeline and constant buffer callbacks (ffx_metal_compute.mm) on `iface`.
+void InstallComputeCallbacks(FfxInterface* iface);
+
+/// Encodes one FFX_GPU_JOB_COMPUTE job (ffx_metal_compute.mm).
+FfxErrorCode ExecuteComputeJob(FfxInterface& iface, Metal::Encoder& encoder,
+                               const FfxComputeJobDescription& job);
+
+/// An FFX (UTF-16/32) name as ASCII, for labels and logs.
+inline std::string Narrow(const wchar_t* name) {
+    std::string out;
+    for (; name && *name; ++name) {
+        out.push_back(*name < 0x80 ? char(*name) : '?');
+    }
+    return out;
+}
+
 /// Releases the resources of effect context `context` (all of them when the last context goes:
 /// the state is deleted).
 void ReleaseContext(BackendContext& backend, uint32_t context);
@@ -94,5 +122,10 @@ void ReleaseContext(BackendContext& backend, uint32_t context);
 /// mip), made on first use and kept with the resource; null for a null resource or a mip past
 /// the texture's.
 void* StorageView(FfxInterface& iface, FfxResourceInternal resource, uint32_t mip);
+
+/// What a compute job binds for `resource` at `mip` (clamped to its last mip, as ffx_vk.cpp
+/// does): the texture itself for mip 0 (SRVs, and UAV writes land on level 0), else its
+/// StorageView. Null for the null resource.
+void* BindingTexture(FfxInterface& iface, FfxResourceInternal resource, uint32_t mip);
 
 } // namespace FfxMetal
