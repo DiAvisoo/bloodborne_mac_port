@@ -1293,3 +1293,40 @@ bottom once it reaches the top of the low range.
 After the fix: 2.48 -> 2.54 GB over 6 minutes (Metal-native), every class balanced (created =
 live + listed); 0.4.x with the same fix 2.48 -> 2.73 GB, flat after the third minute. The fix
 for 0.4.x is on branch `fix/low-alloc-free-list` (from origin/master, not merged).
+
+## 2026-10-18: Metal-native M6, FSR 3.1 on Metal (gate) and 0.5.0 release checks
+
+FSR 3.1 runs through `gpu/shim/ffx_metal/`, a Metal back end for AMD's `FfxInterface` (SDK 1.1.4
+host code and SPIR-V blobs from the fsr-vulkan submodule, compiled to MSL by our compiler). On
+synthetic frames (`tests/fsr3_synthetic.h`, golden data from the Vulkan path on MoltenVK in
+`tests/data/fsr3/`) the Metal output is **bit-identical** to Vulkan's (HDR + auto exposure,
+an odd 171x96 render size, a reset at frame 5). Two back-end bugs found that way: R32_UINT clears
+must store the float's bits (FSR clears depth with 1.0f), and constant buffers must be padded to
+the shader's size (148 -> 160 bytes, debug layer).
+
+Uncapped (Immediate, 480 Hz vblank), stand 30 s, M4 Max 48 GB, arena 12 GiB on both builds (the
+memory-sized default from PR #7's arena commit), FSR 3.1 Quality, 0.4.x (`master`, MoltenVK) vs
+Metal-native:
+
+| Scene | 1080p | 1440p |
+|---|---|---|
+| cages (Central Yharnam lamp) | 117.0 / **119.5** | 95.6 / **98.0** |
+| livecopy (Cathedral Ward) | 122.0 / **126.6** | 98.8 / **108.6** |
+| dense (Upper Cathedral Ward) | 92.0 / **97.7** | 75.7 / **84.8** |
+| loadcrash (Hunter's Dream headstone) | 108.0 / **120.2** | 92.6 / **99.0** |
+
+Gate "≥ 107 FPS at 1080p Quality" (measured at the headstone): 120.2. Worst frame per 5 s
+window is higher uncapped on Metal (21-42 ms vs 12-17 ms): the known long single GPU frames
+(backlog), not seen capped. `BB_FFX_FP16=0` (fp32 blobs): 121.8 vs 119.5 (one run each, within
+noise). Pictures at cages and livecopy, 1080p and 1440p (0.4.x by window capture): same
+image, the caged figure drawn. `MTL_DEBUG_LAYER=1` (errors to the log) at cages, livecopy and
+the headstone with FSR Quality: no validation messages. 15-minute walk at a 60 cap, 1080p FSR
+Quality: 60.0 FPS mean (min 58.8), no errors, the game reached 4.5 GiB of the 12 GiB arena,
+game process 2.5 GB at the end (flat), GPU process 5.5 GB.
+
+Single process (`BB_GPU_PROCESS=0`, the macOS 27 fallback until the reservation fix): the Metal
+renderer runs in the x86-64 game process at a steady 60.0 FPS (every frame 16.7 ms), game
+process 9.0 GB.
+
+Not measured: the in-game preset switch (Quality -> Performance -> Native AA); the wrapper test
+shows a size change recompiles no pipeline.
