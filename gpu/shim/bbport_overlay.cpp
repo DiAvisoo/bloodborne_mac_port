@@ -187,8 +187,6 @@ void Store(std::atomic<T>& target, T value, bool changed) {
     }
 }
 
-constexpr const char* kFsr3Later = "FSR 3.1 returns with the Metal renderer in a later 0.5 update.";
-
 // ---------------------------------------------------------------------------------------------
 // Look: a macOS dark-mode settings panel. Grouped rows on lighter cards, system-blue accent for
 // whatever is selected or on, orange only for "needs a restart". Sizes below are at 1080p and
@@ -643,8 +641,7 @@ void DisplayTab(BbSettings::Values& s) {
     for (int i = 0; i < choice_count; ++i) {
         available[i] = BbSettings::UpscalerAvailable(choices[i]);
         if (!available[i]) {
-            tips[i] = choices[i] == BbSettings::UpscalerFsr3 ? kFsr3Later
-                                                             : "Not supported by this GPU";
+            tips[i] = "Not supported by this GPU";
         }
     }
     const int upscaler = s.upscaler;
@@ -672,15 +669,15 @@ void DisplayTab(BbSettings::Values& s) {
     }
     HintBelow(about[current]);
     for (int i = 0; i < choice_count; ++i) {
-        if (!available[i] && choices[i] != BbSettings::UpscalerFsr3) {
+        if (!available[i]) {
             char line[96];
             std::snprintf(line, sizeof(line), "Not available on this GPU: %s", labels[i]);
             Note(line);
         }
     }
     if (requested != upscaler) {
-        // The saved choice cannot run here (FSR 3.1 until its Metal port, the removed FSR 4,
-        // MetalFX without a scaler): say what runs instead; the ini keeps the choice.
+        // The saved choice cannot run here (FSR 3.1 below Apple7, the removed FSR 4, MetalFX
+        // without a scaler): say what runs instead; the ini keeps the choice.
         char text[256];
         std::snprintf(text, sizeof(text),
                       "%s from your settings is not available%s; %s runs instead. Your choice "
@@ -689,14 +686,9 @@ void DisplayTab(BbSettings::Values& s) {
                       : BbSettings::IsFsr4(requested)       ? "FSR 4"
                       : requested == BbSettings::UpscalerMetalFx ? "MetalFX"
                                                                  : "The upscaler",
-                      requested == BbSettings::UpscalerFsr3 ? " yet (it returns in a later 0.5 "
-                                                              "update)"
-                      : BbSettings::IsFsr4(requested)       ? " on the Mac"
-                                                            : "",
+                      BbSettings::IsFsr4(requested) ? " on the Mac" : " on this GPU",
                       labels[current]);
         Note(text, kOrange);
-    } else if (!BbSettings::UpscalerAvailable(BbSettings::UpscalerFsr3)) {
-        Note(kFsr3Later);
     }
     EndCard();
 

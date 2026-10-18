@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: unit test for the FidelityFX Metal back end (Metal-native M6 Tasks 1-3): every FSR 3.1
+// bbport: unit test for the FidelityFX Metal back end (Metal-native M6 Tasks 1-4): every FSR 3.1
 // upscaler blob AMD ships (SDK 1.1.4 SPIR-V, wave32, fp16 on and off) is reached through the
 // back end's FfxInterface and compiles to a Metal compute pipeline; a second request for a blob
 // is served from the pipeline cache. Resources, clears and copies (Task 2); pipelines and compute
 // jobs (Task 3): AMD's FSR 3 host code on the back end reproduces the Vulkan path's outputs on
-// synthetic frames (tests/data/fsr3, written by tests/fsr3_golden_vk.cpp). Links libbbgpu (the
-// ShaderCompiler) and AMD's host code; the MSL disk cache goes to a temporary directory
-// (SetHostKernelCacheDir).
+// synthetic frames (tests/data/fsr3, written by tests/fsr3_golden_vk.cpp). The renderer's wrapper
+// (Fsr3Metal, Task 4) runs those cases, and is re-created across sizes without compiling or
+// leaking. Links libbbgpu (the ShaderCompiler, AMD's host code); the MSL disk cache goes to a
+// temporary directory (SetHostKernelCacheDir).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -26,6 +27,7 @@
 #include "ffx_metal/ffx_metal.h"
 #include "video_core/renderer_metal/mtl_device.h"
 #include "ffx_metal/ffx_metal_private.h"
+#include "ffx_metal/fsr3_metal.h"
 #include "video_core/renderer_metal/mtl_encoder.h"
 #include "video_core/renderer_metal/mtl_host_kernel.h"
 #include "video_core/renderer_metal/mtl_texture.h"
@@ -598,43 +600,22 @@ Errors Compare(const uint16_t* got, const uint16_t* want, size_t texels) {
 
 // Runs one golden case (fsr3_synthetic.h) through AMD's FSR 3 host code on the Metal back end,
 // as the Vulkan tool ran it through ffx-vulkan's portable wrapper: same flags, same frames, the
-// three shared resources allocated by the caller, null exposure/reactive/composition masks.
+// three shared resources allocated by the caller, null exposure/reactive/composition masks. The
+// renderer's wrapper (Fsr3Metal, Task 4) makes the context and the shared resources: its
+// flags (HDR and auto exposure, or none) and constants are the cases' (Fsr3Synthetic).
 void RunFsr3Case(Metal::Device& device, const Fsr3Synthetic::Fsr3Case& c) {
     using namespace Fsr3Synthetic;
     const uint32_t w = c.render_width, h = c.render_height;
     const uint32_t ow = c.output_width, oh = c.output_height;
-    std::vector<uint8_t> scratch(FfxMetal::ScratchSize(1));
-    FfxFsr3UpscalerContextDescription description{};
-    description.flags = c.flags;
-    description.maxRenderSize = {w, h};
-    description.maxUpscaleSize = {ow, oh};
-    if (FfxMetal::GetInterface(&description.backendInterface, device, scratch.data(),
-                               scratch.size(), 1) != FFX_OK) {
-        std::printf("FAIL: %s: GetInterface\n", c.name);
+    const bool hdr = c.flags == (kFlagHdr | kFlagAutoExposure);
+    Expect(hdr || c.flags == 0, "a golden case has the wrapper's flags");
+    FfxMetal::Fsr3Metal fsr3;
+    std::string error;
+    if (!fsr3.Create(device, {w, h, ow, oh, hdr}, &error)) {
+        std::printf("FAIL: %s: Fsr3Metal::Create: %s\n", c.name, error.c_str());
         ++failures;
         return;
     }
-    FfxFsr3UpscalerContext context{};
-    const FfxErrorCode created = ffxFsr3UpscalerContextCreate(&context, &description);
-    if (created != FFX_OK) {
-        std::printf("FAIL: %s: ffxFsr3UpscalerContextCreate 0x%x\n", c.name, unsigned(created));
-        ++failures;
-        return;
-    }
-
-    // The shared resources (the portable wrapper's dilated depth, motion vectors and
-    // reconstructed previous depth), owned by the caller.
-    FfxFsr3UpscalerSharedResourceDescriptions shared{};
-    Expect(ffxFsr3UpscalerGetSharedResourceDescriptions(&context, &shared) == FFX_OK,
-           "shared resource descriptions");
-    auto make_shared = [&](const FfxCreateResourceDescription& d, const char* label) {
-        const FfxResourceDescription& r = d.resourceDescription;
-        return Texture2D(device, MTLPixelFormat(FfxMetal::PixelFormat(r.format)), r.width, r.height,
-                         true, r.format == FFX_SURFACE_FORMAT_R32_UINT, label);
-    };
-    Metal::Object dilated_depth = make_shared(shared.dilatedDepth, "dilated depth");
-    Metal::Object dilated_motion = make_shared(shared.dilatedMotionVectors, "dilated motion");
-    Metal::Object prev_depth = make_shared(shared.reconstructedPrevNearestDepth, "prev depth");
 
     Metal::Object color = Texture2D(device, MTLPixelFormatRGBA16Float, w, h, false, false, "color");
     Metal::Object depth = Texture2D(device, MTLPixelFormatR32Float, w, h, false, false, "depth");
@@ -660,36 +641,26 @@ void RunFsr3Case(Metal::Device& device, const Fsr3Synthetic::Fsr3Case& c) {
         encoder.CopyBufferToTexture(Ref(motion_staging), w * 4, w * h * 4, motion.Get(), 0, 0, {},
                                     {w, h, 1});
 
-        FfxFsr3UpscalerDispatchDescription dispatch{};
-        dispatch.commandList = FfxMetal::CommandList(encoder);
-        dispatch.color = FfxMetal::Resource(color.Get(), FFX_RESOURCE_USAGE_READ_ONLY, L"color");
-        dispatch.depth = FfxMetal::Resource(depth.Get(), FFX_RESOURCE_USAGE_READ_ONLY, L"depth");
-        dispatch.motionVectors =
-            FfxMetal::Resource(motion.Get(), FFX_RESOURCE_USAGE_READ_ONLY, L"motion");
-        dispatch.dilatedDepth =
-            FfxMetal::Resource(dilated_depth.Get(), FFX_RESOURCE_USAGE_UAV, L"dilated depth");
-        dispatch.dilatedMotionVectors =
-            FfxMetal::Resource(dilated_motion.Get(), FFX_RESOURCE_USAGE_UAV, L"dilated motion");
-        dispatch.reconstructedPrevNearestDepth =
-            FfxMetal::Resource(prev_depth.Get(), FFX_RESOURCE_USAGE_UAV, L"prev depth");
-        dispatch.output = FfxMetal::Resource(output.Get(), FFX_RESOURCE_USAGE_UAV, L"output");
-        dispatch.jitterOffset = {frame.jitter_x, frame.jitter_y};
-        dispatch.motionVectorScale = {kMotionScale, kMotionScale};
-        dispatch.renderSize = {w, h};
-        dispatch.upscaleSize = {ow, oh};
-        dispatch.enableSharpening = c.sharpen;
+        FfxMetal::Fsr3Metal::DispatchInfo dispatch{};
+        dispatch.color = color.Get();
+        dispatch.depth = depth.Get();
+        dispatch.motion = motion.Get();
+        dispatch.output = output.Get();
+        dispatch.render_w = w;
+        dispatch.render_h = h;
+        dispatch.output_w = ow;
+        dispatch.output_h = oh;
+        dispatch.jitter_x = frame.jitter_x;
+        dispatch.jitter_y = frame.jitter_y;
+        dispatch.frame_time_ms = kFrameTimeMs;
+        dispatch.camera_near = kCameraNear;
+        dispatch.camera_far = kCameraFar;
+        dispatch.vertical_fov = kCameraFovY;
         dispatch.sharpness = c.sharpness;
-        dispatch.frameTimeDelta = kFrameTimeMs;
-        dispatch.preExposure = kPreExposure;
+        dispatch.sharpen = c.sharpen;
         dispatch.reset = frame.reset;
-        dispatch.cameraNear = kCameraNear;
-        dispatch.cameraFar = kCameraFar;
-        dispatch.cameraFovAngleVertical = kCameraFovY;
-        dispatch.viewSpaceToMetersFactor = kViewSpaceToMeters;
-        const FfxErrorCode dispatched = ffxFsr3UpscalerContextDispatch(&context, &dispatch);
-        if (dispatched != FFX_OK) {
-            std::printf("FAIL: %s f%u: ffxFsr3UpscalerContextDispatch 0x%x\n", c.name, index,
-                        unsigned(dispatched));
+        if (!fsr3.Dispatch(encoder, dispatch)) {
+            std::printf("FAIL: %s f%u: Fsr3Metal::Dispatch\n", c.name, index);
             ++failures;
             device.Wait(encoder.Submit());
             break;
@@ -733,7 +704,7 @@ void RunFsr3Case(Metal::Device& device, const Fsr3Synthetic::Fsr3Case& c) {
             ++failures;
         }
     }
-    Expect(ffxFsr3UpscalerContextDestroy(&context) == FFX_OK, "ffxFsr3UpscalerContextDestroy");
+    fsr3.Destroy(); // every frame was waited for
     device.Finish();
 }
 
@@ -746,6 +717,242 @@ void TestFsr3MatchesVulkan(Metal::Device& device) {
     Expect(FfxMetal::LiveTextureBytes() == start, "FSR 3 contexts free their textures");
     if (failures == before) {
         std::printf("PASS Fsr3MatchesVulkan\n");
+    }
+}
+
+// --- Task 4: null bindings and the Fsr3Metal wrapper ---
+
+// Reads `texture` (RGBA16F, width x height, level 0) back as half floats.
+std::vector<uint16_t> ReadRgba16f(Metal::Device& device, void* texture, uint32_t width,
+                                  uint32_t height) {
+    Metal::Encoder encoder(device);
+    id<MTLBuffer> readback = SharedBuffer(device, size_t(width) * height * 8);
+    encoder.CopyTextureToBuffer(texture, 0, 0, {}, {width, height, 1}, Ref(readback), width * 8,
+                                width * height * 8);
+    device.Wait(encoder.Submit());
+    const auto* data = static_cast<const uint16_t*>(readback.contents);
+    return {data, data + size_t(width) * height * 4};
+}
+
+// A null SRV unbinds its slot: Encoder slots persist across dispatches, so skipping it would leave
+// the previous job's texture bound. Two RCAS jobs over a flat 1.0 input with exposure 1.0; the
+// second names a null RCAS input and must not reproduce the first one's output.
+void TestNullBindingUnbinds(Metal::Device& device) {
+    const int before = failures;
+    Backend backend(device);
+    FfxInterface& iface = backend.iface;
+    const FfxSamplerDescription samplers[2] = {
+        {FFX_FILTER_TYPE_MINMAGMIP_POINT, FFX_ADDRESS_MODE_CLAMP, FFX_ADDRESS_MODE_CLAMP,
+         FFX_ADDRESS_MODE_CLAMP, FFX_BIND_COMPUTE_SHADER_STAGE},
+        {FFX_FILTER_TYPE_MINMAGMIP_LINEAR, FFX_ADDRESS_MODE_CLAMP, FFX_ADDRESS_MODE_CLAMP,
+         FFX_ADDRESS_MODE_CLAMP, FFX_BIND_COMPUTE_SHADER_STAGE}};
+    FfxPipelineDescription desc{};
+    desc.stage = FFX_BIND_COMPUTE_SHADER_STAGE;
+    desc.samplers = samplers;
+    desc.samplerCount = 2;
+    std::wcsncpy(desc.name, L"FSR3-RCAS", 63);
+    FfxPipelineState rcas{};
+    Expect(iface.fpCreatePipeline(&iface, FFX_EFFECT_FSR3UPSCALER, FFX_FSR3UPSCALER_PASS_RCAS,
+                                  FSR3UPSCALER_SHADER_PERMUTATION_ALLOW_FP16, &desc,
+                                  backend.context, &rcas) == FFX_OK,
+           "RCAS pipeline");
+
+    constexpr uint32_t kSize = 16; // one RCAS threadgroup (16 x 16 pixels)
+    const FfxResourceInitData none{FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED};
+    FfxResourceInternal input{}, exposure{}, outputs[2]{};
+    const FfxCreateResourceDescription color_desc =
+        Describe(FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT, kSize, kSize, 1, none);
+    const FfxCreateResourceDescription exposure_desc =
+        Describe(FFX_SURFACE_FORMAT_R32G32_FLOAT, 1, 1, 1, none);
+    bool created =
+        iface.fpCreateResource(&iface, &color_desc, backend.context, &input) == FFX_OK &&
+        iface.fpCreateResource(&iface, &exposure_desc, backend.context, &exposure) == FFX_OK;
+    for (FfxResourceInternal& output : outputs) {
+        created &= iface.fpCreateResource(&iface, &color_desc, backend.context, &output) == FFX_OK;
+    }
+    Expect(created, "RCAS resources");
+    if (!created || !rcas.pipeline) {
+        return;
+    }
+
+    FfxGpuJobDescription clear{};
+    clear.jobType = FFX_GPU_JOB_CLEAR_FLOAT;
+    clear.clearJobDescriptor = {{1.0f, 1.0f, 1.0f, 1.0f}, input};
+    iface.fpScheduleGpuJob(&iface, &clear);
+    clear.clearJobDescriptor.target = exposure;
+    iface.fpScheduleGpuJob(&iface, &clear);
+
+    // Constant buffers of zeros (RCAS config 0: some sharpening; the output depends on the input
+    // either way), sized as FSR stages them.
+    static uint32_t constants[sizeof(Fsr3UpscalerConstants) / 4]{};
+    static uint32_t rcas_constants[4]{}; // Fsr3UpscalerRcasConstants (ffx_fsr3upscaler.cpp)
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+        FfxGpuJobDescription job{};
+        job.jobType = FFX_GPU_JOB_COMPUTE;
+        FfxComputeJobDescription& compute = job.computeJobDescriptor;
+        compute.pipeline = rcas;
+        compute.dimensions[0] = compute.dimensions[1] = compute.dimensions[2] = 1;
+        for (uint32_t i = 0; i < rcas.srvTextureCount; ++i) {
+            const std::wstring name = rcas.srvTextureBindings[i].name;
+            if (name == L"r_input_exposure") {
+                compute.srvTextures[i].resource = exposure;
+            } else if (name == L"r_rcas_input" && pass == 0) {
+                compute.srvTextures[i].resource = input;
+            } // else the null resource (internalIndex 0)
+        }
+        for (uint32_t i = 0; i < rcas.uavTextureCount; ++i) {
+            compute.uavTextures[i].resource = outputs[pass];
+        }
+        for (uint32_t i = 0; i < rcas.constCount; ++i) {
+            const bool rcas_cb = std::wstring(rcas.constantBufferBindings[i].name) == L"cbRCAS";
+            compute.cbs[i].data = rcas_cb ? rcas_constants : constants;
+            compute.cbs[i].num32BitEntries =
+                rcas_cb ? uint32_t(std::size(rcas_constants)) : uint32_t(std::size(constants));
+        }
+        iface.fpScheduleGpuJob(&iface, &job);
+    }
+    {
+        Metal::Encoder encoder(device);
+        Expect(iface.fpExecuteGpuJobs(&iface, FfxMetal::CommandList(encoder), backend.context) ==
+                   FFX_OK,
+               "execute RCAS jobs");
+        device.Wait(encoder.Submit());
+    }
+    const auto bound = ReadRgba16f(device, iface.fpGetResource(&iface, outputs[0]).resource, kSize,
+                                   kSize);
+    const auto unbound = ReadRgba16f(device, iface.fpGetResource(&iface, outputs[1]).resource,
+                                     kSize, kSize);
+    const float first = Fsr3Synthetic::FromHalf(bound[0]);
+    Expect(std::fabs(first - 1.0f) < 0.01f, "RCAS of a flat 1.0 input is 1.0");
+    Expect(bound != unbound, "a null SRV does not read the previous job's texture");
+    iface.fpDestroyPipeline(&iface, &rcas, backend.context);
+    Expect(iface.fpDestroyBackendContext(&iface, backend.context) == FFX_OK, "destroy context");
+    if (failures == before) {
+        std::printf("PASS NullBindingUnbinds\n");
+    }
+}
+
+// The synthetic scene's inputs at one render size, and an output at one output size.
+struct WrapperFrame {
+    Metal::Object color, depth, motion, reactive, output;
+    id<MTLBuffer> color_staging, depth_staging, motion_staging, reactive_staging;
+    uint32_t w, h, ow, oh;
+
+    WrapperFrame(Metal::Device& device, uint32_t w_, uint32_t h_, uint32_t ow_, uint32_t oh_)
+        : w(w_), h(h_), ow(ow_), oh(oh_) {
+        color = Texture2D(device, MTLPixelFormatRGBA16Float, w, h, false, false, "color");
+        depth = Texture2D(device, MTLPixelFormatR32Float, w, h, false, false, "depth");
+        motion = Texture2D(device, MTLPixelFormatRG16Float, w, h, false, false, "motion");
+        reactive = Texture2D(device, MTLPixelFormatR8Unorm, w, h, false, false, "reactive");
+        output = Texture2D(device, MTLPixelFormatRGBA16Float, ow, oh, true, false, "output");
+        color_staging = SharedBuffer(device, size_t(w) * h * 8);
+        depth_staging = SharedBuffer(device, size_t(w) * h * 4);
+        motion_staging = SharedBuffer(device, size_t(w) * h * 4);
+        reactive_staging = SharedBuffer(device, size_t(w) * h);
+        std::memset(reactive_staging.contents, 0x80, size_t(w) * h); // reactive 0.5
+    }
+
+    void Upload(Metal::Encoder& encoder, uint32_t index) {
+        const Fsr3Synthetic::Fsr3Frame frame = Fsr3Synthetic::MakeFrame(index, w, h);
+        std::memcpy(color_staging.contents, frame.color.data(), frame.color.size() * 2);
+        std::memcpy(depth_staging.contents, frame.depth.data(), frame.depth.size() * 4);
+        std::memcpy(motion_staging.contents, frame.motion.data(), frame.motion.size() * 2);
+        encoder.CopyBufferToTexture(Ref(color_staging), w * 8, w * h * 8, color.Get(), 0, 0, {},
+                                    {w, h, 1});
+        encoder.CopyBufferToTexture(Ref(depth_staging), w * 4, w * h * 4, depth.Get(), 0, 0, {},
+                                    {w, h, 1});
+        encoder.CopyBufferToTexture(Ref(motion_staging), w * 4, w * h * 4, motion.Get(), 0, 0, {},
+                                    {w, h, 1});
+        encoder.CopyBufferToTexture(Ref(reactive_staging), w, w * h, reactive.Get(), 0, 0, {},
+                                    {w, h, 1});
+    }
+};
+
+// Fsr3Metal at the renderer's sizes: a preset change (render size), an output size change and
+// back. Re-creation compiles no pipeline (the per-device cache), and the last Destroy leaves the
+// back end's texture total where it started. The first frame of each size has a reactive mask,
+// the second none.
+void TestWrapperRecreate(Metal::Device& device) {
+    const int before = failures;
+    const uint64_t start = FfxMetal::LiveTextureBytes();
+    struct Size {
+        uint32_t w, h, ow, oh;
+    };
+    constexpr Size kSizes[] = {
+        {1280, 720, 1920, 1080}, {960, 540, 1920, 1080}, {960, 540, 2560, 1440},
+        {1280, 720, 1920, 1080}};
+    FfxMetal::Fsr3Metal fsr3;
+    Expect(fsr3.MemoryBytes() == 0 && !fsr3.Matches({1280, 720, 1920, 1080, true}),
+           "no context before Create");
+    uint32_t compiled = 0;
+    for (size_t i = 0; i < std::size(kSizes); ++i) {
+        const Size& size = kSizes[i];
+        const FfxMetal::Fsr3Metal::CreateInfo info{size.w, size.h, size.ow, size.oh, true};
+        if (i > 0) {
+            fsr3.Destroy(); // every frame below was waited for
+            Expect(fsr3.MemoryBytes() == 0 && !fsr3.Matches(info), "Destroy releases the context");
+        }
+        std::string error;
+        if (!fsr3.Create(device, info, &error)) {
+            std::printf("FAIL: Fsr3Metal::Create %ux%u -> %ux%u: %s\n", size.w, size.h, size.ow,
+                        size.oh, error.c_str());
+            ++failures;
+            return;
+        }
+        if (i == 0) {
+            compiled = FfxMetal::PipelineCompileCount();
+        } else {
+            Expect(FfxMetal::PipelineCompileCount() == compiled,
+                   "re-creation at another size compiles no pipeline");
+        }
+        Expect(fsr3.Matches(info), "Matches the CreateInfo it was made for");
+        Expect(!fsr3.Matches({size.w, size.h, size.ow, size.oh, false}) &&
+                   !fsr3.Matches({size.w + 1, size.h, size.ow, size.oh, true}) &&
+                   !fsr3.Matches({size.w, size.h, size.ow, size.oh + 1, true}),
+               "Matches no other CreateInfo");
+        Expect(fsr3.MemoryBytes() > 0 && FfxMetal::LiveTextureBytes() > start,
+               "a context holds textures");
+
+        WrapperFrame frame(device, size.w, size.h, size.ow, size.oh);
+        for (uint32_t index = 0; index < 2; ++index) {
+            Metal::Encoder encoder(device);
+            frame.Upload(encoder, index);
+            FfxMetal::Fsr3Metal::DispatchInfo dispatch{};
+            dispatch.color = frame.color.Get();
+            dispatch.depth = frame.depth.Get();
+            dispatch.motion = frame.motion.Get();
+            dispatch.reactive = index == 0 ? frame.reactive.Get() : nullptr;
+            dispatch.output = frame.output.Get();
+            dispatch.render_w = size.w;
+            dispatch.render_h = size.h;
+            dispatch.output_w = size.ow;
+            dispatch.output_h = size.oh;
+            dispatch.jitter_x = 0.25f;
+            dispatch.jitter_y = -0.125f;
+            dispatch.frame_time_ms = Fsr3Synthetic::kFrameTimeMs;
+            dispatch.camera_near = Fsr3Synthetic::kCameraNear;
+            dispatch.camera_far = Fsr3Synthetic::kCameraFar;
+            dispatch.vertical_fov = Fsr3Synthetic::kCameraFovY;
+            dispatch.sharpness = 0.5f;
+            dispatch.sharpen = true;
+            dispatch.reset = index == 0;
+            Expect(fsr3.Dispatch(encoder, dispatch), "Fsr3Metal::Dispatch");
+            device.Wait(encoder.Submit());
+        }
+        const auto out = ReadRgba16f(device, frame.output.Get(), size.ow, size.oh);
+        bool finite = true, written = false;
+        for (const uint16_t bits : out) {
+            const float value = Fsr3Synthetic::FromHalf(bits);
+            finite &= std::isfinite(value);
+            written |= value != 0.0f;
+        }
+        Expect(finite && written, "the upscaled frame is written and finite");
+    }
+    fsr3.Destroy();
+    Expect(fsr3.MemoryBytes() == 0, "no memory after Destroy");
+    Expect(FfxMetal::LiveTextureBytes() == start, "the last Destroy frees every texture");
+    if (failures == before) {
+        std::printf("PASS WrapperRecreate\n");
     }
 }
 
@@ -769,6 +976,8 @@ int main() {
         TestCreatePipelineBindings(device);
         TestIntegerClear(device);
         TestFsr3MatchesVulkan(device);
+        TestNullBindingUnbinds(device);
+        TestWrapperRecreate(device);
         Expect(device.ErrorCount() == 0, "no command buffer errors on the device queue");
         std::filesystem::remove_all(dir);
     }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Saved upscaler choices must be safe before the first rendered frame: a provider this build or
-// device cannot run (FSR 3.1 until M6, the removed FSR 4 choices, MetalFX without a scaler) runs
-// as its fallback, and the ini keeps what the user chose.
+// device cannot run (FSR 3.1 below Apple7, the removed FSR 4 choices, MetalFX without a scaler)
+// runs as its fallback, and the ini keeps what the user chose.
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -143,6 +143,21 @@ int main() {
     ChooseUpscaler(UpscalerMetalFx);
     Save();
     assert(s.upscaler == UpscalerMetalFx && SavedUpscalerIs(path, UpscalerMetalFx));
+    // With the Metal FidelityFX back end (M6) FSR 3.1 runs where the device supports it.
+    ConfigureUpscalerSupport(true, true);
+    ChooseUpscaler(UpscalerFsr3);
+    assert(s.upscaler == UpscalerFsr3 && s.requested_upscaler == UpscalerFsr3);
+    assert(UpscalerAvailable(UpscalerFsr3) && s.fsr3_supported);
+    // A saved FSR 3.1 choice runs as saved from the first frame.
+    Save();
+    s.upscaler = UpscalerOff;
+    Load();
+    ConfigureUpscalerSupport(true, true);
+    assert(s.upscaler == UpscalerFsr3 && s.startup_upscaler == UpscalerFsr3);
+    // Without it (below Apple7) the choice falls back again and stays saved.
+    ConfigureUpscalerSupport(true, false);
+    assert(s.upscaler == UpscalerMetalFx && s.requested_upscaler == UpscalerFsr3);
+    ChooseUpscaler(UpscalerMetalFx);
 
     s.startup_preset = Quality;
     s.startup_upscaler = UpscalerFsr3;

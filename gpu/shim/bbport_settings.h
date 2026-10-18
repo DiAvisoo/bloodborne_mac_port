@@ -89,7 +89,7 @@ struct Values {
     std::atomic<bool> metal_renderer{false};
     /// Providers this build and device can run (ConfigureUpscalerSupport); off and TAA always.
     std::atomic<bool> metalfx_supported{false}; ///< macOS: Apple MetalFX temporal scaler
-    std::atomic<bool> fsr3_supported{false};    ///< FSR 3.1: returns with M6 (ffx_metal)
+    std::atomic<bool> fsr3_supported{false};    ///< FSR 3.1: Apple7+ (shim/ffx_metal)
     /// What the user chose (the ini, BB_UPSCALER or the menu): Save() writes it. From
     /// ConfigureUpscalerSupport on, `upscaler` is what runs, which differs while that choice is
     /// unavailable (FallbackUpscaler).
@@ -116,7 +116,7 @@ void ConfigureUpscalerSupport(bool metalfx, bool fsr3 = false);
 bool UpscalerAvailable(int upscaler);
 /// The provider that runs for a choice: the choice itself when available, else MetalFX when
 /// available, else TAA at Native AA (anti-aliasing at the same scene size), else off. Never an
-/// unavailable provider (FSR 3.1 until M6, the removed FSR 4 choices).
+/// unavailable provider (FSR 3.1 below Apple7, the removed FSR 4 choices).
 int FallbackUpscaler(int requested, bool metalfx, bool fsr3, int preset);
 /// The menu's choice: becomes the requested (saved) value and runs, or its fallback.
 void ChooseUpscaler(int upscaler);

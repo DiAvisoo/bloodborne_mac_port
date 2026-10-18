@@ -23,11 +23,14 @@
 #endif
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #include "bbport_metalfx.h"
+#include "ffx_metal/fsr3_metal.h"
 
 #include "common/types.h"
 #include "video_core/renderer_metal/mtl_host_kernel.h"
@@ -155,6 +158,9 @@ public:
         std::array<float, 2> jitter{}; ///< this frame's jitter in pixels (x right, y down)
         bool reset{}; ///< discard history (first frame, resize, camera cut, settings change)
         bool hdr{};   ///< linear HDR input (Run) or the tonemapped frame (RunScaled)
+        float frame_time_ms{16.6f}; ///< since the previous resolve (FrameTimeMs)
+        float camera_near{}, camera_far{}; ///< the scene camera's planes (FSR 3.1)
+        float vertical_fov{};              ///< radians
     };
 
 private:
@@ -206,7 +212,12 @@ private:
     /// MetalFX's temporal scaler, encoded into the frame's command buffer; recreated (after
     /// scheduler.Finish()) when a format or size changes. Then ExtraSharpen (sharpness > 1).
     bool ResolveMetalFx(const ResolveInputs& in);
-    bool ResolveFsr3(const ResolveInputs& in);    ///< M6: FSR 3.1; false until then
+    /// AMD FSR 3.1 on the FidelityFX Metal back end (fsr3, made by EnsureResources), recorded in
+    /// order with the frame; its RCAS covers sharpness up to 1, ExtraSharpen the rest.
+    bool ResolveFsr3(const ResolveInputs& in);
+    /// Milliseconds since the previous call (the steady clock); 16.6 for the first and for
+    /// values <= 0 or > 200 (a pause, a loading screen).
+    float FrameTimeMs();
     /// Sharpness above 1 (the menu's 0..2) for providers whose own sharpening ends at 1: RCAS of
     /// a copy of `target` (id<MTLTexture>, `width` x `height`, ShaderWrite) back into it. `ldr`:
     /// the target is the RGBA8 UI image (sRGB or not), written through its RGBA8Unorm view.
@@ -292,6 +303,13 @@ private:
     /// pointer (the encoder keeps it alive once encoded); replaced only after scheduler.Finish().
     Metal::Object metalfx_scaler;
     BbMetalFx::Config metalfx_config{};
+    /// FSR 3.1's context and shared textures for the current sizes and input kind (FSR 3.1 only).
+    /// Recorded commands use it by pointer; re-created only after scheduler.Finish().
+    FfxMetal::Fsr3Metal fsr3;
+    /// Set on the recording thread when a recorded FSR dispatch failed (logged there): the next
+    /// ResolveFsr3 reports the failure (Fail).
+    std::atomic<bool> fsr3_dispatch_failed{false};
+    std::chrono::steady_clock::time_point last_frame{};
     /// ExtraSharpen: a copy of the target (RCAS reads neighbours) in its format, and the RGBA8Unorm
     /// views of the copy and of the UI image (LDR).
     Metal::Object extra_sharpen_image;

@@ -167,8 +167,8 @@ TemporalUpscaler::TemporalUpscaler(Metal::Device& device_, Scheduler& scheduler_
 }
 
 TemporalUpscaler::~TemporalUpscaler() {
-    // Recorded commands may still use the textures.
-    if (resources_ready || ui_image) {
+    // Recorded commands may still use the textures (and FSR 3.1's context, destroyed after).
+    if (resources_ready || ui_image || fsr3.MemoryBytes() != 0) {
         scheduler.Finish();
     }
 }
@@ -249,8 +249,8 @@ bool TemporalUpscaler::OnFrameStart() {
     // upscaler at the applied preset while the menu saves the requested one for run.sh.
     const int preset = BbSettings::RenderPreset();
     const int upscaler = settings.upscaler.load();
-    // A failed provider (FSR 3 until M6, a size TAA refuses) stays off until the preset, the
-    // output size or the provider changes.
+    // A failed provider (a size TAA refuses, an FSR 3.1 context or dispatch FSR refused) stays
+    // off until the preset, the output size or the provider changes.
     if (applied_preset != preset || applied_upscaler != upscaler ||
         upscaler == BbSettings::UpscalerOff) {
         failed = false;
@@ -377,6 +377,24 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
     taa_next = 0;
     if (upscaler != BbSettings::UpscalerMetalFx) {
         metalfx_scaler = {}; // its memory, while another provider runs
+    }
+    if (upscaler == BbSettings::UpscalerFsr3) {
+        // The context is made for the exact sizes; its pipelines come from the back end's cache,
+        // so a preset or output size change compiles nothing.
+        const FfxMetal::Fsr3Metal::CreateInfo info{w, h, ow, oh, hdr};
+        if (!fsr3.Matches(info)) {
+            std::string error;
+            if (!fsr3.Create(device, info, &error)) {
+                std::printf("Upscaler: no FSR 3.1 context for %ux%u -> %ux%u: %s\n", w, h, ow, oh,
+                            error.c_str());
+                std::fflush(stdout);
+                return false;
+            }
+            std::printf("Upscaler: FSR 3.1 context %ux%u -> %ux%u (%.1f MiB)\n", w, h, ow, oh,
+                        double(fsr3.MemoryBytes()) / (1024.0 * 1024.0));
+        }
+    } else {
+        fsr3.Destroy(); // its memory, while another provider runs
     }
     opaque_valid = false;
     mask_ready = false; // the new mask texture holds nothing yet
@@ -538,7 +556,11 @@ bool TemporalUpscaler::Resolve(const ResolveInputs& in) {
         ExtraSharpen(in.output, false, in.out_width, in.out_height);
         return true;
     case BbSettings::UpscalerFsr3:
-        return ResolveFsr3(in);
+        if (!ResolveFsr3(in)) {
+            return false;
+        }
+        ExtraSharpen(in.output, false, in.out_width, in.out_height);
+        return true;
     default:
         return false;
     }
@@ -708,13 +730,59 @@ bool TemporalUpscaler::ResolveMetalFx(const ResolveInputs& in) {
     return true;
 }
 
-bool TemporalUpscaler::ResolveFsr3(const ResolveInputs&) {
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true)) {
-        std::printf("Upscaler: FSR 3.1 is not on the Metal renderer yet (M6); the frame is not "
-                    "upscaled\n");
+bool TemporalUpscaler::ResolveFsr3(const ResolveInputs& in) {
+    // An earlier frame's dispatch failed on the recording thread (logged there).
+    if (fsr3_dispatch_failed.exchange(false)) {
+        return false;
     }
-    return false;
+    // EnsureResources made the context for this frame's sizes and input kind.
+    if (!fsr3.Matches({in.width, in.height, in.out_width, in.out_height, in.hdr})) {
+        return false;
+    }
+    const auto& settings = BbSettings::Get();
+    // Toggle 1 << 26 (tests): the opposite sign convention for FSR.
+    const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
+    const FfxMetal::Fsr3Metal::DispatchInfo info{
+        .color = in.color,
+        .depth = in.depth,
+        .motion = in.motion,
+        .reactive = in.reactive,
+        .output = in.output,
+        .render_w = in.width,
+        .render_h = in.height,
+        .output_w = in.out_width,
+        .output_h = in.out_height,
+        .jitter_x = sign * in.jitter[0],
+        .jitter_y = sign * in.jitter[1],
+        .frame_time_ms = in.frame_time_ms,
+        .camera_near = in.camera_near,
+        .camera_far = in.camera_far,
+        .vertical_fov = in.vertical_fov,
+        // RCAS strength 0..1 (menu, BB_FSR_SHARPNESS): AMD's RCAS ends at 1; ExtraSharpen adds
+        // the rest of the menu's 0..2.
+        .sharpness = std::min(settings.sharpness.load(), 1.0f),
+        .sharpen = settings.sharpen.load(),
+        .reset = in.reset,
+    };
+    scheduler.EndRendering();
+    // AMD's host code keeps per-frame state: dispatches run on the recording thread, in frame
+    // order. The context is only re-created after scheduler.Finish().
+    scheduler.Record([fsr3 = &fsr3, failed = &fsr3_dispatch_failed, info](Metal::Encoder& e) {
+        if (!fsr3->Dispatch(e, info)) {
+            failed->store(true);
+        }
+    });
+    return true;
+}
+
+float TemporalUpscaler::FrameTimeMs() {
+    const auto now = std::chrono::steady_clock::now();
+    float frame_ms = std::chrono::duration<float, std::milli>(now - last_frame).count();
+    if (frame_ms <= 0.0f || frame_ms > 200.0f) {
+        frame_ms = 16.6f;
+    }
+    last_frame = now;
+    return frame_ms;
 }
 
 void TemporalUpscaler::Run() {
@@ -771,6 +839,10 @@ void TemporalUpscaler::Run() {
         .jitter = jitter,
         .reset = reset,
         .hdr = true,
+        .frame_time_ms = FrameTimeMs(),
+        .camera_near = camera_motion.Near(),
+        .camera_far = 3000.0f,
+        .vertical_fov = camera_motion.VerticalFov(),
     };
     if (!Resolve(inputs)) {
         Fail("the frame stays at render size");
@@ -994,6 +1066,10 @@ void TemporalUpscaler::RunScaled() {
         .jitter = jitter,
         .reset = reset,
         .hdr = false,
+        .frame_time_ms = FrameTimeMs(),
+        .camera_near = camera_motion.Near(),
+        .camera_far = 3000.0f,
+        .vertical_fov = camera_motion.VerticalFov(),
     };
     const bool ok = Resolve(inputs);
     if (ok) {

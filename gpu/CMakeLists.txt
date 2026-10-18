@@ -298,10 +298,11 @@ if (APPLE)
                 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/generated/ffx-1.1.4/vk/fsr3upscaler)
     target_compile_options(ffx_fsr3_host PRIVATE
         -include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/src/ffx_1_1_4_portability.hpp)
+    # fsr3_metal.mm: the renderer's FSR 3.1 context (vk_temporal_upscaler.cpp, ResolveFsr3).
     target_sources(bbgpu PRIVATE shim/ffx_metal/ffx_metal.mm shim/ffx_metal/ffx_metal_resources.mm
-        shim/ffx_metal/ffx_metal_compute.mm)
+        shim/ffx_metal/ffx_metal_compute.mm shim/ffx_metal/fsr3_metal.mm)
     set_source_files_properties(shim/ffx_metal/ffx_metal.mm shim/ffx_metal/ffx_metal_resources.mm
-        shim/ffx_metal/ffx_metal_compute.mm PROPERTIES COMPILE_OPTIONS
+        shim/ffx_metal/ffx_metal_compute.mm shim/ffx_metal/fsr3_metal.mm PROPERTIES COMPILE_OPTIONS
         "-fobjc-arc;-UVK_USE_PLATFORM_METAL_EXT;-Wno-unguarded-availability-new")
     target_include_directories(bbgpu PRIVATE ${FFX_1_1_4_ROOT}/src/backends/shared)
     target_link_libraries(bbgpu PRIVATE ffx_fsr3_host)
@@ -365,9 +366,8 @@ if (APPLE)
                                ${FFX_1_1_4_ROOT}/src/components)
     target_compile_options(ffx-metal-test PRIVATE -UNDEBUG)
     set_source_files_properties(../tests/test_ffx_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-    # AMD's host code itself (Fsr3MatchesVulkan drives ffxFsr3UpscalerContextCreate/Dispatch);
-    # libbbgpu does not export it.
-    target_link_libraries(ffx-metal-test PRIVATE bbgpu ffx_fsr3_host "-framework Metal" "-framework Foundation")
+    # AMD's host code runs inside libbbgpu (FfxMetal::Fsr3Metal); the test only uses its headers.
+    target_link_libraries(ffx-metal-test PRIVATE bbgpu "-framework Metal" "-framework Foundation")
     target_link_options(ffx-metal-test PRIVATE -Wl,-export_dynamic)
     target_compile_definitions(ffx-metal-test PRIVATE
         BB_FSR3_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/data/fsr3")

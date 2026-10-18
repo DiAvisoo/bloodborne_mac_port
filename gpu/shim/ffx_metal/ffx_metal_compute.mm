@@ -213,27 +213,29 @@ FfxErrorCode ExecuteComputeJob(FfxInterface& iface, Metal::Encoder& encoder,
     // FFX touches no untracked (guest) buffers: only its own hazard-tracked textures.
     encoder.SetComputePipeline(job.pipeline.pipeline, Metal::Access::None);
 
-    // Null resources stay unbound, as in ffx_vk.cpp.
+    // Null resources bind nil (reads give zero): Encoder slots persist across dispatches, so
+    // skipping them, as ffx_vk.cpp does with its per-job descriptor sets, would leave an earlier
+    // job's texture bound.
     for (uint32_t i = 0; i < job.pipeline.uavTextureCount; ++i) {
         const FfxTextureUAV& uav = job.uavTextures[i];
-        if (uav.resource.internalIndex == 0) {
-            continue;
-        }
-        void* texture = BindingTexture(iface, uav.resource, uav.mip);
-        if (!texture) {
-            return FFX_ERROR_INVALID_ARGUMENT;
+        void* texture = nullptr;
+        if (uav.resource.internalIndex != 0) {
+            texture = BindingTexture(iface, uav.resource, uav.mip);
+            if (!texture) {
+                return FFX_ERROR_INVALID_ARGUMENT;
+            }
         }
         encoder.SetTexture(Metal::Stage::Compute, job.pipeline.uavTextureBindings[i].slotIndex,
                            texture);
     }
     for (uint32_t i = 0; i < job.pipeline.srvTextureCount; ++i) {
         const FfxTextureSRV& srv = job.srvTextures[i];
-        if (srv.resource.internalIndex == 0) {
-            continue;
-        }
-        void* texture = BindingTexture(iface, srv.resource, 0);
-        if (!texture) {
-            return FFX_ERROR_INVALID_ARGUMENT;
+        void* texture = nullptr;
+        if (srv.resource.internalIndex != 0) {
+            texture = BindingTexture(iface, srv.resource, 0);
+            if (!texture) {
+                return FFX_ERROR_INVALID_ARGUMENT;
+            }
         }
         encoder.SetTexture(Metal::Stage::Compute, job.pipeline.srvTextureBindings[i].slotIndex,
                            texture);

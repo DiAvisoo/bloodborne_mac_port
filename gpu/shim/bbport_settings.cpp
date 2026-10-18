@@ -167,9 +167,7 @@ void ConfigureUpscalerSupport(bool metalfx, bool fsr3) {
     if (runs != requested) {
         std::printf("Upscaler: %s %s; using %s (the saved choice is kept)\n",
                     UpscalerName(requested),
-                    IsFsr4(requested)                ? "was removed"
-                    : requested == UpscalerFsr3      ? "returns with M6 (FSR 3.1 on Metal)"
-                                                     : "is unavailable on this device",
+                    IsFsr4(requested) ? "was removed" : "is unavailable on this device",
                     UpscalerName(runs));
     }
     v.upscaler = runs;
