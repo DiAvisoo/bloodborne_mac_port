@@ -76,7 +76,16 @@ Each item: what was done for now, what the refinement is, and where it lives.
   BGRA8 sRGB; was a MoltenVK HDR10 swapchain), display timing (`IsDisplayTimingSupported` false,
   `TakePastTimings` empty: the spike log's present-to-display column reads 0), the settings
   overlay (not drawn; M5 ImGui on Metal) and FSR 1 (`BB_FSR1` logs a warning and presents
-  without it; M6).
+  without it; M6). FSR 1 and the overlay are done (M5/M6); HDR and display timing remain.
+- **Metal-native (M6): FSR 3.1 back end minors** (review findings, none seen in game):
+  `ffx_fsr3_host` needs the patched `fsr-vulkan` submodule (a fresh clone without the patch fails
+  to build: add a CMake check, or vendor the files in M7); the FFX pipeline cache is keyed by
+  `Device*` and never pruned; read paths (`GetResource`, `StorageView`) after the last context is
+  destroyed allocate a new backend state that leaks; `ExecuteGpuJobs` returns only the last error;
+  a failed dispatch is reported one frame late (asynchronous recording); samplers are matched by
+  order (fine for FSR 3 only). Test gaps: negative inputs (null blob, bad context id), destroy
+  with a dispatch in flight, a `MTL_SHADER_VALIDATION=1` run of `ffx-metal-test` in
+  `build_macos.sh`, FSR 1 HDR and resize.
 
 - **1440p (live resolution path): the item icon in the HUD is missing** (black square where the
   Oil Urn picture is; present at 1080p). Seen 2026-10-16 night in both MoltenVK and Metal frame
