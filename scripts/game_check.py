@@ -13,6 +13,10 @@ from pathlib import Path
 SUPPORTED_TITLE = 'CUSA03173'
 SUPPORTED_VERSION = '01.09'
 SUPPORTED_IMAGE = '071df19c8880086d97182dbc057bc8cb37badaca57d9112683836b24a0444c0a'
+# Base-game data the game opens first; without it the game faults at guest offset 0x21a2da5
+# (a folder holding only the 1.09 update, or a dump whose dvdroot_ps4 was not copied).
+REQUIRED_DATA = ('dvdroot_ps4/shader/gxshader.shaderbnd.dcx', 'dvdroot_ps4/other/systex.tpf.dcx',
+                 'dvdroot_ps4/action/eventnameid.txt')
 
 
 def image_sha256(game):
@@ -29,7 +33,8 @@ def image_sha256(game):
 def problem(game, image_hash=None):
     """None for the supported game, else (kind, title, version): kind is 'missing_update' (base
     game or an older update), 'wrong_eboot' (param.sfo says 1.09, eboot.bin is another version),
-    'other_title' (another edition or region) or 'unreadable'."""
+    'other_title' (another edition or region), 'unreadable' or 'missing_data' (the right eboot.bin
+    without the base game's dvdroot_ps4 files)."""
     if os.environ.get('BB_SKIP_GAME_CHECK') == '1':
         return None
     from prepare import sfo
@@ -40,7 +45,9 @@ def problem(game, image_hash=None):
     title, version = info.get('TITLE_ID', '?'), info.get('APP_VER', '?')
     try:
         if (image_hash or image_sha256(game)) == SUPPORTED_IMAGE:
-            return None
+            if all((Path(game) / f).is_file() for f in REQUIRED_DATA):
+                return None
+            return 'missing_data', title, version
     except (OSError, ValueError, IndexError, StopIteration, KeyError):
         return 'unreadable', title, version
     if title != SUPPORTED_TITLE:
@@ -64,6 +71,10 @@ def explain(kind, title, version):
                        '1.09 update into the game folder, replacing this one.',
         'other_title': f'{found} Only Bloodborne {SUPPORTED_TITLE} with update 1.09 is supported '
                        'for now; other editions and regions have a different executable.',
+        'missing_data': f'{found} eboot.bin is right, but the game data is missing: '
+                        f'{REQUIRED_DATA[0]} is not in the game folder. The folder needs the whole '
+                        'base game (dvdroot_ps4 is about 29 GB) with the 1.09 update copied over '
+                        'it, not the update alone.',
         'unreadable': f'{found} eboot.bin could not be read as a decrypted PS4 executable: dump '
                       'the game and the 1.09 update again.',
     }[kind]
