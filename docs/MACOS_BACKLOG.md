@@ -440,6 +440,9 @@ Each item: what was done for now, what the refinement is, and where it lives.
   work per write, possibly contending with live compiles, and longer than the 5 s exit-flush
   bound (`bbgpu_flush_caches` then gives up, logged; the old file stays). The "wrote N pipelines"
   line now logs the duration: check it on a 16 GB / 8-core Mac in M5; grow the interval with N.
+  Seen 2026-10-18 on the M4 Max: quitting after character creation logged "the pipeline archive
+  write did not finish within 5000 ms; exiting without it" (pipelines from that session recompile
+  next launch).
 - **Metal-native (M4): archive writer throttle allows double writes.** The writer's due time is
   10 s after the last write, computed before it waits: a `Flush` (Sync, exit flush) during that
   wait does not move it, so when more pipelines compile after the flush the writer does a second
