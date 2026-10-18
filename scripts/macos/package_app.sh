@@ -12,6 +12,7 @@
 #   MacOS/Bloodborne              launcher window (Swift, launcher/): settings, folders, Play
 #   MacOS/bb-probe                game process (x86-64, Rosetta 2)
 #   MacOS/bbgpu-host              GPU process (arm64; owns the window, so the Dock shows the app)
+#   MacOS/bbgpu-host-macos27      the same with the guest range as an exec-time segment (macOS 27+)
 #   MacOS/bb-gpu-capabilities     GPU check used by run.sh
 #   Frameworks/*.dylib            universal: libbbgpu, SDL3, Vulkan loader, MoltenVK, FFmpeg
 #   Resources/port/               run.sh, scripts/*.py, patches/, MoltenVK_icd.json
@@ -27,7 +28,7 @@ py_release=20260924
 py_name=cpython-3.12.14+20260924-aarch64-apple-darwin-install_only_stripped.tar.gz
 py_sha256=c2edb321cd32ec2b170df208db0446dccc4398db602ca27cf2079098fb1f7d9d
 
-for f in out/bb-probe out/bb-gpu-capabilities out/gpu/libbbgpu.dylib out/bbgpu-host out/gpu-arm64/libbbgpu.dylib; do
+for f in out/bb-probe out/bb-gpu-capabilities out/gpu/libbbgpu.dylib out/bbgpu-host out/bbgpu-host-macos27 out/gpu-arm64/libbbgpu.dylib; do
     [[ -f $f ]] || { echo "Missing $f: build first (bash build_macos.sh)." >&2; exit 1; }
 done
 
@@ -38,7 +39,7 @@ rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Frameworks" "$contents/Resources/port/scripts" "$contents/Resources/licenses"
 
 # Executables: library search goes to Frameworks/ only (the build's rpaths name this checkout).
-install -m755 out/bb-probe out/bb-gpu-capabilities out/bbgpu-host "$contents/MacOS/"
+install -m755 out/bb-probe out/bb-gpu-capabilities out/bbgpu-host out/bbgpu-host-macos27 "$contents/MacOS/"
 set_rpath() { # file new-rpath
     local file=$1 path
     while read -r path; do
@@ -46,7 +47,7 @@ set_rpath() { # file new-rpath
     done < <(otool -l "$file" | awk '/cmd LC_RPATH/ { getline; getline; print $2 }')
     install_name_tool -add_rpath "$2" "$file"
 }
-for exe in bb-probe bb-gpu-capabilities bbgpu-host; do
+for exe in bb-probe bb-gpu-capabilities bbgpu-host bbgpu-host-macos27; do
     set_rpath "$contents/MacOS/$exe" @executable_path/../Frameworks
 done
 

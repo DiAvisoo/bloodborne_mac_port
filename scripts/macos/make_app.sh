@@ -43,6 +43,7 @@ bash scripts/macos/build_launcher.sh
 install -m755 out/launcher/Bloodborne "$app/Contents/MacOS/Bloodborne"
 codesign --force --sign - "$app/Contents/MacOS/Bloodborne"
 ln -s "$repo/out/bbgpu-host" "$app/Contents/MacOS/bbgpu-host"
+ln -s "$repo/out/bbgpu-host-macos27" "$app/Contents/MacOS/bbgpu-host-macos27"
 
 # Icon from the game's own artwork, when the game folder is known.
 game=
