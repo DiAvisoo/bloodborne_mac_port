@@ -1240,3 +1240,33 @@ the end of Task 10c (display at 120 Hz then, eager private arena), is now level 
   the GPU through a buffer, which marks it GPU-dirty, and the refresh detiles 9.4 MB from the
   arena. Shared texture-cache code (0.4.0 likely does the same). Backlog (Performance).
 - Memory: GPU process 6.3-6.6 GB in the dense scene (lazy arena).
+
+### Task 11 series 2 (2026-10-18 night): attribution, validation, walks, CPU-bound
+
+- **Ordering, city at 1080p uncapped:** default 97.4 FPS; `BB_HOIST_UNSAFE=1` 85.6;
+  `BB_METAL_HAZARD_TRACKING=1` 86.6. The default (untracked buffers, per-command fences) is the
+  fastest; the unsafe probe that reached 108 FPS in Task 10 is now slower than the default.
+- **60 cap with display sync (Cathedral Ward, 60 s standing):** 60.0 FPS, every frame 16.7 ms,
+  no spike over 25 ms: the long single GPU frames seen uncapped do not show in capped play.
+- **CPU-bound check (960x540 render, uncapped, cages):** Metal-native 114.3 FPS, 0.4.0 119.6.
+  Not CPU-bound on Metal: GPU busy 8.75 ms/frame (100%), so ~8.4-8.8 ms of GPU time stays at a
+  quarter of the 1080p pixels. A fixed per-frame GPU cost (~350 encoders, ~2000-2400 fence waits, ~120
+  inline copy-shader copies splitting passes) that 0.4.0 does not pay as much; at 1440p the
+  faster pixel work outweighs it. The next GPU lever is fewer encoders, not shader time.
+- **`MTL_DEBUG_LAYER=1` (errors to the log) at cages, Cathedral Ward, Hunter's Dream (60 cap):**
+  no messages (32-37 FPS under the layer). With `MTL_DEBUG_LAYER_WARNING_MODE=nslog` the
+  performance warnings (unused bindings, redundant state) wrote 16.7 GB in 10 minutes and the host
+  was killed (signal 9): leave warnings off. The run scripts now stop at a 1 GB log.
+- **`MTL_SHADER_VALIDATION=1`** crashed the host at startup inside Metal while loading the binary
+  archive (`MTLGPUDebugDevice newBinaryArchiveWithDescriptor`); no archive under shader validation
+  now. Then at the three saves: no messages (26-29 FPS).
+- **15-minute walks** (60 cap; cages 1080p, Cathedral Ward 1440p MetalFX Quality): no crash, no
+  `<Error>` line, 60.0 FPS mean (min 58.7 / 57.7), 2 of 181 windows with a frame over 25 ms
+  each, no compiles. GPU process flat (6.4 / 6.2 GB after the first minute); arena high-water
+  4.5 / 4.0 GiB.
+- **The game process grows ~80 MB/min while walking, on 0.4.0 too** (cages walk: Metal-native
+  2.5 -> 3.8 GB, 0.4.0 2.5 -> 4.0 GB over 15 minutes, linear). Shared game-side code, not the
+  renderer.
+- **Full screen (`BB_FULLSCREEN=1`):** the window stayed 2992x1686 (windowed) for the whole run;
+  the screen was locked, and macOS runs the full-screen Space transition asynchronously (likely
+  not at all while locked). To check with the screen unlocked.

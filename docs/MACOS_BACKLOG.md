@@ -45,7 +45,8 @@ Each item: what was done for now, what the refinement is, and where it lives.
 - **Metal-native (M4): full-screen switch not checked while presenting.** A window resize
   (1200x900 points via System Events) refits with black bars and no stall (2026-10-16). The
   `BB_FULLSCREEN=1` start and the green-button switch were only tried with the screen locked
-  (no switch on 0.4.0 either then).
+  (no switch on 0.4.0 either then). Again 2026-10-18 (Task 11, screen locked): the window stayed
+  windowed for the whole run. Needs a run with the screen unlocked.
 - **Metal-native (M4): minimised/occluded window.** Fixed 2026-10-16: a minimised, hidden or
   fully occluded macOS window keeps its pixel size, so the 0x0 skip never fired and
   `nextDrawable` could block ~1 s per frame. `WindowSDL` now tracks SDL's MINIMIZED/HIDDEN/
@@ -354,6 +355,13 @@ Each item: what was done for now, what the refinement is, and where it lives.
   FINDINGS 2026-10-17 Task 10). Proper fix: capture with a smaller arena automatically, or a
   `MTLCaptureScope` that leaves the arena out if Apple's tool allows it.
 
+- **The game process grows ~80 MB/min during play (both renderers, 2026-10-18).** Cages walk at
+  a 60 cap: 2.5 -> 3.8 GB (Metal-native) and 2.5 -> 4.0 GB (0.4.0) in 15 minutes, linear; the GPU
+  process stays flat. Either the game's heap being touched for the first time in the shared
+  guest pool (bounded by the PS4 budget) or a leak in the runtime (game side). Check whether it
+  levels off (45-minute walk), then which regions grow (`vmmap --summary` of bb-probe; no
+  debugger on Rosetta processes).
+
 ## 2. Performance
 
 - **Frame drops while traversing (user's 0.4.5 test, 2026-10-17).** Otherwise very smooth (the user:
@@ -372,6 +380,11 @@ Each item: what was done for now, what the refinement is, and where it lives.
   Trace of a long frame (GPU preemption by another client, a residency/paging event, or a GPU
   power-state change). Diagnostics: `BB_SPIKE_MS=20`, `BB_LOG_LONG_CB_MS=20`,
   `BB_GPU_PROFILE=1 BB_GPU_PROFILE_SLOW_MS=18`. FINDINGS 2026-10-18.
+- **Metal-native: a fixed per-frame GPU cost (Task 11 CPU-bound check, 2026-10-18).** At a
+  960x540 render the GPU is still busy 8.75 ms/frame (114 FPS against 0.4.0's 120): the cost does
+  not scale with pixels. ~350 encoders and ~2000-2400 fence waits per frame, ~120 inline
+  copy-shader copies ending render passes. Fewer encoders (hoist or batch the copy-shader copies,
+  merge compute dispatches into one encoder) is the lever; at 1440p we already win by 12-18%.
 - **A 1080p R32F image re-detiled every frame (9.4 MB; shared texture-cache code).** The GPU
   writes its memory through a buffer, which marks the image GPU-dirty, and each use detiles it
   from the arena again (`BB_LOG_UPLOAD_MB=5`). Keep the image in sync with the buffer write
