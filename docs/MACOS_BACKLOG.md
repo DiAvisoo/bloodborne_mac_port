@@ -359,6 +359,14 @@ Each item: what was done for now, what the refinement is, and where it lives.
   same offsets, accept a prefix and index with the TCS stride (`patch_stride` is already the
   TCS's). MoltenVK drew it (0.4.x). Which geometry it is: not known yet (a candidate for some
   missing floors, but not the progressive disappearance above).
+  **Fixed 2026-10-19:** not a prefix but a suffix. The TCS writes patch locations 8-21 (14
+  float4s); the TES reads 12-21, so SPIRV-Cross dropped 8-11 and its struct started with
+  location 12 at offset 0. The TES variant now carries the TCS's patch range
+  (`CompileVariant::patch_first/patch_end`, cache tag `_te<N>p<first>_<end>`) and declares every
+  location with `add_msl_shader_input` (per patch, vec4): SPIRV-Cross adds placeholders
+  (`raw_buffer_tese_input`), so both structs are 224 bytes with the same offsets. `--msl-check`
+  on a copy of the user's cache: 649 of 649 pipelines, all 30 tessellation ones. Still to see in
+  game: what it draws (the error line should be gone).
 - **GPU host crash in `Scheduler::KickRecording` (2026-10-14, user session).** SIGSEGV at
   address 0x20008 (a null `record_chunk`: its size field follows the 128 KiB buffer) on the draw
   recording thread, `RunWriteData` → `WaitHostCopies` → `KickRecording`, right after an area

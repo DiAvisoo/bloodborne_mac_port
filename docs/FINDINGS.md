@@ -1367,3 +1367,17 @@ get it (the heap patch's condition). Native 1080p never took this path.
   720p startup patch: direct memory 5056 MiB, arena 6.0 GiB (reached 3.75), 60.0 FPS stand and
   turn, 0 spikes, GPU process 4.6-5.0 GB, scene correct. 1080p native: arena 6.0 GiB, 60.0 FPS,
   GPU process 5.5-5.9 GB.
+
+## The refused tessellation pipeline: TES patch struct missing the unread locations (2026-10-19)
+
+Every session logged `the evaluation shader reads 160 bytes of patch constants, the control
+shader writes 224` and skipped that pipeline's draws. From the user's MSL cache and the SPIR-V
+(`spirv-dis`): TCS 0x2807dd6c writes Patch locations 8-21 (14 vec4s), TES 0xf0c066a1 reads
+12-21. SPIRV-Cross dropped the unread 8-11, so the TES struct put location 12 at offset 0 and
+indexed the patch buffer with a 160-byte stride. Fix: the TES variant declares the TCS's whole
+patch range as per-patch inputs; with `raw_buffer_tese_input` SPIRV-Cross adds `uint4`
+placeholders. Rebuilt structs: 4 placeholders + 10 values, 224 bytes, offsets as the TCS.
+`bbgpu-host --msl-check` on a copy of the user's pipeline cache: 649 built, 0 failed (30 of 30
+tessellation). The first attempt padded from location 0 and only worked because SPIRV-Cross
+skips locations the per-vertex inputs (0-7) occupy; the range now starts at the TCS's first
+patch location. Not yet seen in game.
