@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <set>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -150,13 +151,31 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     });
 }
 
-void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, u64 writer) {
     std::scoped_lock lock{mutex};
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
         if (image.info.guest_address != address) {
             return;
+        }
+        // bbport: BB_LOG_UPLOAD_MB=<n> also names, once, each writer that dirties an image of
+        // at least n MB (diagnostics).
+        static const double log_upload_mb = [] {
+            const char* env = std::getenv("BB_LOG_UPLOAD_MB");
+            return env ? std::atof(env) : 0.0;
+        }();
+        if (log_upload_mb > 0 && image.info.guest_size >= log_upload_mb * 1e6) {
+            static std::set<std::pair<u64, VAddr>> logged;
+            if (logged.emplace(writer, address).second) {
+                LOG_WARNING(Render_Vulkan,
+                            "GPU write dirties image {:#x} size {:#x} ({}x{} format {}): {} {:#x}, "
+                            "write size {:#x}, image flags {:#x}",
+                            address, image.info.guest_size, image.info.size.width,
+                            image.info.size.height, static_cast<u32>(image.info.pixel_format),
+                            writer ? "shader" : "DMA copy", writer, max_size,
+                            static_cast<u32>(image.flags));
+            }
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
@@ -790,8 +809,13 @@ void TextureCache::RefreshImage(Image& image) {
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
 
         // Protect GPU modified resources from accidental CPU reuploads.
+        // bbport: an image only ever filled from GPU buffer writes (the 1080p R32F one the game
+        // writes with a compute shader every frame: 9 MB) skips the CPU hash. The hash is only
+        // compared once the image is GPU-modified, and here it would read memory whose GPU write
+        // may still be pending; 0 makes that later comparison upload, as a changed hash would.
         const u8* mip_addr = std::bit_cast<u8*>(image.info.guest_address) + mip_offset;
-        const u64 mip_hash = XXH3_64bits(mip_addr, mip_size);
+        const u64 mip_hash =
+            is_gpu_dirty && !is_gpu_modified ? 0 : XXH3_64bits(mip_addr, mip_size);
         if (is_gpu_modified && !is_gpu_dirty && image.mip_hashes[m] == mip_hash) {
             continue;
         }
