@@ -339,7 +339,12 @@ Each item: what was done for now, what the refinement is, and where it lives.
   bad data). Then a long-walk repro from a save (Hemwick lamp), and Option B.
 - **Black loading screen that never finishes (#18, 2026-10-18).** About 1 launch in 10 on an M3
   Pro stops at a black screen with the loading icon; a relaunch works. No log of a stuck run
-  yet (asked for one).
+  yet (asked for one). *Candidate fixed 2026-10-19:* `sceGnmDingDong` waited for the previous
+  submission to retire before queueing its compute work, so a graphics WAIT_REG_MEM on a label
+  that work writes could never finish (the order DiAvisoo/bbport-mac-optimized changed). The game
+  submits compute only at start and while loading (~55 calls a session, measured), none of them
+  over a pending SubmitDone in our runs: a timing race, likelier on slower Macs. Now queued
+  first, then waited. Confirm with Didjus's reports.
 - **Metal: a tessellation pipeline refused, its draws skipped (2026-10-18, user, 0.5.1).** Every
   session: `GetTessellationPipeline: … the evaluation shader reads 160 bytes of patch constants,
   the control shader writes 224` (vs 0x2fb9d0c43ee, fs 0xdbb1593690c; pipeline fs dbb222eb hs
@@ -402,6 +407,17 @@ Each item: what was done for now, what the refinement is, and where it lives.
   The same fix for 0.4.x is on branch `fix/low-alloc-free-list` (not merged). FINDINGS 2026-10-18.
 
 ## 2. Performance
+
+- **Ideas from DiAvisoo/bbport-mac-optimized (bmy's engine on KosmicKrisp, 2026-10-19).**
+  (a) Skipping attachmentless draws without shader writes or queries (`BB_SKIP_EMPTY_DRAWS`, off
+  there): Metal starts a maximum-size render pass for each. Our Cathedral Ward capture has no
+  such pass, so check one more scene before doing anything. (b) A per-thread cache of mapping
+  extents for the draw-preparation workers' region lookups (theirs was a mutex; ours,
+  `host/host_runtime.c`, is a read/write lock: measure contention first). (c) Parking spin-waits
+  on `std::atomic::wait` after the pause loop instead of yielding (`BB_PIPE_PARK_WAITS`): energy
+  on battery. (d) Their sparse arena (KosmicKrisp has sparse binding) only commits bound
+  blocks; the Metal equivalent is placement heaps, an alternative to zero-copy (M7) for 16 GB
+  Macs.
 
 - **Frame drops while traversing (user's 0.4.5 test, 2026-10-17).** Otherwise very smooth (the user:
   better pacing than the original and the PC version on a 4060). Shader/pipeline compiles or asset
@@ -589,6 +605,12 @@ Each item: what was done for now, what the refinement is, and where it lives.
   *Refinement:* clang `-fprofile-generate`/`-fprofile-use` with `.profdata`.
 
 ## 3. Mac GUI
+
+- **Ultrawide and quicksave (seen in DiAvisoo/bbport-mac-optimized, 2026-10-19).** 21:9 and 32:9
+  output resolutions with an optional Nexus Mods UI pack (the launcher backs up and restores the
+  game's menu files), and quicksave/quickload (F2/F3: snapshot the save folder; quickload
+  restores it and restarts the game). Ultrawide fits the launcher's Advanced tab (#15). GPL-2.0:
+  code can be borrowed with credit.
 
 - **Hide the mouse cursor over the game (request via the user, 2026-10-18).** Nothing hides it
   today. `gpu/shim/window.cpp` (host owns the window): `SDL_HideCursor` while the game window has

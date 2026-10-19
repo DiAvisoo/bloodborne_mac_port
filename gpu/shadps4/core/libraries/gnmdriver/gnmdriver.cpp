@@ -876,13 +876,17 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         return;
     }
 
+    // bbport: the compute work is queued first and the wait for the previous submission comes
+    // after (as in DiAvisoo/bbport-mac-optimized). A graphics WAIT_REG_MEM after SubmitDone can
+    // wait for a label this compute work writes: waiting first, the GPU never went idle and
+    // the work never reached it. The game submits compute only at start and while loading
+    // (~55 calls a session), which fits the black loading screen 1 launch in 10 (#18).
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
-
     if (BbSplit::Remote()) {
         const BbGpuDingDong record{{BBGPU_REC_DING_DONG, sizeof(BbGpuDingDong)}, gnm_vqid,
                                    next_offs_dw};
         BbSplit::Push(&record);
+        WaitGpuIdle();
         return;
     }
 
@@ -896,6 +900,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     auto& offs_dw = asc_next_offs_dw[vqid];
 
     if (next_offs_dw == offs_dw) {
+        WaitGpuIdle();
         return;
     }
 
@@ -946,6 +951,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         });
     }
     liverpool->SubmitAsc(gnm_vqid, acb_span);
+    WaitGpuIdle();
 }
 
 void PS4_SYSV_ABI sceGnmDingDongForWorkload(u32 gnm_vqid, u32 next_offs_dw, u64 workload_id) {
