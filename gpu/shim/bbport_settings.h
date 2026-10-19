@@ -77,16 +77,13 @@ struct Values {
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> output_res{OutputDefault}; ///< index into OutputWidths
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
-    /// on the Steam Deck and older GPUs), -1 auto (strong discrete GPUs), 1 on. On restart.
+    /// on the Steam Deck and older GPUs), -1 auto (off on a Mac), 1 on. On restart.
     std::atomic<int> live_resolution{0};
     /// A draw whose pipeline is still compiling in the background: Wait waits for it (a hitch,
     /// correct image), Skip leaves the draw out until it is ready (no hitch, an object may be
     /// missing for a few frames), Balanced waits within a small time budget and skips past it.
     /// bbport.ini shader_compile=wait|skip|balanced; live.
     std::atomic<int> shader_compile{ShaderBalanced};
-    /// bbport.ini renderer=metal|vulkan, read by run.sh at start (native Metal: the arm64 GPU
-    /// process); kept here so saving the settings does not drop it.
-    std::atomic<bool> metal_renderer{false};
     /// Providers this build and device can run (ConfigureUpscalerSupport); off and TAA always.
     std::atomic<bool> metalfx_supported{false}; ///< macOS: Apple MetalFX temporal scaler
     std::atomic<bool> fsr3_supported{false};    ///< FSR 3.1: Apple7+ (shim/ffx_metal)

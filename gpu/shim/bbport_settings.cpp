@@ -20,6 +20,7 @@ const char* Path() {
 
 /// Keys Save() writes; every other key=value line of the file is kept as it is (the launcher's
 /// fps_cap and fullscreen, the removed FSR 4 checks fsr4_auto_exposure/fsr4_invert_jitter, ...).
+/// `renderer` (metal|vulkan until 0.5.2) is owned but no longer written: saving drops it.
 bool OwnedKey(const std::string& key) {
     static constexpr const char* owned[] = {
         "upscaler", "preset", "sharpen", "sharpness", "jitter", "reactive", "object_motion",
@@ -78,8 +79,6 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.model_lod = std::clamp(i, -2, 2);
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
-    } else if (key == "renderer") {
-        v.metal_renderer = value == "metal";
     } else if (key == "shader_compile") {
         v.shader_compile = value == "skip"       ? BbSettings::ShaderSkip
                            : value == "balanced" ? BbSettings::ShaderBalanced
@@ -275,8 +274,6 @@ void Save() {
     static constexpr const char* compile_modes[] = {"wait", "skip", "balanced"};
     std::fprintf(file, "shader_compile=%s\n",
                  compile_modes[std::clamp(v.shader_compile.load(), 0, 2)]);
-    // Read by run.sh at start.
-    std::fprintf(file, "renderer=%s\n", v.metal_renderer ? "metal" : "vulkan");
     for (const std::string& line : kept) {
         std::fprintf(file, "%s\n", line.c_str());
     }

@@ -147,8 +147,8 @@ struct GameSettings: Equatable {
         if let v = ini["live_resolution"], let l = LiveResolution(rawValue: v) { liveResolution = l }
     }
 
-    /// Writes the launcher's settings into `ini`; every other line stays (the `renderer` key too:
-    /// macOS always uses the Metal renderer now).
+    /// Writes the launcher's settings into `ini`; every other line stays (a `renderer` key from
+    /// 0.5.2 or earlier too: the game drops it the next time its menu saves).
     func apply(to ini: inout IniFile) {
         ini["output_res"] = output.iniValue
         ini["upscaler"] = upscaler.rawValue
