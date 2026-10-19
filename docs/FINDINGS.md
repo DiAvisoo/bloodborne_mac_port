@@ -1330,3 +1330,26 @@ process 9.0 GB.
 
 Not measured: the in-game preset switch (Quality -> Performance -> Native AA); the wrapper test
 shows a size change recompiles no pipeline.
+
+## 16 GB Macs: arena sized to the game, textures to what it leaves (2026-10-19)
+
+Issue #19 (M1 Pro 16 GB, macOS 27, 0.5.1): 4-9 FPS at 1080p, GPU 39-117 ms a frame, and Metal's
+allocated size 9.57-11.53 GB against a working-set limit of 11.55 GB (MTL HUD report). The
+arena was 8 GiB there (a quarter of memory, at least two 4 GiB pages), and the texture
+collector left the resident buffers out of its usage but measured against the whole working
+set, so images could reach ~8 GB beside it.
+
+- The game's direct memory is the same every run: 14 allocations, 4.48 GiB, at start; with
+  flexible memory the highest mapping ends 4.80 GiB above 0x7000000000 in every log (ours,
+  Didjus's, the #19 reporter's 88-map session).
+- Arena = direct memory + 1 GiB, rounded up to 512 MiB, on every Mac: 6 GiB (10 GiB with
+  `BB_DMEM_MB=9152`). Exact sizes now: the 4 GiB page table points at it and `GetArena` checks
+  the end.
+- Texture budget = working set minus resident buffers (at least 2 GiB); the trigger stays at 70%.
+- M4 Max, Hunter's Dream headstone, 1080p, 60 cap, stand + turn: 60.0 FPS, no spikes, with
+  6 GiB and with `BB_ARENA_GIB=12` alike; GPU process 5.4-5.8 GB vs 6.0-6.5 GB with 12 GiB.
+  Arena reached 4.50 GiB.
+- The same with a 16 GB Mac's limits (`BB_GC_BUDGET_MB=11015 BB_MAX_BUFFER_GIB=9`): 60.0 FPS;
+  Metal allocated 7.1 GB at start, 9.6 GB at most (6.7 GB of it resident buffers), image
+  trigger 3.0 GiB, 0 images freed. Not measured on a real 16 GB Mac yet.
+

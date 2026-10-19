@@ -1019,8 +1019,9 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 
 void TextureCache::GarbageCollectImages() {
     { // Metal always reports usage (Device::AllocatedSize)
-        // Without the resident buffers: the guest arena (8-16 GiB, private) counts in full from
-        // its creation, which kept a 16 GB Mac above the trigger and evicted textures for nothing.
+        // Without the resident buffers: the guest arena (6 GiB, private) counts in full from its
+        // creation, which kept a 16 GB Mac above the trigger and evicted textures for nothing.
+        // The budget below leaves them out instead.
         const u64 allocated = device.AllocatedSize();
         const u64 resident = device.ResidentBytes();
         total_used_memory = allocated > resident ? allocated - resident : 0;
@@ -1041,7 +1042,13 @@ void TextureCache::GarbageCollectImages() {
         if (budget != 0 || local_mem != 0) {
             const bool is_low_vram = (local_mem > 0 && local_mem <= 4096ULL * 1024 * 1024) ||
                                      (budget > 0 && budget <= 4096ULL * 1024 * 1024);
-            const u64 base_mem = !forced_budget && is_low_vram && local_mem > 0 ? local_mem : budget;
+            u64 base_mem = !forced_budget && is_low_vram && local_mem > 0 ? local_mem : budget;
+            // bbport: the resident buffers (the guest arena above all) count toward Metal's
+            // working set too, so images get what they leave. Measured against the whole set,
+            // images could grow to ~8 GB beside an 8 GiB arena on a 16 GB Mac and the GPU
+            // process sat at Metal's limit (11.53 of 11.55 GB, issue #19). BB_GC_BUDGET_MB
+            // stands for the working set (BB_GC_BUDGET_MB=11015: a 16 GB Mac's).
+            base_mem = base_mem > resident + (2ULL << 30) ? base_mem - resident : 2ULL << 30;
             static const u64 trig_pct = [is_low_vram] {
                 const char* e = std::getenv("BB_GC_TRIGGER");
                 return e ? std::strtoull(e, nullptr, 10) : (is_low_vram ? 70 : 70);
