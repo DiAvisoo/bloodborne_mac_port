@@ -21,6 +21,12 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 1. Stability
 
+- **The Linux reference path no longer builds (2026-10-19).** `build.sh`, `shell.nix`,
+  `packaging/default.nix`, the GTK launcher (`launcher/*.py`, its FSR 4 asset checks) and
+  `tools/gpu_capabilities.c` (the Vulkan GPU check, still in `build.sh` and run.sh's non-Mac
+  `live_resolution=auto`) predate the Metal renderer, which needs Metal; 0.5.3 kept them only
+  as upstream reference. Delete them, or fence them off as unmaintained, when nobody needs them.
+
 - **Metal-native: world geometry missing after long play (Hemwick graveyard, user's 0.4.5 test,
   2026-10-17).** After a long session a large rock wall and the terrain behind it drew as a flat
   fog-coloured hole; quit to menu and load restored them. Suspects: a missed CPU write to guest
@@ -427,6 +433,26 @@ Each item: what was done for now, what the refinement is, and where it lives.
   The same fix for 0.4.x is on branch `fix/low-alloc-free-list` (not merged). FINDINGS 2026-10-18.
 
 ## 2. Performance
+
+- **x86-64 GPU library: trim to the remote shim (M7 leftover, 2026-10-19).** The game process
+  loads an x86-64 libbbgpu that only runs in remote mode, yet it compiles the whole Metal
+  renderer, FSR 3.1 (FidelityFX host code), MetalFX, ImGui and SPIRV-Cross (so bootstrap still
+  builds SPIRV-Cross for x86-64). *Done in 0.5.3:* an exported-symbols list
+  (`gpu/shim/bbgpu_game.exports`) plus dead stripping: 15.5 → 13.4 MB. The rest stays reachable
+  through the single-process branches of gnmdriver.cpp, driver.cpp and video_out.cpp
+  (`if (BbSplit::Remote()) ... else <renderer>`). *Measured:* with `Remote()` a compile-time
+  `true` in that build the library is 5.0 MB (scratch experiment, not committed). *Why not
+  yet:* that changes behaviour before `bbgpu_init_remote` (the mode is still Single then):
+  `bbgpu_handle_fault` would relay faults to a host that has not started its renderer, and
+  `bbgpu_split_keyboard`/`InvalidateMemory` would dereference a null shared block before
+  `bbgpu_split_attach`. *Refinement:* make the game side's mode explicit from the start (or
+  guard those entry points), delete the single-process branches, then leave the renderer,
+  ffx_metal, MetalFX, the overlay and SPIRV-Cross out of the x86-64 build (and bootstrap).
+  Needs game runs: boot, movies (AvPlayer), save load, restart, text entry, fault relays.
+- **SDL is still built with its Vulkan support (2026-10-19).** The window is a Metal window now,
+  so SDL never loads a Vulkan library, but libSDL3 still contains the loader code and names
+  `libvulkan`/`libMoltenVK` as candidates. `-DSDL_VULKAN=OFF` in `bootstrap_deps.sh` would drop
+  it; untested (needs a fresh bootstrap of both architectures and a game run).
 
 - **Ideas from DiAvisoo/bbport-mac-optimized (bmy's engine on KosmicKrisp, 2026-10-19).**
   (a) Skipping attachmentless draws without shader writes or queries (`BB_SKIP_EMPTY_DRAWS`, off

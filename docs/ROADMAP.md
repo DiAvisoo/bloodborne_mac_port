@@ -49,6 +49,8 @@ roadmap, from before the Mac port, is kept in [ROADMAP_UPSTREAM.md](ROADMAP_UPST
   main thread's loading work (from PR #20, MojahedAbushawish).
 - **Launcher Advanced tab** with the in-game menu's options (#15). The unused Renderer picker is
   gone.
+- **Cleanup:** MoltenVK, the Vulkan loader, FSR 4 and the single-process mode are gone from the
+  app and the build: a 4.5 MB smaller download (milestone M7 of the Metal renderer plan).
 
 **From contributors, once reviewed and tested**
 - **Mouse look** (PR #20), then **rebindable keyboard and mouse controls** with a Controls tab
@@ -62,8 +64,6 @@ roadmap, from before the Mac port, is kept in [ROADMAP_UPSTREAM.md](ROADMAP_UPST
   geometry here on 2026-10-13.
 
 **Planned**
-- **Cleanup:** MoltenVK, the Vulkan loader, FSR 4 and the single-process mode leave the app, for a
-  smaller download and a simpler build (milestone M7 of the Metal renderer plan).
 - **Hide the mouse cursor** during play (#18; PR #20's capture on click covers most of it).
 - **Fewer render passes:** first re-measure encoders and passes per frame on the Metal renderer,
   then merge the avoidable splits. Expected 10–20% where the GPU is the limit, mostly at 1440p

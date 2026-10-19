@@ -87,7 +87,7 @@ fetch Vulkan-Headers https://github.com/KhronosGroup/Vulkan-Headers.git $VULKAN_
 fetch magic_enum https://github.com/Neargye/magic_enum.git $MAGIC_ENUM_TAG
 fetch robin-map https://github.com/Tessil/robin-map.git $ROBIN_MAP_TAG
 fetch FFmpeg https://github.com/FFmpeg/FFmpeg.git $FFMPEG_TAG
-# SPIR-V -> MSL for the Metal renderer (both libraries compile it until M7 trims the x86-64 one).
+# SPIR-V -> MSL for the Metal renderer (the x86-64 library still compiles it: MACOS_BACKLOG).
 fetch SPIRV-Cross https://github.com/KhronosGroup/SPIRV-Cross.git $VULKAN_TAG
 
 cmake_dep Vulkan-Headers .

@@ -1412,3 +1412,29 @@ Full screen (`fullscreen=1`, MetalFX 1440p, 60 cap, app not focused): 59.5-59.8 
 game-side spikes per run and worst frames of 25 ms (three 120 Hz refreshes), on master and on
 the cleanup branch alike; windowed the same runs have 0 spikes. The user plays full screen and
 reports smooth play, so this is likely the unfocused harness. Not chased.
+
+## 0.5.3 cleanup: no MoltenVK or Vulkan loader in the app (2026-10-19)
+
+Milestone M7 of the Metal renderer plan, branch `cleanup-0.5.3`: MoltenVK, the Vulkan loader,
+VMA, Zydis, xbyak, FSR 4's tools and the `renderer` setting left the build and the app.
+`bash scripts/macos/package_app.sh` on the M4 Max, before (5e27895) and after:
+
+| | Before | After |
+|---|---|---|
+| Zip | 51,280,513 bytes | 46,736,600 bytes (−4.5 MB, −8.9%) |
+| App (sum of files) | 134,629,957 bytes | 119,700,516 bytes (−14.9 MB) |
+| libbbgpu (x86-64 slice) | 15.9 MB | 13.6 MB (exported symbols list + dead stripping) |
+| Gone from Frameworks | | libMoltenVK (10.9 MB, universal), libvulkan.1 (1.4 MB) |
+
+- No Mach-O in the bundle links a Vulkan library or imports a `vk*` symbol (`otool -L`,
+  `nm -u`); `package_app.sh` now fails if one does. Before: bb-probe imported 26 `vk*` functions
+  (the `--vulkan-only` smoke test), bb-gpu-capabilities 7.
+- SDL created a Vulkan window (`SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN`), which makes SDL load a
+  Vulkan library; the window is a Metal window now. The split test (host window) passes.
+- `live_resolution=auto`: the removed Vulkan check answered 0 on every Mac (MoltenVK reports
+  Apple GPUs as integrated; it wanted a discrete GPU), so run.sh answers 0 itself on macOS.
+- The x86-64 library with `BbSplit::Remote()` a compile-time `true` (scratch experiment): 5.0 MB.
+  Not done: it changes behaviour before `bbgpu_init_remote` (MACOS_BACKLOG, Performance).
+- `build_macos.sh --test`: the same PASS lines as before minus the two MoltenVK interop runs
+  (221 vs 223), the same error lines. A build against a copy of `deps/` without the loader,
+  MoltenVK, VMA, Zydis and xbyak (symlink overlay) succeeds.

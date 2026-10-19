@@ -196,8 +196,8 @@ if (APPLE)
         set_property(TARGET bbgpu APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shim/bbgpu_game.exports)
     endif()
     # The Metal renderer: SPIR-V -> MSL through SPIRV-Cross (deps/<arch>, bootstrap_deps.sh). The
-    # x86-64 library compiles it too (split mode never runs it there) until M7 trims that library
-    # to the remote shim.
+    # x86-64 library compiles it too (the game's side never runs it) until that library is trimmed
+    # to the remote shim (MACOS_BACKLOG, Performance).
     find_package(spirv_cross_core CONFIG REQUIRED)
     find_package(spirv_cross_glsl CONFIG REQUIRED)
     find_package(spirv_cross_msl CONFIG REQUIRED)
