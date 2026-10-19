@@ -3,8 +3,7 @@
 #  - x86_64 (default) -> deps/x86_64: bb-probe and the game run under Rosetta 2, so every
 #    library linked into that process must be x86-64.
 #  - arm64 (BB_DEPS_ARCH=arm64) -> deps/arm64: the native GPU host process (bbgpu-host, see
-#    docs/DESIGN_NATIVE_GPU_PROCESS.md). Same pinned set minus the x86-only Zydis/Zycore/xbyak
-#    (they only serve the x86 SRT-walker JIT in the shader recompiler).
+#    docs/DESIGN_NATIVE_GPU_PROCESS.md). The same pinned set.
 # Each architecture has its own prefix, build directory and stamps; neither ever sees the
 # other's libraries. No Vulkan loader or MoltenVK (removed in 0.5.3: the renderer is Metal);
 # Vulkan-Headers stay for Vulkan-Hpp's types, SPIRV-Cross turns the shaders' SPIR-V into MSL.
@@ -33,11 +32,9 @@ SDL_TAG=release-3.4.18
 FMT_TAG=11.2.0
 XXHASH_TAG=v0.8.3
 MINIZ_TAG=3.1.2
-ZYDIS_TAG=v4.1.1
 VULKAN_TAG=vulkan-sdk-1.4.363.0
 MAGIC_ENUM_TAG=v0.9.7
 ROBIN_MAP_TAG=v1.4.0
-XBYAK_TAG=v7.43
 FFMPEG_TAG=n7.1.5
 
 if [[ ${BB_DEPS_CLEAN:-} == 1 ]]; then rm -rf "$BUILD" "$PREFIX"; fi
@@ -86,11 +83,9 @@ fetch SDL https://github.com/libsdl-org/SDL.git $SDL_TAG
 fetch fmt https://github.com/fmtlib/fmt.git $FMT_TAG
 fetch xxHash https://github.com/Cyan4973/xxHash.git $XXHASH_TAG
 fetch miniz https://github.com/richgel999/miniz.git $MINIZ_TAG
-[[ $ARCH == x86_64 ]] && fetch zydis https://github.com/zyantific/zydis.git $ZYDIS_TAG
 fetch Vulkan-Headers https://github.com/KhronosGroup/Vulkan-Headers.git $VULKAN_TAG
 fetch magic_enum https://github.com/Neargye/magic_enum.git $MAGIC_ENUM_TAG
 fetch robin-map https://github.com/Tessil/robin-map.git $ROBIN_MAP_TAG
-[[ $ARCH == x86_64 ]] && fetch xbyak https://github.com/herumi/xbyak.git $XBYAK_TAG
 fetch FFmpeg https://github.com/FFmpeg/FFmpeg.git $FFMPEG_TAG
 # SPIR-V -> MSL for the Metal renderer (both libraries compile it until M7 trims the x86-64 one).
 fetch SPIRV-Cross https://github.com/KhronosGroup/SPIRV-Cross.git $VULKAN_TAG
@@ -100,19 +95,12 @@ cmake_dep SDL . -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=
 cmake_dep fmt . -DFMT_TEST=OFF -DFMT_DOC=OFF
 cmake_dep xxHash cmake_unofficial -DBUILD_SHARED_LIBS=OFF -DXXHASH_BUILD_XXHSUM=OFF
 cmake_dep miniz . -DBUILD_SHARED_LIBS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_FUZZERS=OFF
-if [[ $ARCH == x86_64 ]]; then
-    # Zydis builds against its bundled Zycore, but its installed CMake config also needs an
-    # installed Zycore (find_dependency): install the same copy separately.
-    cmake_dep zycore ../zydis/dependencies/zycore -DZYCORE_BUILD_SHARED_LIB=OFF
-    cmake_dep zydis . -DZYDIS_BUILD_TOOLS=OFF -DZYDIS_BUILD_EXAMPLES=OFF -DZYDIS_BUILD_DOXYGEN=OFF
-fi
 cmake_dep magic_enum . -DMAGIC_ENUM_OPT_BUILD_EXAMPLES=OFF -DMAGIC_ENUM_OPT_BUILD_TESTS=OFF
 cmake_dep robin-map .
 cmake_dep SPIRV-Cross . -DSPIRV_CROSS_SHARED=OFF -DSPIRV_CROSS_STATIC=ON \
     -DSPIRV_CROSS_CLI=OFF -DSPIRV_CROSS_ENABLE_TESTS=OFF -DSPIRV_CROSS_ENABLE_HLSL=OFF \
     -DSPIRV_CROSS_ENABLE_CPP=OFF -DSPIRV_CROSS_ENABLE_REFLECT=OFF -DSPIRV_CROSS_ENABLE_C_API=OFF \
     -DSPIRV_CROSS_ENABLE_UTIL=OFF
-[[ $ARCH == x86_64 ]] && cmake_dep xbyak .
 
 # Boost is used header-only; headers are architecture-independent.
 if [[ ! -e $PREFIX/include/boost ]]; then

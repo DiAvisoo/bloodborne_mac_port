@@ -112,7 +112,7 @@ cp LICENSE "$lic/LICENSE-bloodborne-mac-port.txt"
 cp "$stdlib/LICENSE.txt" "$lic/LICENSE-Python.txt"
 for pair in SDL:LICENSE.txt Vulkan-Headers:LICENSE.md SPIRV-Cross:LICENSE FFmpeg:COPYING.LGPLv2.1 \
             FFmpeg:LICENSE.md fmt:LICENSE magic_enum:LICENSE miniz:LICENSE robin-map:LICENSE \
-            xxHash:LICENSE zydis:LICENSE xbyak:COPYRIGHT; do
+            xxHash:LICENSE; do
     cp "deps/src/${pair%%:*}/${pair#*:}" "$lic/LICENSE-${pair%%:*}-${pair#*:}"
 done
 for pair in fsr-vulkan:LICENSE.txt fsr-vulkan:NOTICE.md half:LICENSE.txt imgui:LICENSE.txt sirit:LICENSE.txt \
