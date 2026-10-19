@@ -185,8 +185,6 @@ EOF
 # The launcher window (launcher/, Swift): settings, folders, Play.
 bash scripts/macos/build_launcher.sh
 install -m755 out/launcher/Bloodborne "$contents/MacOS/Bloodborne"
-# The launcher offers the renderer choice only in builds with the Metal renderer.
-if [[ -d gpu/shadps4/video_core/renderer_metal ]]; then touch "$contents/Resources/port/metal-renderer"; fi
 
 # Ad-hoc signature (arm64 code must be signed to run; install_name_tool invalidated the build's).
 find "$contents/MacOS" "$contents/Frameworks" "$py" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.so' \) -print0 |

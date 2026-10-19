@@ -60,13 +60,20 @@ do {
     let defaults = GameSettings(ini: IniFile())
     check(defaults == GameSettings(), "empty ini = defaults")
     check(defaults.output == PixelSize(1920, 1080) && defaults.upscaler == .off && defaults.preset == 0, "default display")
-    check(defaults.frameCap == .fps60 && !defaults.fullscreen && defaults.renderer == .vulkan, "default cap, window, renderer")
+    check(defaults.frameCap == .fps60 && !defaults.fullscreen, "default cap, window")
+    check(!defaults.jitter && defaults.modelDetail == .gameDefault && !defaults.reactive && defaults.reactiveScale == 1.0 && defaults.reactiveThreshold == 0.2 && defaults.reactiveMax == 0.9, "default advanced (bbport_settings.h)")
+    check(!defaults.objectMotion && defaults.liveResolution == .off && defaults.effects["debug_camera"] == false && defaults.effects["debug_menu"] == false, "default advanced, debug")
     check(defaults.effects["effect_dof"] == true && defaults.effects["effect_ssr"] == false && defaults.effects["skip_intro"] == false, "default effects")
     check(defaults.sharpen && defaults.sharpness == 0.3 && !defaults.showFPS && !defaults.metalHUD && defaults.shaderCompile == .balanced, "default extras")
 
     let read = GameSettings(ini: IniFile(text: "upscaler=metalfx\npreset=2\noutput_res=2560x1440\nfps_cap=40\nfullscreen=1\neffect_dof=0\nshow_fps=1\nmetal_hud=1\nrenderer=metal\nshader_compile=skip\nsharpness=0.75\n"))
     check(read.upscaler == .metalfx && read.preset == 2 && read.output == PixelSize(2560, 1440), "read display")
-    check(read.frameCap == .fps40 && read.fullscreen && read.renderer == .metal && read.shaderCompile == .skip, "read launcher keys")
+    check(read.frameCap == .fps40 && read.fullscreen && read.shaderCompile == .skip, "read launcher keys")
+    let advanced = GameSettings(ini: IniFile(text: "jitter=1\nmodel_lod=-2\nreactive=1\nreactive_scale=2.5\nreactive_threshold=0.4\nreactive_max=0.7\nobject_motion=1\nlive_resolution=auto\ndebug_camera=1\n"))
+    check(advanced.jitter && advanced.modelDetail == .highest && advanced.reactive && advanced.reactiveScale == 2.5, "read advanced")
+    check(advanced.reactiveThreshold == 0.4 && advanced.reactiveMax == 0.7 && advanced.objectMotion && advanced.liveResolution == .auto && advanced.effects["debug_camera"] == true, "read advanced, debug")
+    let bad = GameSettings(ini: IniFile(text: "model_lod=7\nreactive_threshold=3\nlive_resolution=2\n"))
+    check(bad.modelDetail == .gameDefault && bad.reactiveThreshold == 0.2 && bad.liveResolution == .off, "invalid advanced values -> defaults")
     check(read.effects["effect_dof"] == false && read.showFPS && read.metalHUD && read.sharpness == 0.75, "read effects")
     check(read.renderSize == PixelSize(1506, 848), "render size follows output and preset")
     check(GameSettings(ini: IniFile(text: "upscaler=taa\npreset=3\n")).renderSize == PixelSize(1920, 1080), "TAA renders native")
@@ -76,16 +83,21 @@ do {
     let odd = GameSettings(ini: other)
     check(odd.output == PixelSize(3008, 1692) && odd.upscaler == .fsr4, "unlisted output and FSR 4 kept")
     check(odd.frameCap == .fps60 && odd.preset == 0 && odd.sharpness == 0.3, "invalid values -> defaults")
-    odd.apply(to: &other, includeRenderer: false)
+    odd.apply(to: &other)
     check(other["output_res"] == "3008x1692" && other["upscaler"] == "fsr4", "written back unchanged")
     check(other["fsr4_auto_exposure"] == "1" && other["renderer"] == nil, "other keys kept; no renderer key")
     var changed = read
     changed.output = PixelSize(3840, 2160)
     changed.effects["effect_ssr"] = true
-    var file = IniFile(text: "# header\nupscaler=metalfx\njitter=1\n")
-    changed.apply(to: &file, includeRenderer: true)
-    check(file["output_res"] == "3840x2160" && file["effect_ssr"] == "1" && file["jitter"] == "1", "apply writes and keeps")
-    check(file["fps_cap"] == "40" && file["fullscreen"] == "1" && file["renderer"] == "metal" && file["sharpness"] == "0.75", "apply launcher keys")
+    changed.modelDetail = .lowest
+    changed.liveResolution = .auto
+    changed.effects["debug_menu"] = true
+    var file = IniFile(text: "# header\nupscaler=metalfx\nrenderer=vulkan\n")
+    changed.apply(to: &file)
+    check(file["output_res"] == "3840x2160" && file["effect_ssr"] == "1" && file["renderer"] == "vulkan", "apply writes and keeps")
+    check(file["fps_cap"] == "40" && file["fullscreen"] == "1" && file["sharpness"] == "0.75", "apply launcher keys")
+    check(file["model_lod"] == "2" && file["live_resolution"] == "auto" && file["debug_menu"] == "1" && file["jitter"] == "0", "apply advanced keys")
+    check(file["reactive_scale"] == "1.00" && file["reactive_threshold"] == "0.20" && file["reactive_max"] == "0.90" && file["object_motion"] == "0", "apply reactive keys")
     check(file["metal_hud"] == "1", "apply writes the Metal HUD key")
     check(file.text.hasPrefix("# header\n"), "header kept")
     // Review focus 3: reloading after the game's menu changed the file picks up its values.
@@ -170,9 +182,6 @@ do {
     let packaged = Layout.detect(bundleURL: app, info: ["BBRepository": repo.path])
     check(packaged == .packaged(contents: contents), "packaged app (run.sh inside wins)")
 
-    check(!packaged!.hasMetalRenderer, "no Metal marker")
-    try? Data().write(to: port.appendingPathComponent("metal-renderer"))
-    check(packaged!.hasMetalRenderer, "Metal marker")
 
     let home = URL(fileURLWithPath: "/Users/h")
     let defaultData = home.appendingPathComponent("Library/Application Support/Bloodborne")

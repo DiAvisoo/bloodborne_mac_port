@@ -61,7 +61,7 @@ final class LauncherModel: ObservableObject {
 
     func save() {
         config.apply(to: &confFile)
-        settings.apply(to: &settingsFile, includeRenderer: layout.hasMetalRenderer)
+        settings.apply(to: &settingsFile)
         do {
             try confFile.write(to: confURL)
             try settingsFile.write(to: settingsURL)

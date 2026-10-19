@@ -39,10 +39,31 @@ enum ShaderCompile: String, CaseIterable, Identifiable {
     }
 }
 
-enum Renderer: String, CaseIterable, Identifiable {
-    case vulkan, metal
+/// bbport.ini model_lod: the level-of-detail bias (in-game menu: Graphics → Model detail).
+enum ModelDetail: Int, CaseIterable, Identifiable {
+    case highest = -2, gameDefault = 0, lower = 1, lowest = 2
+    var id: Int { rawValue }
+    var label: String {
+        switch self {
+        case .highest: "Highest"
+        case .gameDefault: "Game default"
+        case .lower: "Lower"
+        case .lowest: "Lowest"
+        }
+    }
+}
+
+/// bbport.ini live_resolution, read by run.sh at start (in-game menu: Advanced → Resolution).
+enum LiveResolution: String, CaseIterable, Identifiable {
+    case auto, off = "0", on = "1"
     var id: String { rawValue }
-    var label: String { self == .metal ? "Metal" : "MoltenVK (Vulkan)" }
+    var label: String {
+        switch self {
+        case .auto: "Auto"
+        case .off: "Off"
+        case .on: "On"
+        }
+    }
 }
 
 struct Effect: Identifiable {
@@ -65,8 +86,11 @@ struct GameSettings: Equatable {
         Effect(key: "effect_ssr", label: "Screen-space reflections (not in the original)", defaultOn: false),
         Effect(key: "effect_game_aa", label: "The game's own anti-aliasing", defaultOn: true),
         Effect(key: "skip_intro", label: "Skip intro videos", defaultOn: false),
+        Effect(key: "debug_camera", label: "Free camera (Cross + L3)", defaultOn: false),
+        Effect(key: "debug_menu", label: "Debug menu (needs font files)", defaultOn: false),
     ]
-    static var visualEffects: [Effect] { effects.filter { $0.key != "skip_intro" } }
+    static var visualEffects: [Effect] { effects.filter { $0.key != "skip_intro" && !$0.key.hasPrefix("debug_") } }
+    static var debugEffects: [Effect] { effects.filter { $0.key.hasPrefix("debug_") } }
     static let newFileHeader = "# bbport settings (in-game menu: Cmd+, / L3+R3)\n"
 
     var output = Resolution.defaultOutput
@@ -79,8 +103,16 @@ struct GameSettings: Equatable {
     var effects = Dictionary(uniqueKeysWithValues: GameSettings.effects.map { ($0.key, $0.defaultOn) })
     var frameCap = FrameCap.fps60
     var fullscreen = false
-    var renderer = Renderer.vulkan
     var shaderCompile = ShaderCompile.balanced
+    // The in-game menu's Graphics and Advanced options (gpu/shim/bbport_settings.h, same defaults).
+    var jitter = false
+    var modelDetail = ModelDetail.gameDefault
+    var reactive = false
+    var reactiveScale = 1.0
+    var reactiveThreshold = 0.2
+    var reactiveMax = 0.9
+    var objectMotion = false
+    var liveResolution = LiveResolution.off
 
     init() {}
 
@@ -99,13 +131,24 @@ struct GameSettings: Equatable {
         }
         if let v = ini["fps_cap"], let n = Int(v), let cap = FrameCap(rawValue: n) { frameCap = cap }
         if let v = flag("fullscreen") { fullscreen = v }
-        if let v = ini["renderer"], let r = Renderer(rawValue: v) { renderer = r }
         if let v = ini["shader_compile"], let s = ShaderCompile(rawValue: v) { shaderCompile = s }
+        // Ranges as the game clamps them.
+        func number(_ key: String, _ range: ClosedRange<Double>) -> Double? {
+            ini[key].flatMap(Double.init).flatMap { range.contains($0) ? $0 : nil }
+        }
+        if let v = flag("jitter") { jitter = v }
+        if let v = ini["model_lod"], let n = Int(v), let d = ModelDetail(rawValue: n) { modelDetail = d }
+        if let v = flag("reactive") { reactive = v }
+        if let v = number("reactive_scale", 0...16) { reactiveScale = v }
+        if let v = number("reactive_threshold", 0...1) { reactiveThreshold = v }
+        if let v = number("reactive_max", 0...1) { reactiveMax = v }
+        if let v = flag("object_motion") { objectMotion = v }
+        if let v = ini["live_resolution"], let l = LiveResolution(rawValue: v) { liveResolution = l }
     }
 
-    /// Writes the launcher's settings into `ini`; every other line stays. `includeRenderer`:
-    /// the build has the Metal renderer (otherwise no renderer key is written).
-    func apply(to ini: inout IniFile, includeRenderer: Bool) {
+    /// Writes the launcher's settings into `ini`; every other line stays (the `renderer` key too:
+    /// macOS always uses the Metal renderer now).
+    func apply(to ini: inout IniFile) {
         ini["output_res"] = output.iniValue
         ini["upscaler"] = upscaler.rawValue
         ini["preset"] = String(preset)
@@ -118,10 +161,15 @@ struct GameSettings: Equatable {
         }
         ini["fps_cap"] = String(frameCap.rawValue)
         ini["fullscreen"] = fullscreen ? "1" : "0"
-        if includeRenderer {
-            ini["renderer"] = renderer.rawValue
-        }
         ini["shader_compile"] = shaderCompile.rawValue
+        ini["jitter"] = jitter ? "1" : "0"
+        ini["model_lod"] = String(modelDetail.rawValue)
+        ini["reactive"] = reactive ? "1" : "0"
+        ini["reactive_scale"] = String(format: "%.2f", reactiveScale)
+        ini["reactive_threshold"] = String(format: "%.2f", reactiveThreshold)
+        ini["reactive_max"] = String(format: "%.2f", reactiveMax)
+        ini["object_motion"] = objectMotion ? "1" : "0"
+        ini["live_resolution"] = liveResolution.rawValue
     }
 
     /// The scene size the game renders.

@@ -48,15 +48,6 @@ enum Layout: Equatable {
         return nil
     }
 
-    var hasMetalRenderer: Bool {
-        switch self {
-        case let .packaged(contents):
-            FileManager.default.fileExists(atPath: contents.appendingPathComponent("Resources/port/metal-renderer").path)
-        case let .checkout(repo, _):
-            FileManager.default.fileExists(atPath: repo.appendingPathComponent("gpu/shadps4/video_core/renderer_metal").path)
-        }
-    }
-
     private static func home(_ env: [String: String]) -> URL {
         URL(fileURLWithPath: env["HOME"] ?? NSHomeDirectory())
     }
