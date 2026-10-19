@@ -113,7 +113,6 @@ enum Layout: Equatable {
             environment["BB_PROBE"] = contents.appendingPathComponent("MacOS/bb-probe").path
             environment["PYTHON"] = contents.appendingPathComponent("Resources/python/bin/python3").path
             environment["PYTHONDONTWRITEBYTECODE"] = "1"
-            environment["VK_DRIVER_FILES"] = port.appendingPathComponent("MoltenVK_icd.json").path
             return LaunchPlan(executable: bash, arguments: [port.appendingPathComponent("run.sh").path],
                               environment: environment, directory: port)
         case let .checkout(repo, app):

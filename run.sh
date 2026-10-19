@@ -16,7 +16,7 @@ fi
 # BB_DATA_DIR: writable directory for the generated files (out/), saves (user/) and bbport.ini;
 # by default this directory (macOS: ~/Library/Application Support/Bloodborne).
 data=${BB_DATA_DIR:-.}
-# macOS: the x86-64 build runs under Rosetta 2 on MoltenVK from deps/ (scripts/macos/bootstrap_deps.sh).
+# macOS: the game process (x86-64) runs under Rosetta 2; a native arm64 process renders with Metal.
 macos=0
 if [[ $(uname -s) == Darwin ]]; then
     macos=1
@@ -34,8 +34,6 @@ if [[ $(uname -s) == Darwin ]]; then
             [[ -e Saves || -L Saves ]] || ln -s "$data/user/savedata" Saves 2>/dev/null || true
         fi
     fi
-    icd=$PWD/deps/x86_64/share/vulkan/icd.d/MoltenVK_icd.json
-    if [[ -z ${VK_DRIVER_FILES:-} && -f $icd ]]; then export VK_DRIVER_FILES=$icd; fi
 fi
 out=$data/out
 mkdir -p "$out"
@@ -110,7 +108,11 @@ if [[ -n ${scaled_output:-} ]]; then
             [[ $line =~ ^live_resolution=([01]|auto)$ ]] && live=${BASH_REMATCH[1]}
         done < "$BB_CONFIG"
     fi
-    if [[ $live == auto ]]; then
+    # macOS: off. The Vulkan check (bb-gpu-capabilities) wanted a discrete GPU with 8 GB; Apple
+    # GPUs are integrated, so it always answered 0 on a Mac.
+    if [[ $live == auto ]] && (( macos )); then
+        live=0
+    elif [[ $live == auto ]]; then
         if [[ -n ${BB_PROBE:-} ]]; then caps=$(dirname -- "$BB_PROBE")/bb-gpu-capabilities
         elif [[ -n ${BB_PREBUILT:-} ]]; then caps=bin/bb-gpu-capabilities
         else caps=out/bb-gpu-capabilities; fi

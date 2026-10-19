@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the GPU library (gpu/: shadPS4 video core + drivers) natively for arm64, for the native
-# GPU host process bbgpu-host (docs/DESIGN_NATIVE_GPU_PROCESS.md, M2). The x86-64 build used by
-# the single-process game stays in build_macos.sh (out/gpu); this one goes to out/gpu-arm64.
+# GPU host process bbgpu-host (docs/DESIGN_NATIVE_GPU_PROCESS.md), which renders with Metal. The
+# x86-64 build loaded by the game (bb-probe) stays in build_macos.sh (out/gpu); this one goes to
+# out/gpu-arm64.
 # Dependencies come from deps/arm64 (BB_DEPS_ARCH=arm64 bash scripts/macos/bootstrap_deps.sh);
 # nothing from deps/x86_64 or the arm64 Homebrew is linked (Boost headers aside).
 #
@@ -13,7 +14,7 @@ ROOT=$PWD
 PREFIX=$ROOT/deps/arm64
 OUT=$ROOT/out/gpu-arm64
 export MACOSX_DEPLOYMENT_TARGET=15.0
-if [[ ! -f $PREFIX/.built-MoltenVK ]]; then
+if [[ ! -f $PREFIX/.built-SPIRV-Cross ]]; then
     echo 'arm64 dependencies missing: run BB_DEPS_ARCH=arm64 bash scripts/macos/bootstrap_deps.sh' >&2
     exit 1
 fi
@@ -39,7 +40,7 @@ cmake -S gpu -B "$OUT" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_PREFIX_PATH="$PREFIX;$boost" \
     -DCMAKE_IGNORE_PREFIX_PATH="/opt/homebrew;/usr/local;$ROOT/deps/x86_64" \
     -DBoost_INCLUDE_DIR="$boost/include" \
-    -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$ROOT/pgo" -DBB_METAL_NATIVE_STAGE=6 -Wno-dev >/dev/null
+    -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$ROOT/pgo" -Wno-dev >/dev/null
 echo "GPU library (arm64): LTO ${BB_LTO:-ON}"
 if ! ninja -C "$OUT" bbgpu > "$ROOT/out/gpu-arm64-build.log" 2>&1; then
     grep -v '^\[' "$ROOT/out/gpu-arm64-build.log" | tail -40 >&2

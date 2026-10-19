@@ -201,7 +201,7 @@ do {
     check(p.environment["BB_LAUNCH_CONF"] == packaged!.launchConfURL(env: env).path, "launch.conf for the in-game menu")
     check(p.environment["BB_PREBUILT"] == "1" && p.environment["BB_PROBE"] == contents.appendingPathComponent("MacOS/bb-probe").path, "prebuilt probe")
     check(p.environment["PYTHON"] == contents.appendingPathComponent("Resources/python/bin/python3").path, "bundled Python")
-    check(p.environment["VK_DRIVER_FILES"] == port.appendingPathComponent("MoltenVK_icd.json").path, "bundled MoltenVK")
+    check(p.environment["VK_DRIVER_FILES"] == nil, "no Vulkan driver (Metal renderer)")
     check(p.environment["BB_SAVE_DIR"] == nil && p.directory.path == port.path, "default saves; runs in port")
     let saves = URL(fileURLWithPath: "/Volumes/Drive/Hunter's saves")
     let c = checkout!.launchPlan(gameDir: game, saveDir: saves, dataDir: defaultData, env: env.merging(["BB_SAVE_DIR": "/stale"]) { $1 })

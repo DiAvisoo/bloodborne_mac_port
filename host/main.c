@@ -30,7 +30,6 @@
 #include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
-#include <libgen.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <libproc.h>
@@ -321,18 +320,6 @@ static int map_shared(void) {
     return 0;
 }
 
-/* The Vulkan loader needs the MoltenVK driver manifest: run.sh exports one (the universal
- * MoltenVK works here too); without it, use deps/arm64 next to out/. */
-static void find_vulkan_driver(void) {
-    if (getenv("VK_DRIVER_FILES")) return;
-    char exe[PATH_MAX], real[PATH_MAX], icd[PATH_MAX];
-    uint32_t n = sizeof exe;
-    if (_NSGetExecutablePath(exe, &n) || !realpath(exe, real)) return;
-    snprintf(icd, sizeof icd, "%s/../deps/arm64/share/vulkan/icd.d/MoltenVK_icd.json", dirname(real));
-    if (access(icd, R_OK) == 0) setenv("VK_DRIVER_FILES", icd, 1);
-    else say("no VK_DRIVER_FILES and no %s: Vulkan may find no driver", icd);
-}
-
 /* Names what already occupies the guest range (the reservation failed on an M2 Max, issue #2). */
 static void report_guest_range(void) {
     mach_vm_address_t at = BBGPU_GUEST_MIN;
@@ -399,7 +386,6 @@ static int reserve_guest_range(void) {
 int main(int argc, char **argv) {
     /* bbgpu-host --msl-check <spv dir> [msl cache dir]: the Metal back end's shader check. */
     if (argc >= 3 && !strcmp(argv[1], "--msl-check")) return bbgpu_msl_check(argv[2], argc >= 4 ? argv[3] : NULL);
-    find_vulkan_driver();
     /* A signal ends the host as a signal, not as SDL's polite quit event (exit status 0). */
     setenv("SDL_NO_SIGNAL_HANDLERS", "1", 1);
     say("pid %d, %s, page %d bytes", (int)getpid(), translated() ? "TRANSLATED (Rosetta)" : "native arm64", getpagesize());

@@ -117,7 +117,6 @@ static void print_exit_summary(void) {
         fclose(f);
     }
 }
-int vulkan_smoke(void);
 
 
 static void fail(const char *message) {
@@ -636,7 +635,7 @@ int main(int argc, char **argv) {
 #endif
     setvbuf(stdout, NULL, _IONBF, 0);
 #ifdef __APPLE__
-    /* Before SDL/MoltenVK map anything: on macOS large host mmaps land in the guest range. */
+    /* Before SDL maps anything: on macOS large host mmaps land in the guest range. */
     if (runtime_memory_reserve_space()) fail("cannot reserve guest address range");
     /* The native arm64 GPU process renders; the game stops if it cannot start. */
     gpu_process_start();
@@ -652,7 +651,6 @@ int main(int argc, char **argv) {
         g_bb_trace = 1;
     }
 
-    if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
     const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL;
@@ -688,7 +686,7 @@ int main(int argc, char **argv) {
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
 #endif
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--strict-imports] [--content-profile file] [--app0 dir] [--user dir] [--patches file] [--timeout seconds] | --vulkan-only\n", argv[0]);
+        fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--strict-imports] [--content-profile file] [--app0 dir] [--user dir] [--patches file] [--timeout seconds]\n", argv[0]);
         return 1;
     }
     if (content_profile) {
@@ -846,7 +844,7 @@ int main(int argc, char **argv) {
 #endif
         /* BB_SYNC_TRACE=1: lock calls in the Gnm check's report (load-crash hunt). */
         if (getenv("BB_SYNC_TRACE") && getenv("BB_SYNC_TRACE")[0]=='1') runtime_sync_hook = bbgpu_record_sync;
-        printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
+        printf("GPU: window and presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
     }
     image_size = size;
     resolved_targets = calloc(import_count + 1, sizeof(void *));
