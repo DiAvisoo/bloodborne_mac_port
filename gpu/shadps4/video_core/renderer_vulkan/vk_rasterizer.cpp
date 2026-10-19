@@ -84,6 +84,14 @@ Rasterizer::Rasterizer(Metal::Device& device_, Scheduler& scheduler_, Runtime& r
         constant_ring = std::make_unique<ConstantRing>(device, scheduler);
         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
     }
+    // bbport: the frame capture's event trace also lists the SRT walkers' guest reads.
+    if (std::getenv("BB_CAPTURE_TRIGGER")) {
+        Shader::srt_read_hook = [](u64 address, u32 size) {
+            if (FrameCapture::Tracing()) {
+                FrameCapture::Trace(fmt::format("W {:#x} {}", address, size));
+            }
+        };
+    }
     // bbport: this thread joins the texture binding helper before it changes image state.
     runtime.SetImageAccessHook(&JoinBindHelper, this);
 }
@@ -547,6 +555,10 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
             std::memcpy(dst, source, size);
         } else {
             memory->CopySparseMemory(address, dst, size);
+            if (FrameCapture::Tracing()) {
+                FrameCapture::Trace(fmt::format("R {} {:08x} {:#x} {}", u32(stage.sw_stage),
+                                                u32(stage.pgm_hash), address, size));
+            }
         }
         out.push_back({index, static_cast<u32>(size), *offset, address});
     };
@@ -1280,6 +1292,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
     NoteRead(buffer, base, stride * max_count);
+    if (FrameCapture::Tracing()) {
+        FrameCapture::Trace(fmt::format("A {:#x} {}", indirect.args, stride * max_count));
+    }
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
@@ -1855,6 +1870,9 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
         NoteRead(range.buffer, range.offset, size);
+        if (FrameCapture::Tracing()) {
+            FrameCapture::Trace(fmt::format("V {:#x} {}", range.base_address, size));
+        }
     }
 
     // The streams, by attribute location (fetch shader order, like guest_buffers). A V# without
@@ -1908,6 +1926,9 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     NoteRead(buffer, offset, index_buffer_size);
+    if (FrameCapture::Tracing()) {
+        FrameCapture::Trace(fmt::format("I {:#x} {}", index_address, index_buffer_size));
+    }
     index_bind = {buffer->Ref(offset), is_index16 ? Metal::IndexType::U16 : Metal::IndexType::U32};
 }
 
@@ -2157,6 +2178,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
             } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
                 const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
+                if (FrameCapture::Tracing()) {
+                    FrameCapture::Trace(fmt::format("M {} {:08x}", u32(stage.sw_stage),
+                                                    u32(stage.pgm_hash)));
+                }
                 // bbport: direct memory access (BB_DIRECT_MEMORY_ACCESS=1) reads any guest
                 // memory by address: the whole arena and the page table, for the ordering.
                 const auto stage_of_read = stage.sw_stage == Shader::SwStage::Fragment ||
@@ -2217,6 +2242,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                if (FrameCapture::Tracing()) {
+                    FrameCapture::Trace(fmt::format("B {} {:08x} {:#x} {} {}",
+                                                    u32(stage.sw_stage), u32(stage.pgm_hash),
+                                                    vsharp.base_address, size,
+                                                    desc.is_written ? 1 : 0));
+                }
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {

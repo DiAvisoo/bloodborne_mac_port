@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/host_shaders/buffer_multi_copy_comp.h"
 #include "bbport_toggles.h"
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -155,6 +156,11 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         const char* env = std::getenv("BB_COPY_MERGE_KB");
         return env ? u64(std::strtoull(env, nullptr, 10)) * 1024 : u64(64_KB);
     }();
+    if (FrameCapture::Tracing()) {
+        FrameCapture::Trace(fmt::format("S {} stride {} src {:#x} dst {:#x} ctl {:#x}",
+                                        cs_program.dim_x, buf_stride, src_buf_sharp.base_address,
+                                        dst_buf_sharp.base_address, ctl_buf_sharp.base_address));
+    }
     u32 batch_start = 0;
     u32 batch_end = 0;
 
@@ -212,17 +218,40 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         // ahead of the submission instead. In Bloodborne most of them rewrite entries of one
         // table between the draws that read it, so they stay in order (docs/FINDINGS.md).
         // BB_HOIST_UNSAFE=1 hoists them anyway: wrong image, a measurement bound only.
+        const bool tracing = FrameCapture::Tracing();
+        const bool was_rendering = runtime.GetScheduler().IsRendering();
+        const bool src_gpu = tracing && buffer_cache.IsRegionGpuModified(
+                                            src_buf_sharp.base_address + src_offset_min,
+                                            src_offset_max - src_offset_min);
+        const char* path = "inline";
         static const bool unsafe_hoist = std::getenv("BB_HOIST_UNSAFE") != nullptr;
         if (MultiCopy(rasterizer, src_buf, dst_buf, vk_copies)) {
+            path = "multi";
         } else if (unsafe_hoist && runtime.GetScheduler().IsRendering()) {
             runtime.GetScheduler().RecordHoistedCopy(src_buf->Ref(), dst_buf->Ref(),
                                                      vk_copies, true);
             BbStats::hoisted_shader_copies.fetch_add(1, std::memory_order_relaxed);
+            path = "unsafe";
         } else if (runtime.HoistCopy(src_buf, dst_buf, vk_copies, true)) {
             BbStats::hoisted_shader_copies.fetch_add(1, std::memory_order_relaxed);
+            path = "hoist";
         } else {
             BbStats::inline_shader_copies.fetch_add(1, std::memory_order_relaxed);
             runtime.CopyBuffer(*src_buf, *dst_buf, vk_copies);
+        }
+        if (tracing) {
+            // Absolute guest ranges: the batch's, then each destination range (offset+size from
+            // the batch's destination start).
+            std::string line = fmt::format(
+                "C {} rend {} srcgpu {} src {:#x} {} dst {:#x} {} n {} :",
+                path, was_rendering ? 1 : 0, src_gpu ? 1 : 0,
+                src_buf_sharp.base_address + src_offset_min, src_offset_max - src_offset_min,
+                dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min,
+                vk_copies.size());
+            for (const auto& copy : vk_copies) {
+                line += fmt::format(" {}+{}", copy.dst_offset - dst_buf_offset, copy.size);
+            }
+            FrameCapture::Trace(std::move(line));
         }
         runtime.NoteSubmissionUse(src_buf, src_buf_offset, src_offset_max - src_offset_min);
         runtime.NoteSubmissionUse(dst_buf, dst_buf_offset, dst_offset_max - dst_offset_min);

@@ -18,6 +18,7 @@
 
 #include "bbport_copy.h"
 #include "bbport_cpu.h"
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
@@ -211,6 +212,14 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         }
     }
     EndRendering();
+    if (FrameCapture::Tracing()) {
+        std::string line = fmt::format("P {}x{} d={}", new_state.width, new_state.height,
+                                       fmt::ptr(new_state.depth.texture));
+        for (u32 i = 0; i < new_state.num_colors; ++i) {
+            line += fmt::format(" c={}", fmt::ptr(new_state.colors[i].texture));
+        }
+        FrameCapture::Trace(std::move(line));
+    }
     is_rendering = true;
     render_state = new_state;
     Record([desc = render_state.ToDesc()](Metal::Encoder& e) { e.BeginRenderPass(desc); });
@@ -223,6 +232,9 @@ void Scheduler::EndRendering(std::source_location where, const char* detail) {
     if (pass_stats) {
         const std::string reason = Where(where) + detail;
         CountPass(&reason, false);
+    }
+    if (FrameCapture::Tracing()) {
+        FrameCapture::Trace(fmt::format("E {}:{}", where.file_name(), where.line()));
     }
     is_rendering = false;
     // Through the draw runs: waiting patch draws are drawn in this pass first.
