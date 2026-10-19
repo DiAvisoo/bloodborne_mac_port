@@ -320,6 +320,11 @@ else()
 endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
+add_executable(draw-pipe-wait-test EXCLUDE_FROM_ALL ../tests/test_draw_pipe_wait.cpp
+    shim/common/logging/log.cpp)
+target_include_directories(draw-pipe-wait-test PRIVATE shim shadps4)
+target_link_libraries(draw-pipe-wait-test PRIVATE fmt::fmt)
+target_compile_options(draw-pipe-wait-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
 target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(motion-history-test PRIVATE ..)
