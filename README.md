@@ -187,6 +187,7 @@ the log.
 - Signing and notarisation of the downloadable app (today it must be released from quarantine).
 
 Details:
+- Roadmap (released, next, later): [docs/ROADMAP.md](docs/ROADMAP.md)
 - Plan, design decisions and porting checklist: [docs/MACOS_PORT.md](docs/MACOS_PORT.md)
 - Known issues and planned refinements: [docs/MACOS_BACKLOG.md](docs/MACOS_BACKLOG.md)
 - Every test and measurement: [docs/FINDINGS.md](docs/FINDINGS.md)
