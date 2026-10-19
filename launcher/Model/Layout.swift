@@ -106,6 +106,8 @@ enum Layout: Equatable {
     func launchPlan(gameDir: URL, saveDir: URL?, dataDir: URL, env: [String: String]) -> LaunchPlan {
         var environment = env
         environment["BB_GAME_DIR"] = gameDir.path
+        // The in-game menu's "Show the launcher" toggle writes BB_SHOW_LAUNCHER there.
+        environment["BB_LAUNCH_CONF"] = launchConfURL(env: env).path
         if let saveDir {
             environment["BB_SAVE_DIR"] = saveDir.path
         } else {

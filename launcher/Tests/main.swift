@@ -189,6 +189,7 @@ do {
     let p = packaged!.launchPlan(gameDir: game, saveDir: nil, dataDir: defaultData, env: env)
     check(p.executable.path == "/bin/bash" && p.arguments == [port.appendingPathComponent("run.sh").path], "packaged runs its run.sh")
     check(p.environment["BB_GAME_DIR"] == game.path && p.environment["BB_DATA_DIR"] == defaultData.path, "game and data folder")
+    check(p.environment["BB_LAUNCH_CONF"] == packaged!.launchConfURL(env: env).path, "launch.conf for the in-game menu")
     check(p.environment["BB_PREBUILT"] == "1" && p.environment["BB_PROBE"] == contents.appendingPathComponent("MacOS/bb-probe").path, "prebuilt probe")
     check(p.environment["PYTHON"] == contents.appendingPathComponent("Resources/python/bin/python3").path, "bundled Python")
     check(p.environment["VK_DRIVER_FILES"] == port.appendingPathComponent("MoltenVK_icd.json").path, "bundled MoltenVK")

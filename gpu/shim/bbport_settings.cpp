@@ -283,6 +283,80 @@ void Save() {
     std::fclose(file);
 }
 
+namespace {
+
+const char* LaunchConfPath() {
+    const char* env = std::getenv("BB_LAUNCH_CONF");
+    return env && env[0] ? env : nullptr;
+}
+
+/// launch.conf's lines, without line ends.
+std::vector<std::string> LaunchConfLines() {
+    std::vector<std::string> lines;
+    if (FILE* file = std::fopen(LaunchConfPath(), "r")) {
+        char line[1024];
+        while (std::fgets(line, sizeof(line), file)) {
+            std::string text{line};
+            text.erase(text.find_last_not_of("\r\n") + 1);
+            lines.push_back(text);
+        }
+        std::fclose(file);
+    }
+    return lines;
+}
+
+constexpr std::string_view ShowLauncherKey = "BB_SHOW_LAUNCHER=";
+int show_launcher = -2; ///< -2: not read yet
+
+} // namespace
+
+int ShowLauncher() {
+    if (show_launcher == -2) {
+        show_launcher = -1;
+        if (LaunchConfPath()) {
+            show_launcher = 1; // the launcher's default when the key is absent
+            for (const std::string& line : LaunchConfLines()) {
+                if (line.starts_with(ShowLauncherKey)) {
+                    std::string value = line.substr(ShowLauncherKey.size());
+                    std::erase(value, '\'');
+                    std::erase(value, '"');
+                    show_launcher = value == "0" ? 0 : 1;
+                }
+            }
+        }
+    }
+    return show_launcher;
+}
+
+void SetShowLauncher(bool show) {
+    if (!LaunchConfPath()) {
+        return;
+    }
+    std::vector<std::string> lines = LaunchConfLines();
+    const std::string entry = std::string(ShowLauncherKey) + (show ? "1" : "0");
+    bool replaced = false;
+    for (std::string& line : lines) {
+        if (line.starts_with(ShowLauncherKey)) {
+            line = entry;
+            replaced = true;
+        }
+    }
+    if (!replaced) {
+        lines.push_back(entry);
+    }
+    FILE* file = std::fopen(LaunchConfPath(), "w");
+    if (!file) {
+        std::printf("Settings: cannot write %s\n", LaunchConfPath());
+        return;
+    }
+    for (const std::string& line : lines) {
+        std::fprintf(file, "%s\n", line.c_str());
+    }
+    std::fclose(file);
+    show_launcher = show ? 1 : 0;
+    std::printf("Settings: saved %s (BB_SHOW_LAUNCHER=%d)\n", LaunchConfPath(), show_launcher);
+}
+
 float PresetScale(int preset) {
     static constexpr float scales[PresetCount] = {1.0f, 1.5f, 1.7f, 2.0f, 3.0f};
     return scales[std::clamp(preset, 0, PresetCount - 1)];

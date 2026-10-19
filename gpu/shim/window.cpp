@@ -149,6 +149,12 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
             continue;
         }
+        // SDL sends button events only for opened gamepads. The game reads the pad in bb-probe
+        // (runtime_pad.c), so in the GPU process nothing else opens it: without this the menu
+        // never saw L3+R3 or its gamepad navigation.
+        if (event.type == SDL_EVENT_GAMEPAD_ADDED) {
+            SDL_OpenGamepad(event.gdevice.which);
+        }
         if (BbOverlay::HandleEvent(event)) {
             continue;
         }

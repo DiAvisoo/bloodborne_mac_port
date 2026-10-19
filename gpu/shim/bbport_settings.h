@@ -127,6 +127,12 @@ bool ResolutionNeedsRestart();
 /// Writes the file (menu changes).
 void Save();
 
+/// The launcher's "show every time" choice in launch.conf (BB_LAUNCH_CONF, set by the launcher):
+/// 1 or 0, or -1 when the launcher did not start the game. Read once, then cached.
+int ShowLauncher();
+/// Rewrites BB_SHOW_LAUNCHER in launch.conf; every other line is kept.
+void SetShowLauncher(bool show);
+
 /// Render resolution divisor of a preset (1.0 native, 1.5 quality, ...).
 float PresetScale(int preset);
 const char* PresetName(int preset);
