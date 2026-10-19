@@ -221,8 +221,37 @@ do {
     try? fm.removeItem(at: root)
 }
 
+// CrashReport: the cause line, summaries, excerpt, redaction, the issue link.
+do {
+    let mac = SystemInfo(appVersion: "0.5.3", model: "Mac16,5", chip: "Apple M4 Max", memoryGB: 48, macOS: "Version 26.6 (Build 25G62)")
+    let home = "/Users/hunter"
+    var log = (1...200).map { "line \($0)" }
+    log[120] = "Crash: the GPU process crashed (signal 11 in Foo)"
+    log[121] = "bbgpu-host: fatal fault (signal 11) at /Users/hunter/Applications/Bloodborne.app/x+0x10"
+    log[150] = "Crash: the GPU process stopped unexpectedly (host process killed by signal 11)"
+    let crash = CrashReport(status: 1, log: log.joined(separator: "\n"), logName: "game.log", system: mac,
+                            settings: ["output 2560x1440"], home: home)
+    check(crash.cause == "the GPU process crashed (signal 11 in Foo)", "first Crash: line is the cause")
+    check(crash.summary == "The GPU process crashed (signal 11 in Foo).", "summary sentence")
+    check(crash.report.contains("line 81\n") && crash.report.contains("line 160\n") && !crash.report.contains("line 80\n")
+          && !crash.report.contains("line 161\n"), "excerpt: 40 lines either side of the cause")
+    check(!crash.report.contains("hunter") && crash.report.contains("~/Applications/Bloodborne.app"), "home folder redacted")
+    check(crash.report.contains("Mac16,5 (Apple M4 Max), 48 GB, macOS 26.6 (Build 25G62)") && crash.report.contains("output 2560x1440"), "system and settings")
+
+    let stop = CrashReport(status: 21, log: "a\nSTOP: unsupported TLS module id\nb", logName: "game.log", system: mac, settings: [], home: home)
+    check(stop.cause == "unsupported TLS module id" && stop.summary == "Unsupported TLS module id.", "STOP: line when there is no Crash: line")
+    let signal = CrashReport(status: 139, log: "nothing\nuseful", logName: "game.log", system: mac, settings: [], home: home)
+    check(signal.cause == nil && signal.summary == "The game stopped unexpectedly (signal 11)." && signal.report.contains("nothing\nuseful"), "signal status, end of log")
+    check(CrashReport.redact("/Users/someone/x and /Users/hunter/y", home: home) == "~/x and ~/y", "other user folders redacted")
+
+    let query = URLComponents(url: crash.issueURL, resolvingAgainstBaseURL: false)!.queryItems ?? []
+    check(crash.issueURL.absoluteString.hasPrefix("https://github.com/Wooloomooloo2/bloodborne_mac_port/issues/new?"), "issue link")
+    check(query.first { $0.name == "title" }?.value == "Crash: the GPU process crashed (signal 11 in Foo)", "issue title")
+    check(query.first { $0.name == "body" }?.value?.contains("Apple M4 Max") == true, "issue body has the Mac")
+}
+
 if failures > 0 {
     print("FAIL: launcher model, \(failures) failed")
     exit(1)
 }
-print("PASS: launcher model (ini, resolutions, settings, launch.conf, saves, launch plan)")
+print("PASS: launcher model (ini, resolutions, settings, launch.conf, saves, launch plan, crash report)")

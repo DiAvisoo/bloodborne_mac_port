@@ -203,10 +203,10 @@ Details:
   PS4 libraries. macOS specifics: guest TLS via a reserved pthread TSD slot, guest-visible
   memory kept below 1 TiB, Mach-based thread inspection.
 - **GPU** (`gpu/`): the shadPS4 video core and shader recompiler, built as
-  `libbbgpu.dylib`, rendering through native Metal (`renderer_metal/`). By default it runs in
+  `libbbgpu.dylib`, rendering through native Metal (`renderer_metal/`). It runs in
   `bbgpu-host`, a **native arm64 process** that maps the game's memory at the same addresses
-  (`host/`, `docs/DESIGN_NATIVE_GPU_PROCESS.md`); `BB_GPU_PROCESS=0` runs everything in one
-  process.
+  (`host/`, `docs/DESIGN_NATIVE_GPU_PROCESS.md`). If it cannot start, the game stops with a
+  "Crash:" line that the launcher shows in a crash report.
 - **Upscalers:** MetalFX temporal upscaling, FSR 3.1 (AMD FidelityFX on a Metal back end,
   `gpu/shim/ffx_metal/`) and TAA. Planned: zero-copy guest memory on unified memory.
 - Inherited from upstream: high-frame-rate community patches, synthetic motion vectors and

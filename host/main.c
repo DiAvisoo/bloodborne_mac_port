@@ -1,5 +1,5 @@
 /* bbgpu-host: the native arm64 GPU process (docs/DESIGN_NATIVE_GPU_PROCESS.md), M3.
- * Spawned by bb-probe (src/gpu_process.c) with BB_GPU_PROCESS=1. It reserves the guest range,
+ * Spawned by bb-probe (src/gpu_process.c). It reserves the guest range,
  * maps the guest memory entry and the shared control block it receives in the handshake
  * (host/bbgpu_protocol.h, host/bbgpu_shared.h), then serves the submit ring on its own thread:
  * guest view events (mirrored at the runtime's addresses), mirror verification, and, after the
@@ -87,7 +87,13 @@ static void fault(int sig, siginfo_t *info, void *context) {
     char line[512];
     Dl_info where;
     int n;
-    /* The process is ending: dladdr/snprintf/backtrace are acceptable here. */
+    /* The process is ending: dladdr/snprintf/backtrace are acceptable here. One plain line
+     * first: the launcher's crash report leads with it. */
+    if (dladdr((void *)pc, &where) && where.dli_fname && where.dli_sname)
+        n = snprintf(line, sizeof line, "Crash: the GPU process crashed (signal %d in %s)\n", sig, where.dli_sname);
+    else
+        n = snprintf(line, sizeof line, "Crash: the GPU process crashed (signal %d)\n", sig);
+    (void)!write(1, line, (size_t)n);
     if (dladdr((void *)pc, &where) && where.dli_fname)
         n = snprintf(line, sizeof line, "bbgpu-host: fatal fault (signal %d) at %s+0x%lx (%s), address %p\n", sig,
                      where.dli_fname, (unsigned long)(pc - (uintptr_t)where.dli_fbase),
@@ -99,7 +105,9 @@ static void fault(int sig, siginfo_t *info, void *context) {
     void *frames[32];
     const int count = backtrace(frames, 32);
     backtrace_symbols_fd(frames, count, 1);
-    signal(sig, SIG_DFL); /* returns into the fault again: the default action ends the process */
+    signal(sig, SIG_DFL); /* the default action ends the process (raise: a signal sent with kill
+                           * would not fault again on return) */
+    raise(sig);
 }
 
 /* ---- mirror verification (M2), answered on the control port ---------------------------- */
@@ -234,7 +242,7 @@ static int translated(void) {
 static int handshake(mach_port_t *parent) {
     const char *marker = getenv("BBGPU_HANDSHAKE");
     if (!marker || atoi(marker) != getppid()) {
-        say("not started by bb-probe (run the game with BB_GPU_PROCESS=1)");
+        say("not started by bb-probe (bb-probe starts it; run the game with run.sh)");
         return -1;
     }
     mach_port_array_t ports = NULL;

@@ -68,7 +68,7 @@ fi
 cflags=(-std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${ARCH[@]}")
 "$CC" "${cflags[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/gpu_process.c src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -framework CoreFoundation -o out/bb-probe
 echo "Built $PWD/out/bb-probe"
-# Native arm64 GPU process (docs/DESIGN_NATIVE_GPU_PROCESS.md; BB_GPU_PROCESS=1): the GPU
+# Native arm64 GPU process (docs/DESIGN_NATIVE_GPU_PROCESS.md): the GPU
 # library built arm64 (scripts/macos/build_gpu_arm64.sh, needs deps/arm64 from
 # BB_DEPS_ARCH=arm64 scripts/macos/bootstrap_deps.sh) linked into out/bbgpu-host.
 ARM64_PREFIX=$ROOT/deps/arm64
@@ -139,6 +139,7 @@ if [[ ${1:-} == --test ]]; then
         /usr/bin/clang++ -arch arm64 -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -std=c++20 -fobjc-arc -O2 -g \
             -Wall -Wextra -Werror -Igpu/shim -Igpu/shadps4 -I"$ARM64_PREFIX/include" tests/test_mtl_encoder.mm gpu/shim/common/logging/log.cpp gpu/shim/common/assert.cpp out/gpu-arm64/libbbmetal_core.a -L"$ARM64_PREFIX/lib" -lfmt \
             -framework Metal -framework Foundation -o out/mtl-encoder-test
+        glslang -V --quiet tests/data/spec_const.comp -o out/spec_const.spv  # the Specialize test's module
         out/mtl-encoder-test
         MTL_DEBUG_LAYER=1 out/mtl-encoder-test
         # Metal-native M3: the rasterizer's draw helper (core part), plain and under validation.

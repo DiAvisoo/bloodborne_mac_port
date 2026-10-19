@@ -21,7 +21,11 @@ struct LauncherView: View {
                 Spacer()
                 if let message = model.exitMessage {
                     Text(message).foregroundStyle(.red).lineLimit(2)
-                    Button("Show Log", action: model.showLog)
+                    if model.crashReport != nil {
+                        Button("Crash Report…") { model.showingCrashReport = true }
+                    } else {
+                        Button("Show Log", action: model.showLog)
+                    }
                 }
                 Button(action: model.play) {
                     Text(model.running ? "Running…" : "Play").frame(minWidth: 80)
@@ -33,6 +37,11 @@ struct LauncherView: View {
             .padding()
         }
         .frame(width: LauncherView.size.width, height: LauncherView.size.height)
+        .sheet(isPresented: $model.showingCrashReport) {
+            if let report = model.crashReport {
+                CrashReportView(report: report, model: model)
+            }
+        }
     }
 
     private var general: some View {
@@ -195,5 +204,50 @@ private struct FolderRow: View {
                 Text(problem).font(.caption).foregroundStyle(.red)
             }
         }
+    }
+}
+
+/// The game stopped with an error: what happened, and a report ready to paste into an issue.
+private struct CrashReportView: View {
+    let report: CrashReport
+    @ObservedObject var model: LauncherModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Bloodborne stopped").font(.title2.bold())
+            Text(report.summary)
+            Text("Please report it so it can be fixed: Report on GitHub copies this report and opens a new issue to paste it into. The report has no personal files; your home folder is shown as ~.")
+                .font(.callout).foregroundStyle(.secondary)
+            ScrollView {
+                Text(report.report)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+            }
+            .background(Color(nsColor: .textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            HStack {
+                Button("Show Log in Finder", action: model.showLog)
+                Spacer()
+                if copied {
+                    Text("Copied").foregroundStyle(.secondary)
+                }
+                Button("Copy Report") {
+                    model.copyCrashReport()
+                    copied = true
+                }
+                Button("Report on GitHub") {
+                    model.reportOnGitHub()
+                    copied = true
+                }
+                Button("Close") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 760, height: 560)
     }
 }

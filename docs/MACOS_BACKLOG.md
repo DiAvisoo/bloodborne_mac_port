@@ -382,7 +382,7 @@ Each item: what was done for now, what the refinement is, and where it lives.
   alias. *Refinement:* toggle protection (RW→RX) on executable aliases after host writes, if
   the game ever runs code from direct/flexible memory.
 
-- **GPU process split (default since 2026-10-12; `BB_GPU_PROCESS=0` = single process).** *Now:*
+- **GPU process split (default since 2026-10-12, the only mode since 2026-10-19).** *Now:*
   (a) every GPU page protection is a synchronous round trip to bb-probe and every fault on a
   protected page is relayed to the host (~950 faults/s in the city, no FPS loss measured) —
   *proper:* batch protections asynchronously with ordering guarantees; (b) input: the host

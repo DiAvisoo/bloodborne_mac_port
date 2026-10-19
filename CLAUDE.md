@@ -152,13 +152,14 @@ the live path (the startup patch breaks geometry there). Check screenshots when 
    MoltenVK-style CPU work). M1 done (guest pool = Mach named entry, `runtime_memory_pool_entry()`,
    `BB_SHARED_GUEST_MEMORY=0` fallback). M2 done (2026-10-12): `BB_DEPS_ARCH=arm64 bash scripts/macos/bootstrap_deps.sh`,
    `scripts/macos/build_gpu_arm64.sh` → `out/gpu-arm64/libbbgpu.dylib`, `out/bbgpu-host` (`host/`),
-   `BB_GPU_PROCESS=1` (`src/gpu_process.c`) mirrors guest memory into the host; HLE split in
+   `src/gpu_process.c` mirrors guest memory into the host; HLE split in
    `docs/HLE_CLASSIFICATION.md`. M3 implemented (2026-10-12, design "M3 plan"): portable SRT walker
    (bytecode), shared control block + rings (`host/bbgpu_shared.h`), host links the arm64 GPU
    library (`host/host_runtime.c`), game side in "remote" mode (`gpu/shim/bbport_split.*`).
    Tests pass (`tests/test_bbgpu_rings.c`, `tests/test_gpu_split.c`); the title screen renders
    through the host at 60 FPS. M4 (protect/fault relays) done: gameplay renders correctly. Split
-   mode is the DEFAULT on macOS (`BB_GPU_PROCESS=0` = single process); text entry and Restart
+   mode is the ONLY mode on macOS (single process and `BB_GPU_PROCESS` removed 2026-10-19: a host that
+   cannot start or is lost stops the game with a "Crash:" line); text entry and Restart
    go through the host; keyboard bridged, gamepads polled in bb-probe. Same FPS as single
    process in the GPU-bound city scene (27.5), steadier worst frames. Next: render-pass merging.
 2. Menu bugs: "Subpixel jitter" unticks itself; menu choices (upscaler/preset) not persisted
