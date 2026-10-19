@@ -33,11 +33,6 @@ read -r -a libraries <<< "$(pkg-config --libs sdl3)"
 if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
     git submodule update --init --recursive
 fi
-for patch in gpu/patches/fsr-vulkan/*.patch; do
-    if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
-        git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
-    fi
-done
 # Boost is header-only: the arm64 Homebrew headers are fine (nothing is linked from there).
 boost=$(brew --prefix boost 2>/dev/null || echo /opt/homebrew/opt/boost)
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \

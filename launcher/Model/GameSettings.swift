@@ -17,7 +17,8 @@ enum Upscaler: String, CaseIterable, Identifiable {
     }
     /// The quality level sets the render size (TAA always renders at the output size).
     var usesPreset: Bool { self != .off && self != .taa }
-    /// Offered in the launcher; FSR 4 needs extra assets and a GPU check (in-game menu only).
+    /// Offered in the launcher (the in-game menu's list). FSR 4 and 4.1.1 are gone from the Mac
+    /// build: an ini naming them still reads and is kept, the game runs a fallback.
     static let launcherChoices: [Upscaler] = [.off, .fsr3, .metalfx, .taa]
 }
 

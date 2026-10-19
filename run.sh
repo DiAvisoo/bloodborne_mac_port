@@ -45,10 +45,6 @@ bb_launch_settings "$BB_CONFIG"
 # library reads it while loading, in bb-probe and in the native GPU host alike.
 export BB_GPU_USER_DIR=${BB_GPU_USER_DIR:-${BB_USER_DIR:-$data/user}}
 mkdir -p "$BB_GPU_USER_DIR"
-# FSR 4.1.1 assets (tools/fsr4cap/build_assets.sh): next to run.sh or in the data directory.
-if [[ -z ${BB_FSR411_DIR:-} && ! -d fsr4_411 && -d $data/fsr4_411 ]]; then
-    export BB_FSR411_DIR=$data/fsr4_411
-fi
 if [[ -z ${BB_PREBUILT:-} && -z ${BB_IN_NIX_SHELL:-} ]] && ! { command -v pkg-config >/dev/null && pkg-config --exists vulkan sdl3; } && command -v nix-shell >/dev/null; then
     args=''; if (( $# )); then args=$(printf '%q ' "$@"); fi
     exec env BB_IN_NIX_SHELL=1 nix-shell shell.nix --run "bash run.sh $args"
@@ -142,10 +138,6 @@ fi
     --patches-dir "${BB_PATCHES_DIR:-$data/patches}" --patches-config "${BB_PATCHES_CONFIG:-$data/patches.json}"
 if [[ -z ${BB_VBLANK_HZ:-} ]]; then
     case $fps in uncap) export BB_VBLANK_HZ=0 ;; 90) export BB_VBLANK_HZ=90 ;; *) export BB_VBLANK_HZ=60 ;; esac
-fi
-# FSR 4: faster post passes next to the downloaded ones (incremental; tools/fsr4_optimize.sh).
-if [[ -z ${BB_PREBUILT:-} && -d fsr4_shaders ]] && command -v spirv-cross >/dev/null; then
-    bash tools/fsr4_optimize.sh || echo 'FSR 4: optimized post passes not built' >&2
 fi
 if [[ -n ${BB_PREBUILT:-} ]]; then
     probe=${BB_PROBE:-bin/bb-probe}
