@@ -89,9 +89,11 @@ class RestartResolutionTests(unittest.TestCase):
         self.assertIsNone(self.run_restarts(ini_extra='live_resolution=1\n')[0]['BB_RENDER_RES'])
         self.assertEqual(self.run_restarts(ini_extra='live_resolution=0\n', caps=1)[0]['BB_RENDER_RES'],
                          '854x480')
-        # Unset: off (the startup patch), whatever the GPU; auto asks the GPU check.
+        # Unset: off (the startup patch), whatever the GPU; auto asks the GPU check, except on a
+        # Mac, where it is off (Apple GPUs are integrated: the check always answered 0).
         self.assertEqual(self.run_restarts(caps=1)[0]['BB_RENDER_RES'], '854x480')
-        self.assertIsNone(self.run_restarts(ini_extra='live_resolution=auto\n', caps=1)[0]['BB_RENDER_RES'])
+        self.assertEqual(self.run_restarts(ini_extra='live_resolution=auto\n', caps=1)[0]['BB_RENDER_RES'],
+                         '854x480' if sys.platform == 'darwin' else None)
         self.assertEqual(self.run_restarts(ini_extra='live_resolution=auto\n', caps=0)[0]['BB_RENDER_RES'],
                          '854x480')
 
