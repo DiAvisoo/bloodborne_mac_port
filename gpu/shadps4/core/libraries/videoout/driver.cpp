@@ -826,7 +826,8 @@ void VideoOutDriver::Flip(const Request& req) {
                             "vkQueueSubmit %.2f in %.1f calls; command thread waiting for "
                             "recording %.2f; flip submit -> GPU done %.2f, GPU done every %.2f; "
                             "per frame %.1f tessellated, %.1f rect/quad-list draws; hoisted "
-                            "%.1f uploads, copy shader %.1f hoisted / %.1f inline; arena ordering "
+                            "%.1f uploads, copy shader %.1f hoisted / %.1f inline / %.1f deferred (%.1f "
+                            "conflicts); arena ordering "
                             "requests %.1f naming render passes, %.1f others; %.1f not hoisted (in "
                             "flight); busy-slot reuses %.1f guest memory, %.1f motion; ordering "
                             "fence waits %.1f per frame on %.1f encoders, at most %llu on one\n",
@@ -836,6 +837,8 @@ void VideoOutDriver::Flip(const Request& req) {
                             double(BbStats::hoisted_copies.exchange(0)) / frames,
                             double(BbStats::hoisted_shader_copies.exchange(0)) / frames,
                             double(BbStats::inline_shader_copies.exchange(0)) / frames,
+                            double(BbStats::deferred_shader_copies.exchange(0)) / frames,
+                            double(BbStats::deferred_copy_conflicts.exchange(0)) / frames,
                             double(BbStats::arena_barriers.exchange(0)) / frames,
                             double(BbStats::arena_other_barriers.exchange(0)) / frames,
                             double(BbStats::hoists_in_flight.exchange(0)) / frames,

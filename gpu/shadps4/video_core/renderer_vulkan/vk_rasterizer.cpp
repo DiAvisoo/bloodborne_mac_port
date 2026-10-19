@@ -84,6 +84,8 @@ Rasterizer::Rasterizer(Metal::Device& device_, Scheduler& scheduler_, Runtime& r
         constant_ring = std::make_unique<ConstantRing>(device, scheduler);
         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
     }
+    scheduler.SetPassEndHook(
+        [](void* self) { FlushDeferredCopies(*static_cast<Rasterizer*>(self)); }, this);
     // bbport: the frame capture's event trace also lists the SRT walkers' guest reads.
     if (std::getenv("BB_CAPTURE_TRIGGER")) {
         Shader::srt_read_hook = [](u64 address, u32 size) {
@@ -1964,6 +1966,22 @@ void Rasterizer::SetDrawEncoders(const Pipeline& pipeline, bool indirect) {
 }
 
 void Rasterizer::OrderAccesses() {
+    // bbport: a command of the pass that touches the ranges of copies deferred to its end
+    // (vk_shader_hle.h) has them run first: the pass ends there and reopens.
+    if (scheduler.IsRendering()) {
+        bool conflict = false;
+        for (const auto& b : bound_buffers) {
+            conflict = conflict || DeferredCopiesConflict(b.buffer, b.offset, b.size, b.is_written);
+        }
+        for (const auto& r : read_ranges) {
+            conflict = conflict || DeferredCopiesConflict(r.buffer, r.offset, r.size, false);
+        }
+        if (conflict) {
+            BbStats::deferred_copy_conflicts.fetch_add(1, std::memory_order_relaxed);
+            scheduler.EndRendering();
+            scheduler.ResumeRendering();
+        }
+    }
     // Checked now, right before the command is recorded: the uploads and copies recorded while
     // its resources were bound are among the accesses it is checked against.
     Metal::OrderRequest need;

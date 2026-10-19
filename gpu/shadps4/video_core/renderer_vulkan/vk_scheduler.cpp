@@ -209,6 +209,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         if (is_rendering) {
             is_rendering = false; // counted above, not again in EndRendering
             Record([runs = &draw_runs](Metal::Encoder& e) { runs->EndRenderPass(e); });
+            PassEnded();
         }
     }
     EndRendering();
@@ -239,6 +240,28 @@ void Scheduler::EndRendering(std::source_location where, const char* detail) {
     is_rendering = false;
     // Through the draw runs: waiting patch draws are drawn in this pass first.
     Record([runs = &draw_runs](Metal::Encoder& e) { runs->EndRenderPass(e); });
+    PassEnded();
+}
+
+void Scheduler::PassEnded() {
+    if (pass_end_hook && !in_pass_end_hook) {
+        in_pass_end_hook = true;
+        pass_end_hook(pass_end_context);
+        in_pass_end_hook = false;
+    }
+}
+
+void Scheduler::ResumeRendering() {
+    if (is_rendering) {
+        return;
+    }
+    RenderState state = render_state;
+    for (u32 i = 0; i < state.num_colors; ++i) {
+        state.colors[i].clear = false;
+    }
+    state.depth.clear = false;
+    state.depth.clear_stencil = false;
+    BeginRendering(state);
 }
 
 void Scheduler::PushDebugGroup(std::string label) {
