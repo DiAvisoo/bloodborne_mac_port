@@ -6,8 +6,9 @@
 #    docs/DESIGN_NATIVE_GPU_PROCESS.md). Same pinned set minus the x86-only Zydis/Zycore/xbyak
 #    (they only serve the x86 SRT-walker JIT in the shader recompiler).
 # Each architecture has its own prefix, build directory and stamps; neither ever sees the
-# other's libraries. Host tools (cmake, ninja, nasm, glslang, pkgconf) come from the native
-# arm64 Homebrew.
+# other's libraries. No Vulkan loader or MoltenVK (removed in 0.5.3: the renderer is Metal);
+# Vulkan-Headers stay for Vulkan-Hpp's types, SPIRV-Cross turns the shaders' SPIR-V into MSL.
+# Host tools (cmake, ninja, nasm, glslang, pkgconf) come from the native arm64 Homebrew.
 #
 #   bash scripts/macos/bootstrap_deps.sh                   # x86-64: build what is missing
 #   BB_DEPS_ARCH=arm64 bash scripts/macos/bootstrap_deps.sh # arm64
@@ -34,10 +35,8 @@ XXHASH_TAG=v0.8.3
 MINIZ_TAG=3.1.2
 ZYDIS_TAG=v4.1.1
 VULKAN_TAG=vulkan-sdk-1.4.363.0
-MOLTENVK_TAG=v1.4.2
 MAGIC_ENUM_TAG=v0.9.7
 ROBIN_MAP_TAG=v1.4.0
-VMA_TAG=v3.3.0
 XBYAK_TAG=v7.43
 FFMPEG_TAG=n7.1.5
 
@@ -89,17 +88,14 @@ fetch xxHash https://github.com/Cyan4973/xxHash.git $XXHASH_TAG
 fetch miniz https://github.com/richgel999/miniz.git $MINIZ_TAG
 [[ $ARCH == x86_64 ]] && fetch zydis https://github.com/zyantific/zydis.git $ZYDIS_TAG
 fetch Vulkan-Headers https://github.com/KhronosGroup/Vulkan-Headers.git $VULKAN_TAG
-fetch Vulkan-Loader https://github.com/KhronosGroup/Vulkan-Loader.git $VULKAN_TAG
 fetch magic_enum https://github.com/Neargye/magic_enum.git $MAGIC_ENUM_TAG
 fetch robin-map https://github.com/Tessil/robin-map.git $ROBIN_MAP_TAG
-fetch VulkanMemoryAllocator https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git $VMA_TAG
 [[ $ARCH == x86_64 ]] && fetch xbyak https://github.com/herumi/xbyak.git $XBYAK_TAG
 fetch FFmpeg https://github.com/FFmpeg/FFmpeg.git $FFMPEG_TAG
 # SPIR-V -> MSL for the Metal renderer (both libraries compile it until M7 trims the x86-64 one).
 fetch SPIRV-Cross https://github.com/KhronosGroup/SPIRV-Cross.git $VULKAN_TAG
 
 cmake_dep Vulkan-Headers .
-cmake_dep Vulkan-Loader . -DUPDATE_DEPS=OFF -DBUILD_TESTS=OFF -DVulkanHeaders_DIR="$PREFIX/share/cmake/VulkanHeaders"
 cmake_dep SDL . -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
 cmake_dep fmt . -DFMT_TEST=OFF -DFMT_DOC=OFF
 cmake_dep xxHash cmake_unofficial -DBUILD_SHARED_LIBS=OFF -DXXHASH_BUILD_XXHSUM=OFF
@@ -112,7 +108,6 @@ if [[ $ARCH == x86_64 ]]; then
 fi
 cmake_dep magic_enum . -DMAGIC_ENUM_OPT_BUILD_EXAMPLES=OFF -DMAGIC_ENUM_OPT_BUILD_TESTS=OFF
 cmake_dep robin-map .
-cmake_dep VulkanMemoryAllocator .
 cmake_dep SPIRV-Cross . -DSPIRV_CROSS_SHARED=OFF -DSPIRV_CROSS_STATIC=ON \
     -DSPIRV_CROSS_CLI=OFF -DSPIRV_CROSS_ENABLE_TESTS=OFF -DSPIRV_CROSS_ENABLE_HLSL=OFF \
     -DSPIRV_CROSS_ENABLE_CPP=OFF -DSPIRV_CROSS_ENABLE_REFLECT=OFF -DSPIRV_CROSS_ENABLE_C_API=OFF \
@@ -141,35 +136,8 @@ if ! stamp FFmpeg; then
     done_stamp FFmpeg
 fi
 
-# MoltenVK: the release dylib is universal (arm64 + x86_64). Registered with the loader
-# through an ICD manifest; run scripts point VK_DRIVER_FILES at it.
-if ! stamp MoltenVK; then
-    if [[ ! -f $SRC/MoltenVK-macos.tar ]]; then
-        echo "== fetch MoltenVK $MOLTENVK_TAG"
-        curl -fsSL -o "$SRC/MoltenVK-macos.tar" \
-            "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_TAG/MoltenVK-macos.tar"
-    fi
-    rm -rf "$BUILD/MoltenVK" && mkdir -p "$BUILD/MoltenVK"
-    tar -xf "$SRC/MoltenVK-macos.tar" -C "$BUILD/MoltenVK"
-    dylib=$(find "$BUILD/MoltenVK" -name libMoltenVK.dylib -path '*macOS*' | head -1)
-    lipo "$dylib" -verify_arch $ARCH || { echo "MoltenVK dylib lacks $ARCH" >&2; exit 1; }
-    cp "$dylib" "$PREFIX/lib/"
-    mkdir -p "$PREFIX/share/vulkan/icd.d"
-    cat > "$PREFIX/share/vulkan/icd.d/MoltenVK_icd.json" <<'JSON'
-{
-    "file_format_version": "1.0.0",
-    "ICD": {
-        "library_path": "../../../lib/libMoltenVK.dylib",
-        "api_version": "1.4.0",
-        "is_portability_driver": true
-    }
-}
-JSON
-    done_stamp MoltenVK
-fi
-
 echo
 echo "$ARCH dependencies ready in $PREFIX"
-for lib in libvulkan.1.dylib libSDL3.0.dylib libMoltenVK.dylib libavcodec.dylib; do
+for lib in libSDL3.0.dylib libavcodec.dylib; do
     printf '  %-22s %s\n' "$lib" "$(lipo -archs "$PREFIX/lib/$lib" 2>/dev/null || echo missing)"
 done
