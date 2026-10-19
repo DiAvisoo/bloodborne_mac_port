@@ -345,6 +345,11 @@ Each item: what was done for now, what the refinement is, and where it lives.
   submits compute only at start and while loading (~55 calls a session, measured), none of them
   over a pending SubmitDone in our runs: a timing race, likelier on slower Macs. Now queued
   first, then waited. Confirm with Didjus's reports.
+  **Cause found 2026-10-19 (PR #20, cherry-picked as 2cb8681):** Didjus's stuck-run log shows the
+  render thread's draw-list task (`0x219d220`, run by GXRenderThread's loop after the frame job)
+  writing the immediate context while the main thread was in `0xebb960` under the lock, then
+  "bad packet ... at word 777". That task is now hooked under the same lock (the "third direct
+  user" of 2026-10-17). Author's tests: 2 of 2 hangs before, 0 of 5 after. Confirm on #18.
 - **Metal: a tessellation pipeline refused, its draws skipped (2026-10-18, user, 0.5.1).** Every
   session: `GetTessellationPipeline: … the evaluation shader reads 160 bytes of patch constants,
   the control shader writes 224` (vs 0x2fb9d0c43ee, fs 0xdbb1593690c; pipeline fs dbb222eb hs
