@@ -186,6 +186,15 @@ if (APPLE)
     # its first call, so test programs that define only the ones they use still load (chained
     # fixups bind every symbol at load time).
     target_link_options(bbgpu PRIVATE -Wl,-no_fixup_chains)
+    # The x86-64 library serves the game's side only (remote mode; the arm64 GPU host renders):
+    # it exports the C API (gpu/bbgpu.h) and the SRT walker its test calls, so that LTO and
+    # dead stripping drop what nothing reaches (15.5 -> 13.4 MB). The renderer is still compiled
+    # in: its code stays reachable through the single-process branches (MACOS_BACKLOG).
+    if (BB_TARGET_ARCH STREQUAL "x86_64")
+        target_link_options(bbgpu PRIVATE
+            -Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/shim/bbgpu_game.exports -Wl,-dead_strip)
+        set_property(TARGET bbgpu APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shim/bbgpu_game.exports)
+    endif()
     # The Metal renderer: SPIR-V -> MSL through SPIRV-Cross (deps/<arch>, bootstrap_deps.sh). The
     # x86-64 library compiles it too (split mode never runs it there) until M7 trims that library
     # to the remote shim.
