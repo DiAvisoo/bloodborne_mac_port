@@ -55,6 +55,26 @@ do {
     check(PixelSize(2560, 1440).iniValue == "2560x1440" && PixelSize(2560, 1440).description == "2560 × 1440", "format")
 }
 
+// Native wide patch: display size is independent of the neutral renderer size.
+do {
+    var settings = GameSettings()
+    settings.output = PixelSize(2560, 1440)
+    settings.ultrawide = true
+    settings.wideOutput = PixelSize(3840, 1080)
+    settings.upscaler = .metalfx
+    settings.preset = 3
+    settings.liveResolution = .on
+    var ini = IniFile()
+    settings.apply(to: &ini)
+    check(ini["output_res"] == "1920x1080" && ini["ultrawide_res"] == "3840x1080", "wide patch and neutral renderer")
+    check(ini["upscaler"] == "off" && ini["preset"] == "0" && ini["live_resolution"] == "0", "native wide avoids duplicate host scaling")
+    var loaded = GameSettings(ini: ini)
+    check(loaded.ultrawide && loaded.renderSize == PixelSize(3840, 1080), "wide selection survives restart")
+    loaded.ultrawide = false
+    loaded.apply(to: &ini)
+    check(ini["ultrawide_res"] == nil && ini["output_res"] == "2560x1440", "disable removes patch and restores standard output")
+}
+
 // GameSettings: defaults, reading, values the launcher does not offer, writing back.
 do {
     let defaults = GameSettings(ini: IniFile())
@@ -248,6 +268,17 @@ do {
     check(crash.issueURL.absoluteString.hasPrefix("https://github.com/Wooloomooloo2/bloodborne_mac_port/issues/new?"), "issue link")
     check(query.first { $0.name == "title" }?.value == "Crash: the GPU process crashed (signal 11 in Foo)", "issue title")
     check(query.first { $0.name == "body" }?.value?.contains("Apple M4 Max") == true, "issue body has the Mac")
+}
+
+// High-resolution ultrawide selection on memory-constrained Macs.
+do {
+    let gib: UInt64 = 1024 * 1024 * 1024
+    for size in [PixelSize(3440, 1440), PixelSize(5120, 1440)] {
+        check(Resolution.ultrawideMemoryWarning(size, memoryBytes: 16 * gib) != nil, "16 GB wide memory warning")
+        check(Resolution.ultrawideMemoryWarning(size, memoryBytes: 24 * gib) == nil, "24 GB boundary")
+        check(Resolution.ultrawideMemoryWarning(size, memoryBytes: 64 * gib) == nil, "64 GB wide selection")
+    }
+    check(Resolution.ultrawideMemoryWarning(PixelSize(3840, 1080), memoryBytes: 16 * gib) == nil, "1080p wide selection")
 }
 
 if failures > 0 {

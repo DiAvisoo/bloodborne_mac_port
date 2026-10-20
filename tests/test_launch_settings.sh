@@ -28,3 +28,28 @@ rm -f "$ini"
 /bin/bash -c 'source scripts/launch_settings.sh; bb_launch_settings /nonexistent/bbport.ini' ||
     { echo "FAIL: launch settings with a missing file"; exit 1; }
 echo "PASS: launch settings (fps_cap, fullscreen)"
+
+# In-game restart inherits the old environment: disabling wide mode must clear only our
+# overrides and keep the user's external patch list and explicit memory limit.
+(
+    source scripts/launch_settings.sh
+    unset BB_DMEM_MB BB_ULTRAWIDE_AUTO_DMEM BB_ULTRAWIDE_SESSION BB_UPSCALER
+    export BB_PATCHES='Skip Intro'
+    bb_native_ultrawide 'Resolution Patch 3840x1080 (32:9)'
+    [[ $launch_patches == 'Skip Intro' ]]
+    [[ $BB_DMEM_MB == 6144 && $BB_ULTRAWIDE_AUTO_DMEM == 1 && $BB_UPSCALER == none && $BB_ULTRAWIDE_RES == 3840x1080 ]]
+    [[ -z ${BB_RENDER_RES:-} && -z ${BB_OUTPUT_RES:-} ]]
+    # An inherited .1 test environment must shed its unsafe automatic heap override.
+    export BB_DMEM_MB=9152 BB_ULTRAWIDE_AUTO_DMEM=1
+    bb_native_ultrawide 'Resolution Patch 3840x1080 (32:9)'
+    [[ $BB_DMEM_MB == 6144 && $BB_ULTRAWIDE_AUTO_DMEM == 1 ]]
+    bb_native_ultrawide 'Resolution Patch 2560x720 (32:9)'
+    [[ -z ${BB_DMEM_MB:-} && -z ${BB_ULTRAWIDE_AUTO_DMEM:-} ]]
+    bb_native_ultrawide ''
+    [[ $launch_patches == 'Skip Intro' && -z ${BB_DMEM_MB:-} && -z ${BB_UPSCALER:-} && -z ${BB_ULTRAWIDE_RES:-} ]]
+    export BB_DMEM_MB=10240
+    bb_native_ultrawide 'Resolution Patch 2560x1080 (21:9)'
+    bb_native_ultrawide ''
+    [[ $BB_DMEM_MB == 10240 ]]
+) || { echo 'FAIL: ultrawide restart/disable'; exit 1; }
+echo 'PASS: native ultrawide restart and disable'

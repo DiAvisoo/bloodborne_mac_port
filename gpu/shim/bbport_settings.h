@@ -6,6 +6,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 
 /// Keyboard shortcut that opens the in-game menu (log lines and the ini header; ASCII).
 /// Mac keyboards have no Insert key, so macOS uses the Settings convention Cmd+,.
@@ -72,6 +73,8 @@ struct Values {
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
+    // Fixed at launch: native scene/UI patch dimensions, requiring a restart.
+    int ultrawide_width = 0, ultrawide_height = 0;
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
@@ -103,6 +106,8 @@ struct Values {
 };
 
 Values& Get();
+/// Output dimensions actually selected for this session, including native ultrawide.
+std::array<int, 2> OutputSize();
 
 /// Reads the file, then the environment overrides. Called once at start.
 void Load();
