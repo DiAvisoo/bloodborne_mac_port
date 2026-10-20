@@ -1574,3 +1574,12 @@ launcher accessible during play, and distinguish deliberate stops from crashes. 
 host already observes parent exit and flushes its pipeline archive before closing. Launcher
 Quit requests the same stop before exiting. Local app `.5` now supplies the validated
 invariant/Precise profile by default, with explicit environment overrides preserved.
+
+
+Launcher validation for `.5`: Swift launcher tests and both-architecture builds pass, and the
+standalone app passes deep/strict ad-hoc signature verification. With a disposable copy of
+the successful audio test save, Play changes to Stop and disables settings; Stop returns to
+Play without a crash report, with both the guest and renderer gone. A second Play restarts
+successfully. Quitting the launcher during play also closes its guest and renderer; process
+inspection confirms no surviving game processes. Preserve the successful audio-test save,
+not the disposable Stop-test save, when installing this local build.
