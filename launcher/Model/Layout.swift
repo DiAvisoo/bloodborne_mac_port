@@ -97,6 +97,9 @@ enum Layout: Equatable {
     func launchPlan(gameDir: URL, saveDir: URL?, dataDir: URL, env: [String: String]) -> LaunchPlan {
         var environment = env
         environment["BB_GAME_DIR"] = gameDir.path
+        // Validated M2 native Metal test profile; explicit developer overrides still win.
+        environment["BB_SPIRV_PRECISE"] = env["BB_SPIRV_PRECISE"] ?? "invariant"
+        environment["BB_READBACKS"] = env["BB_READBACKS"] ?? "2"
         // The in-game menu's "Show the launcher" toggle writes BB_SHOW_LAUNCHER there.
         environment["BB_LAUNCH_CONF"] = launchConfURL(env: env).path
         if let saveDir {

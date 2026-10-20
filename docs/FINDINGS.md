@@ -1564,3 +1564,13 @@ non-finite sample count, SDL submission failures and queue starvation before sil
 Playback samples and scheduling are unchanged. A separate `out/bb-probe-audio-diagnostic`
 compiles successfully; the running original diagnostic is not replaced. No audio fix has
 yet been established, and the confirmed fast GPU library is unchanged.
+
+
+The user subsequently confirmed the audio diagnostic run was "perfect" with everything
+working. That run used the unchanged audio implementation (only existing trace flags), so
+no audio fix is claimed. Preserve its latest save for the local launcher trial. Added a Stop
+control to the launcher: retain the Process, request termination of that child only, keep the
+launcher accessible during play, and distinguish deliberate stops from crashes. The native
+host already observes parent exit and flushes its pipeline archive before closing. Launcher
+Quit requests the same stop before exiting. Local app `.5` now supplies the validated
+invariant/Precise profile by default, with explicit environment overrides preserved.

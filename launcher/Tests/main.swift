@@ -219,6 +219,10 @@ do {
     check(p.executable.path == "/bin/bash" && p.arguments == [port.appendingPathComponent("run.sh").path], "packaged runs its run.sh")
     check(p.environment["BB_GAME_DIR"] == game.path && p.environment["BB_DATA_DIR"] == defaultData.path, "game and data folder")
     check(p.environment["BB_LAUNCH_CONF"] == packaged!.launchConfURL(env: env).path, "launch.conf for the in-game menu")
+    check(p.environment["BB_SPIRV_PRECISE"] == "invariant" && p.environment["BB_READBACKS"] == "2", "validated native Metal profile")
+    let originalProfile = packaged!.launchPlan(gameDir: game, saveDir: nil, dataDir: defaultData,
+        env: env.merging(["BB_SPIRV_PRECISE": "vertex", "BB_READBACKS": "1"]) { $1 })
+    check(originalProfile.environment["BB_SPIRV_PRECISE"] == "vertex" && originalProfile.environment["BB_READBACKS"] == "1", "explicit renderer overrides preserved")
     check(p.environment["BB_PREBUILT"] == "1" && p.environment["BB_PROBE"] == contents.appendingPathComponent("MacOS/bb-probe").path, "prebuilt probe")
     check(p.environment["PYTHON"] == contents.appendingPathComponent("Resources/python/bin/python3").path, "bundled Python")
     check(p.environment["VK_DRIVER_FILES"] == nil, "no Vulkan driver (Metal renderer)")
