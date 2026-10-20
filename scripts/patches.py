@@ -157,22 +157,22 @@ def ultrawide_patch(settings):
 
 
 def ultrawide_writes(xml, name, app_version, segments):
-    """Keep camera/UI coordinates, but leave guest scene allocations/heaps at retail size.
+    """Apply the complete native scene/UI patch while retaining retail graphics heaps.
 
-    UI_WIDTH/UI_HEIGHT set Scaleform's logical viewport, not the scene allocation.
-    Keep the community screen-coordinate fixes (lock-on/enemy bars, menu layout);
-    the host compositor draws those coordinates directly into its wide UI target.
+    The fallback globals and scene MOV/NOP overrides are a single patch: keeping the
+    640x360 globals without the overrides caused black menus and an oversized HUD.
+    Enlarged heaps correlated with missing geometry in the first Metal trial; the
+    same native resolution without those two heap writes passes the M2 gameplay test.
     """
-    forbidden = [(SCENE_WIDTH, SCENE_WIDTH + 9), (SCENE_HEIGHT, SCENE_HEIGHT + 9),
-                 (0x04B36DDA - EBOOT_BASE, 0x04B36DDC - EBOOT_BASE),
-                 (0x04B36DE2 - EBOOT_BASE, 0x04B36DE4 - EBOOT_BASE)]
+    heaps = [(0x04B36DDA - EBOOT_BASE, 0x04B36DDC - EBOOT_BASE),
+             (0x04B36DE2 - EBOOT_BASE, 0x04B36DE4 - EBOOT_BASE)]
     writes = [(offset, data) for offset, data in
               compile_patches(xml, [name], app_version, segments)
               if not any(offset < end and offset + len(data) > start
-                         for start, end in forbidden)]
-    required = {0x0183A35D - EBOOT_BASE, UI_WIDTH, UI_HEIGHT}
+                         for start, end in heaps)]
+    required = {0x0183A35D - EBOOT_BASE, SCENE_WIDTH, SCENE_HEIGHT, UI_WIDTH, UI_HEIGHT}
     if not required.issubset(offset for offset, _ in writes):
-        raise ValueError('Ultrawide patch is missing camera/UI viewport instructions')
+        raise ValueError('Ultrawide patch is missing scene/camera/UI instructions')
     return writes
 
 
@@ -367,7 +367,7 @@ def main():
     wide = ultrawide_patch(read_settings(a.settings))
     if wide and (a.render_res or any(n.startswith('Resolution Patch ') or
                                     n == 'Increased Graphics Heap Sizes' for n in names)):
-        raise ValueError('Native Metal ultrawide uses host targets; remove startup resolution/heap overrides')
+        raise ValueError('Ultrawide already selects the native resolution; remove conflicting resolution/heap overrides')
     writes=compile_patches(a.xml,names,a.app_version,segments)
     if wide:
         writes += ultrawide_writes(a.xml, wide, a.app_version, segments)

@@ -1188,7 +1188,7 @@ void FpsCounter() {
     ImGui::Text("%.0f FPS", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f);
     ImGui::SameLine();
     ImGui::TextColored(kSecondary, "%.1f ms", frame_ms_avg);
-    // Scene (render) size as reported by the upscaler, and the output size in effect: a
+    // Scene size from the upscaler or native G-buffer, and the output in effect: a
     // startup-patched session keeps its launch output until restart.
     const char* upscaler = s.upscaler == BbSettings::UpscalerFsr3      ? "FSR 3.1"
                            : s.upscaler == BbSettings::UpscalerTaa     ? "TAA"
@@ -1197,7 +1197,9 @@ void FpsCounter() {
     const auto [out_w, out_h] = BbSettings::OutputSize();
     const int render_w = s.active_render_width, render_h = s.active_render_height;
     ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.82f);
-    if (render_w == out_w && render_h == out_h) {
+    if (!render_w || !render_h) {
+        ImGui::TextColored(kSecondary, "%dx%d output", out_w, out_h);
+    } else if (render_w == out_w && render_h == out_h) {
         ImGui::TextColored(kSecondary, "%dx%d  %s", out_w, out_h, upscaler);
     } else {
         ImGui::TextColored(kSecondary, "%dx%d \xE2\x86\x92 %dx%d  %s", render_w, render_h, out_w,

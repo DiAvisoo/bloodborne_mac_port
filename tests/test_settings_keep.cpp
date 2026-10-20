@@ -60,7 +60,7 @@ int main() {
     std::fclose(f);
     Load();
     assert(Get().output_res == OutputDefault && Get().upscaler == UpscalerOff);
-    assert(Get().preset == NativeAA && Get().live_resolution == 1);
+    assert(Get().preset == NativeAA && Get().live_resolution == 0);
     Save();
     text = Read(path);
     assert(Count(text, "ultrawide_res=3840x1080") == 1);

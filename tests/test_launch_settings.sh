@@ -37,7 +37,7 @@ echo "PASS: launch settings (fps_cap, fullscreen)"
     export BB_PATCHES='Skip Intro'
     bb_native_ultrawide 'Resolution Patch 3840x1080 (32:9)'
     [[ $launch_patches == 'Skip Intro' ]]
-    [[ -z ${BB_DMEM_MB:-} && $BB_UPSCALER == off && $BB_ULTRAWIDE_RES == 3840x1080 ]]
+    [[ -z ${BB_DMEM_MB:-} && $BB_UPSCALER == none && $BB_ULTRAWIDE_RES == 3840x1080 ]]
     [[ -z ${BB_RENDER_RES:-} && -z ${BB_OUTPUT_RES:-} ]]
     # An inherited .1 test environment must shed its unsafe automatic heap override.
     export BB_DMEM_MB=9152 BB_ULTRAWIDE_AUTO_DMEM=1

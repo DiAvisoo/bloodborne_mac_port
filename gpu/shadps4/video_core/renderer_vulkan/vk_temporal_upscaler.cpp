@@ -218,28 +218,6 @@ bool TemporalUpscaler::RasterScaling() const {
     return !scaled_session && scene_targets.Reduced() && !done_this_frame;
 }
 
-std::array<u32, 2> TemporalUpscaler::UiSize() const {
-    const auto& settings = BbSettings::Get();
-    if (settings.ultrawide_width) {
-        return {u32(settings.ultrawide_width), u32(settings.ultrawide_height)};
-    }
-    return {1920, 1080};
-}
-
-void TemporalUpscaler::OnFrameEnd(VideoCore::ImageId color_id) {
-    // OnDraw normally enters UI composition, but a hidden/offscreen HUD or loading
-    // transition can produce zero movie draws. Falling back to the guest display then
-    // squeezes a wide camera into a pillarboxed 16:9 image. Finish a fresh frame here;
-    // never keep a stale UI image from the previous frame.
-    if (!enabled || !Scaled() || ui_phase || !color_id) return;
-    const auto& color = texture_cache.GetImage(color_id);
-    if (FrameCapture::IsDisplayBuffer(color.info.guest_address) ||
-        !RenderTarget(color.info.size.width, color.info.size.height) ||
-        (color.info.pixel_format != vk::Format::eR8G8B8A8Unorm &&
-         color.info.pixel_format != vk::Format::eR8G8B8A8Srgb)) return;
-    RunUiOnly(color_id, {});
-}
-
 bool TemporalUpscaler::OnFrameStart() {
     // bbport: BB_PRESET_FILE=<file> holding a preset number, read about once a second: switches
     // the preset like the menu does (scripted tests of live preset changes).
@@ -280,13 +258,10 @@ bool TemporalUpscaler::OnFrameStart() {
     const bool active = Active();
     const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25);
     const int output = settings.output_res.load();
-    const auto [output_width, output_height] = BbSettings::OutputSize();
-    const bool output_changed = !scaled_session &&
-        (applied_output != output || target_width != u32(output_width) ||
-         target_height != u32(output_height));
+    const bool output_changed = !scaled_session && applied_output != output;
     if (output_changed) {
-        target_width = output_width;
-        target_height = output_height;
+        target_width = BbSettings::OutputWidths[output];
+        target_height = BbSettings::OutputHeights[output];
         std::printf("Output resolution: %ux%u (live)\n", target_width, target_height);
         failed = false;
     }

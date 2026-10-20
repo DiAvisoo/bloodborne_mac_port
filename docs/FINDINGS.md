@@ -1454,3 +1454,24 @@ The user observed ~55 FPS with missing character legs and progressive stretched 
 The `.2` gameplay trial had no triangle artifacts, but no-HUD frames were squeezed into a pillarboxed 16:9 output (~36 FPS in the supplied screenshot). Opening inventory restored the full-width scene, with horizontally stretched UI. `OnFrameStart` copied `ui_phase` to `display_redirect`; no Scaleform draw meant no host display override. `.3` completes composition before clearing camera/frame state even when no UI draw occurred. It uses the current frame's last eligible color target, not a retained prior UI frame.
 
 Camera-only patching also left the UI at 1920×1080 while the compositor stretched it to 3840×1080. `.3` keeps the community logical UI viewport and lock-on/menu-coordinate writes, while excluding both guest scene MOV/NOP ranges and both heap writes. The compositor now separates wide UI coordinates (1:1 onto the wide host UI target) from guest display-copy coordinates (scaled to the host output). No `.gfx` or other game asset is changed. Correct image and menu transitions still require user gameplay validation.
+
+### Native ultrawide with retail heaps (2026-10-20)
+
+The `.3` test above failed: black title menus and a giant HUD in a narrow image. Its log
+reported an actual 640×360 scene. The community resolution patch changes fallback globals
+at `0x055289F8/FC` to 640/360, then compensates with scene MOV/NOP overrides. Filtering out
+the overrides alone broke that dependency. A diagnostic also removing the globals brought
+back the title image but with incorrect placement, so it was not installed.
+
+A second isolated diagnostic applied the complete native resolution patch at 3840×1080,
+omitting only graphics-heap expansion writes at `0x04B36DDA` and `0x04B36DE2`, with
+`BB_UPSCALER=none` and retail 5056 MiB DMEM (6 GiB Metal arena, observed use 4.50 GiB).
+Title menus, full-width gameplay and HUD were correctly proportioned. The user confirmed
+movement/menu testing looked correct with no artifacts. Clinic readings varied ~33–54 FPS
+by view; no controlled speedup claim. The expanded heaps remain a suspect, not a proven
+root cause of the original geometry corruption. Longer play and other resolutions are untested.
+
+`.4` packages this native/retail-heap configuration. It removes the experimental wide host
+composition changes, preserves all dependent scene/UI patch instructions, and measures the
+native G-buffer depth dimensions for the FPS badge. It neither changes game assets nor
+replaces stable apps or their saves. Diagnostic saves are disposable copies.

@@ -150,8 +150,8 @@ void Load() {
             Set(v, key, value);
         }
     }
-    // Wide output uses host scene targets. The guest's heaps and viewports stay native;
-    // only its camera aspect is patched. Match the launcher's validated presets.
+    // Native wide patches own scene/UI dimensions. Disable generic host resizing.
+    // Match the launcher's validated presets; observe actual scene size at the G-buffer.
     v.ultrawide_width = v.ultrawide_height = 0;
     if (const char* wide = std::getenv("BB_ULTRAWIDE_RES"); wide && wide[0]) {
         constexpr std::array<int, 2> sizes[] = {
@@ -161,7 +161,8 @@ void Load() {
                 v.ultrawide_width = size[0];
                 v.ultrawide_height = size[1];
                 v.output_res = OutputDefault;
-                v.live_resolution = 1;
+                v.live_resolution = 0;
+                v.active_render_width = v.active_render_height = 0;
                 v.upscaler = UpscalerOff;
                 v.preset = NativeAA;
                 break;

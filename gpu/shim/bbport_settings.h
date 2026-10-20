@@ -73,7 +73,7 @@ struct Values {
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
-    // Fixed at launch: camera aspect needs a restart, host targets use these dimensions.
+    // Fixed at launch: native scene/UI patch dimensions, requiring a restart.
     int ultrawide_width = 0, ultrawide_height = 0;
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};

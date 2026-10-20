@@ -25,17 +25,5 @@ int main() {
     assert(ui[0] == 1 && ui[1] == 1); // don't double an already native UI viewport
     const auto larger = Scale(960, 540, 3840, 2160, true);
     assert(larger[0] == 2 && larger[1] == 2);
-    // Wide Scaleform movies already use the full width, but the scene/display-copy
-    // coordinates still use the retail guest buffer. Scaling both identically doubled
-    // menu text while frames without movie draws reverted to a narrow display.
-    for (const auto size : {std::array<uint32_t, 2>{3840, 1080}, {2560, 1080},
-                           {3440, 1440}, {5120, 1440}, {2560, 720}}) {
-        assert(NativeViewport(float(size[0]), -float(size[1]), size));
-        const auto wide_ui = Scale(1920, 1080, size[0], size[1], true, size);
-        assert(wide_ui[0] == 1 && wide_ui[1] == 1);
-        const auto wide_display = Scale(1920, 1080, size[0], size[1], false, size);
-        assert(wide_display[0] == float(size[0]) / 1920);
-        assert(wide_display[1] == float(size[1]) / 1080);
-    }
     std::puts("UI composition: PASS (menu without camera, HUD, FSR off, viewport scaling)");
 }
