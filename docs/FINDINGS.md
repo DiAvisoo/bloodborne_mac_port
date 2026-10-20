@@ -1539,3 +1539,15 @@ First launch rebuilds affected shaders; compare only warmed views. Gameplay resu
 Sources: https://github.com/Wooloomooloo2/bloodborne_mac_port/pull/20,
 https://github.com/Wooloomooloo2/bloodborne_mac_port/pull/11,
 https://github.com/Wooloomooloo2/bloodborne_mac_port/issues/18.
+
+
+The invariant trial subsequently ran at the observed native 3840x1080 scene dimensions.
+After initial loading/compilation, 5-second gameplay samples were predominantly 56-60 FPS,
+GPU busy roughly 12-17 ms/frame, versus about 35 ms in the preceding Dream test. The user
+confirmed "60FPS pretty stable at ultrawide". These moving views are not a controlled fixed-
+camera benchmark and no long-session stability claim is made. The user reported audio loss
+after a while: music and effects stopped, then music returned, menu sounds worked, but
+punch/combat sounds did not. The shader commit changes no audio code. Preserve this build,
+log and save copy before audio investigation. Audio diagnostics were not enabled in that run;
+CoreAudio opened main and BGM ports successfully. The launch-time sound-save flag workaround
+was applied, so merely enabling that existing workaround is not a new fix.
