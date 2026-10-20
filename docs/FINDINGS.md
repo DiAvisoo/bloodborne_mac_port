@@ -1381,3 +1381,34 @@ placeholders. Rebuilt structs: 4 placeholders + 10 values, 224 bytes, offsets as
 tessellation). The first attempt padded from location 0 and only worked because SPIRV-Cross
 skips locations the per-vertex inputs (0-7) occupy; the range now starts at the TCS's first
 patch location. Not yet seen in game.
+
+## PR #20's performance changes on the M4 Max, one at a time (2026-10-20)
+
+Master 1cf9f4a vs master plus each change (deferred copies = c3785a5 + 382cec9), windowed,
+uncapped (Immediate, 480 Hz vblank), warm caches, mean of 3 alternating runs (stand / turn FPS),
+GPU-process CPU from `top`:
+
+| | Dream headstone 1440p native | GPU process | City (Cages) 1080p native | GPU process |
+|---|---|---|---|---|
+| master | 82.1 / 80.4 | 225% | 109.4 / 115.9 | 295% |
+| deferred copies | **86.5 / 85.8 (+5.4% / +6.7%)** | 228% | **125.6 / 118.8 (+14.8% / +2.5%)** | 304% |
+| sleep instead of spin | 81.6 / 80.2 | **175% (-22%)** | 108.3 / 113.3 | **265% (-10%)** |
+| no texture hash | 81.9 / 80.4 | 222% | 110.4 / 119.7 | 292% |
+
+- Deferred copies, uncapped at 1440p: more game-side spikes (7-12 per run vs 3-4, worst 56 ms
+  once); not in the city. At the 60 cap (1440p, 2 runs each) both hold 60.0 FPS with the same
+  pacing (stddev 0.01 ms, 0 frames over 1.5x median); 1-3 spikes per run vs 0-1, one present gap
+  of 25.7 ms. Headstone screenshots identical to master's.
+- All three together: Dream 86.0 / 85.5 with the GPU process at 177%. City: 5 alternating runs
+  of the combined build, sleep vs `BB_PIPE_BLOCKING_WAIT=0` (spin): median 125.6 vs 127.1 FPS,
+  host 283% vs 305%; each mode had one slow run (sleep 114.5, spin 123.3). An earlier pair of
+  combined city runs measured 110.9 against master's 110.2 in the same session: the city scene
+  swings between sessions, so only alternating runs compare.
+- Taken onto master (authorship kept) for 0.5.3.
+
+## Full screen in the background harness (2026-10-20)
+
+Full screen (`fullscreen=1`, MetalFX 1440p, 60 cap, app not focused): 59.5-59.8 FPS with 30-40
+game-side spikes per run and worst frames of 25 ms (three 120 Hz refreshes), on master and on
+the cleanup branch alike; windowed the same runs have 0 spikes. The user plays full screen and
+reports smooth play, so this is likely the unfocused harness. Not chased.

@@ -367,6 +367,13 @@ Each item: what was done for now, what the refinement is, and where it lives.
   (`raw_buffer_tese_input`), so both structs are 224 bytes with the same offsets. `--msl-check`
   on a copy of the user's cache: 649 of 649 pipelines, all 30 tessellation ones. Still to see in
   game: what it draws (the error line should be gone).
+- **Flaky unit test: `untracked command buffers count too` (test_mtl_encoder.mm, 2026-10-20).**
+  It compares the GPU busy time of two 64 MiB fills; failed once in a full `--test` run while the
+  machine was otherwise idle, then passed 5 of 5 alone and in the next full run. A timing bound,
+  not a renderer bug; widen the margin or repeat the measurement before failing.
+- **Full-screen pacing in the unfocused test harness (2026-10-20).** 30-40 spikes per run (25 ms
+  frames) full screen vs 0 windowed, master and the cleanup branch alike (FINDINGS). Check with
+  the app focused before treating it as a real problem.
 - **GPU host crash in `Scheduler::KickRecording` (2026-10-14, user session).** SIGSEGV at
   address 0x20008 (a null `record_chunk`: its size field follows the 128 KiB buffer) on the draw
   recording thread, `RunWriteData` → `WaitHostCopies` → `KickRecording`, right after an area
