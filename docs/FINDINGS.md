@@ -1458,3 +1458,9 @@ or ordinary play. No reproducible dropout or causal claim is asserted in this sp
 Split validation: build_macos.sh completes for the x86 guest/library and both arm64
 host variants. The extraction changes only runtime_audio.c, runtime_ajm.c and this note;
 no playback algorithm, renderer default or launcher setting is changed.
+2026-10-20 — launcher validation fixes (split from PR #26): the duplicate-launch
+guard now recognizes bbgpu-host-macos27 as well as bbgpu-host/bb-probe. Game-folder
+validation passes Python -B in both checkout and packaged layouts; importing prepare.py
+must not create __pycache__ inside the signed app. The combined build passed strict
+signature verification after launcher folder validation. Launcher model tests cover both
+checker commands. No renderer defaults, lifecycle or resolution changes in this split.
