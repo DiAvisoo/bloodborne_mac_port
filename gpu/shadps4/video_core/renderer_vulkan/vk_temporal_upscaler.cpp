@@ -276,6 +276,13 @@ bool TemporalUpscaler::OnFrameStart() {
     }
     BbSettings::Get().active_render_width = Scaled() ? render_width : scene_targets.Size().width;
     BbSettings::Get().active_render_height = Scaled() ? render_height : scene_targets.Size().height;
+    if (const char* wide = std::getenv("BB_ULTRAWIDE_RES"); wide && wide[0]) {
+        unsigned w = 0, h = 0;
+        if (std::sscanf(wide, "%ux%u", &w, &h) == 2 && w && h) {
+            BbSettings::Get().active_render_width = w;
+            BbSettings::Get().active_render_height = h;
+        }
+    }
     if (changed || !dispatched_last_frame) reset = true;
     if (changed) jitter_index = 0;
     applied_preset = preset;

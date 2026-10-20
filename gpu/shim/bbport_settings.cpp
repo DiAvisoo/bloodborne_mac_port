@@ -143,6 +143,13 @@ void Load() {
             Set(v, key, value);
         }
     }
+    // Native wide patches own the scene/UI size; the generic host resize stays neutral.
+    if (const char* wide = std::getenv("BB_ULTRAWIDE_RES"); wide && wide[0]) {
+        v.output_res = OutputDefault;
+        v.live_resolution = 0;
+        v.upscaler = UpscalerOff;
+        v.preset = NativeAA;
+    }
     // The choice as asked for; ConfigureUpscalerSupport resolves what runs before the renderer
     // reads it.
     v.requested_upscaler = v.upscaler.load();

@@ -4,17 +4,17 @@ cd -- "$(dirname -- "$0")"
 # BB_PREBUILT=1 (packaged builds, Bloodborne.app): out/bb-probe and its GPU library are installed
 # next to this script; nothing is built.
 # BB_DATA_DIR: writable directory for the generated files (out/), saves (user/) and bbport.ini;
-# by default ~/Library/Application Support/Bloodborne.
+# by default ~/Library/Application Support/Bloodborne Metal Ultrawide Test.
 # The game process (x86-64) runs under Rosetta 2; a native arm64 process renders with Metal.
 if [[ $OSTYPE != darwin* ]]; then echo 'This port runs on macOS (Apple Silicon) only.' >&2; exit 1; fi
 data=${BB_DATA_DIR:-.}
-# Data defaults to ~/Library/Application Support/Bloodborne. A checkout that already keeps
+# Data defaults to ~/Library/Application Support/Bloodborne Metal Ultrawide Test. A checkout that already keeps
 # saves in this directory goes on using them (moving saves is left to the player).
 if [[ -z ${BB_DATA_DIR:-} ]]; then
-    data="$HOME/Library/Application Support/Bloodborne"
+    data="$HOME/Library/Application Support/Bloodborne Metal Ultrawide Test"
     if [[ ! -d $data && ( -d user/savedata || -f bbport.ini ) ]]; then
         data=.
-        echo "Saves and settings stay in $PWD (move user/ and bbport.ini to $HOME/Library/Application Support/Bloodborne to use the default)."
+        echo "Saves and settings stay in $PWD (move user/ and bbport.ini to $HOME/Library/Application Support/Bloodborne Metal Ultrawide Test to use the default)."
     fi
     # A "Saves" link next to this script leads to the save folder from Finder.
     if [[ $data != . ]]; then
@@ -68,7 +68,9 @@ fps=${BB_FPS:-uncap}
 # and scene targets are copied back: much slower on the Steam Deck and older GPUs). Chosen by
 # BB_LIVE_RES=0/1, else bbport.ini live_resolution=0/1/auto (auto: the GPU check, strong
 # discrete GPUs get them); off when unset. 1080p output and TAA always use the live path.
-if [[ -z ${BB_RENDER_RES:-} ]]; then
+wide_patch=$("$PYTHON" scripts/patches.py --print-ultrawide --settings "$BB_CONFIG")
+bb_native_ultrawide "$wide_patch"
+if [[ -z $wide_patch && -z ${BB_RENDER_RES:-} ]]; then
     read -r scaled_render scaled_output < <("$PYTHON" scripts/patches.py --print-scaled --settings "$BB_CONFIG") || true
 fi
 live=0 above_1080=0
@@ -100,7 +102,7 @@ elif [[ -n ${scaled_output:-} ]]; then
     if (( render_w * render_h > 1920 * 1080 )); then export BB_DMEM_MB=${BB_DMEM_MB:-9152}; fi
     echo "Output ${scaled_output}: scene ${scaled_render}, direct memory ${BB_DMEM_MB:-5056} MiB (live_resolution=1: live changes)"
 fi
-"$PYTHON" scripts/patches.py --out "$out" --fps "$fps" --extra "${BB_PATCHES:-}" --settings "$BB_CONFIG" --game-dir "$game" --render-res "${BB_RENDER_RES:-}" --output-res "${BB_OUTPUT_RES:-}" \
+"$PYTHON" scripts/patches.py --out "$out" --fps "$fps" --extra "$launch_patches" --settings "$BB_CONFIG" --game-dir "$game" --render-res "${BB_RENDER_RES:-}" --output-res "${BB_OUTPUT_RES:-}" \
     --patches-dir "${BB_PATCHES_DIR:-$data/patches}" --patches-config "${BB_PATCHES_CONFIG:-$data/patches.json}"
 if [[ -z ${BB_VBLANK_HZ:-} ]]; then
     case $fps in uncap) export BB_VBLANK_HZ=0 ;; 90) export BB_VBLANK_HZ=90 ;; *) export BB_VBLANK_HZ=60 ;; esac

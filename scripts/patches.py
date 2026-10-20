@@ -139,6 +139,23 @@ def output_size(settings):
     return OUTPUT_SIZE
 
 
+ULTRAWIDE_PATCHES = {
+    '2560x720': 'Resolution Patch 2560x720 (32:9)',
+    '3840x1080': 'Resolution Patch 3840x1080 (32:9)',
+    '5120x1440': 'Resolution Patch 5120x1440 (32:9)',
+    '2560x1080': 'Resolution Patch 2560x1080 (21:9)',
+    '3440x1440': 'Resolution Patch 3440x1440 (21:9)',
+}
+
+
+def ultrawide_patch(settings):
+    size = settings.get('ultrawide_res', '').strip()
+    if not size: return ''
+    if size not in ULTRAWIDE_PATCHES:
+        raise ValueError(f'Unsupported ultrawide resolution: {size}')
+    return ULTRAWIDE_PATCHES[size]
+
+
 def scaled_sizes(settings):
     """(render, output) for an output other than 1080p (above it, or 720p for the Steam Deck):
     the game renders at output / preset scale (or at the output size without upscaler) and the
@@ -294,9 +311,13 @@ def main():
     p.add_argument('--render-res',default='',help='render resolution WxH (overrides the preset)')
     p.add_argument('--print-preset-size',action='store_true',help='print the selected preset size, if reduced')
     p.add_argument('--output-res',default='',help='output resolution WxH (the upscaler\'s; the UI stays 1920x1080)')
+    p.add_argument('--print-ultrawide',action='store_true', help='print the selected native wide patch')
     p.add_argument('--print-scaled',action='store_true',
                    help='print "RENDER OUTPUT" (WxH) when bbport.ini selects an output other than 1080p')
     a=p.parse_args()
+    if a.print_ultrawide:
+        print(ultrawide_patch(read_settings(a.settings)))
+        return
     if a.print_scaled:
         sizes=scaled_sizes(read_settings(a.settings))
         if sizes: print(f'{sizes[0][0]}x{sizes[0][1]} {sizes[1][0]}x{sizes[1][1]}')

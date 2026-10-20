@@ -11,7 +11,7 @@ struct LaunchPlan: Equatable {
 
 enum Logs {
     /// game.log (this session) and game.previous.log.
-    static func folder(home: URL) -> URL { home.appendingPathComponent("Library/Logs/Bloodborne") }
+    static func folder(home: URL) -> URL { home.appendingPathComponent("Library/Logs/Bloodborne Metal Ultrawide Test") }
 }
 
 /// Where the parts are: the release app (everything inside it, scripts/macos/package_app.sh) or
@@ -53,7 +53,7 @@ enum Layout: Equatable {
     }
 
     private static func defaultData(_ env: [String: String]) -> URL {
-        home(env).appendingPathComponent("Library/Application Support/Bloodborne")
+        home(env).appendingPathComponent("Library/Application Support/Bloodborne Metal Ultrawide Test")
     }
 
     /// launch.conf: in the data folder for the release app, next to Bloodborne.command in a
@@ -67,7 +67,7 @@ enum Layout: Equatable {
     }
 
     /// bbport.ini, the shader cache and the default save folder: BB_DATA_DIR, else launch.conf's
-    /// BB_DATA_DIR, else ~/Library/Application Support/Bloodborne (run.sh's default).
+    /// BB_DATA_DIR, else ~/Library/Application Support/Bloodborne Metal Ultrawide Test (run.sh's default).
     func dataDir(env: [String: String], config: LaunchConfig) -> URL {
         if let path = env["BB_DATA_DIR"], !path.isEmpty { return URL(fileURLWithPath: path) }
         return config.dataDir ?? Self.defaultData(env)

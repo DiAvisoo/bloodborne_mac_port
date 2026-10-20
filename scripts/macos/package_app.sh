@@ -33,7 +33,7 @@ for f in out/bb-probe out/gpu/libbbgpu.dylib out/bbgpu-host out/bbgpu-host-macos
 done
 
 dist=$repo/dist
-app=$dist/Bloodborne.app
+app="$dist/Bloodborne Metal Ultrawide Test.app"
 contents=$app/Contents
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Frameworks" "$contents/Resources/port/scripts" "$contents/Resources/licenses"
@@ -157,9 +157,9 @@ cat > "$contents/Info.plist" <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>Bloodborne</string>
-    <key>CFBundleDisplayName</key><string>Bloodborne</string>
-    <key>CFBundleIdentifier</key><string>io.github.wooloomooloo2.bloodborne-mac-port</string>
+    <key>CFBundleName</key><string>Bloodborne Metal Ultrawide Test</string>
+    <key>CFBundleDisplayName</key><string>Bloodborne Metal Ultrawide Test</string>
+    <key>CFBundleIdentifier</key><string>io.github.diavisoo.bloodborne-metal-ultrawide-test</string>
     <key>CFBundleExecutable</key><string>Bloodborne</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>${version%%-*}</string>
@@ -188,5 +188,5 @@ codesign --verify --deep --strict "$app"
 
 zip=$dist/Bloodborne-macOS-$version.zip
 rm -f "$zip"
-(cd "$dist" && ditto -c -k --keepParent --sequesterRsrc Bloodborne.app "$(basename "$zip")")
+(cd "$dist" && ditto -c -k --keepParent --sequesterRsrc "$(basename "$app")" "$(basename "$zip")")
 echo "Built $app ($(du -sh "$app" | cut -f1)) and $zip ($(du -h "$zip" | cut -f1))"

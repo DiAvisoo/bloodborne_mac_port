@@ -55,6 +55,26 @@ do {
     check(PixelSize(2560, 1440).iniValue == "2560x1440" && PixelSize(2560, 1440).description == "2560 × 1440", "format")
 }
 
+// Native wide patch: display size is independent of the neutral renderer size.
+do {
+    var settings = GameSettings()
+    settings.output = PixelSize(2560, 1440)
+    settings.ultrawide = true
+    settings.wideOutput = PixelSize(3840, 1080)
+    settings.upscaler = .metalfx
+    settings.preset = 3
+    settings.liveResolution = .on
+    var ini = IniFile()
+    settings.apply(to: &ini)
+    check(ini["output_res"] == "1920x1080" && ini["ultrawide_res"] == "3840x1080", "wide patch and neutral renderer")
+    check(ini["upscaler"] == "off" && ini["preset"] == "0" && ini["live_resolution"] == "0", "native wide never upscales")
+    var loaded = GameSettings(ini: ini)
+    check(loaded.ultrawide && loaded.renderSize == PixelSize(3840, 1080), "wide selection survives restart")
+    loaded.ultrawide = false
+    loaded.apply(to: &ini)
+    check(ini["ultrawide_res"] == nil && ini["output_res"] == "2560x1440", "disable removes patch and restores standard output")
+}
+
 // GameSettings: defaults, reading, values the launcher does not offer, writing back.
 do {
     let defaults = GameSettings(ini: IniFile())
@@ -107,7 +127,7 @@ do {
 
 // Shell quoting and launch.conf (review focus 1: spaces, quotes; bash must source it).
 do {
-    let tricky = ["/Users/a/Library/Application Support/Bloodborne", "/Volumes/My Drive/Hunter's saves", "/tmp/$HOME `x` \\ \"q\""]
+    let tricky = ["/Users/a/Library/Application Support/Bloodborne Metal Ultrawide Test", "/Volumes/My Drive/Hunter's saves", "/tmp/$HOME `x` \\ \"q\""]
     for path in tricky {
         check(Shell.unquote(Shell.quote(path)) == path, "quote round trip \(path)")
     }
@@ -184,7 +204,7 @@ do {
 
 
     let home = URL(fileURLWithPath: "/Users/h")
-    let defaultData = home.appendingPathComponent("Library/Application Support/Bloodborne")
+    let defaultData = home.appendingPathComponent("Library/Application Support/Bloodborne Metal Ultrawide Test")
     let env = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
     check(packaged!.launchConfURL(env: env) == defaultData.appendingPathComponent("launch.conf"), "packaged launch.conf in the data folder")
     check(checkout!.launchConfURL(env: env) == repo.appendingPathComponent("launch.conf"), "checkout launch.conf in the repository")
@@ -192,7 +212,7 @@ do {
     check(packaged!.dataDir(env: env, config: LaunchConfig()) == defaultData, "default data folder")
     check(packaged!.dataDir(env: env.merging(["BB_DATA_DIR": "/x"]) { $1 }, config: LaunchConfig()).path == "/x", "BB_DATA_DIR")
     check(checkout!.dataDir(env: env, config: LaunchConfig(ini: IniFile(text: "BB_DATA_DIR=/y\n"))).path == "/y", "launch.conf BB_DATA_DIR")
-    check(Logs.folder(home: home).path == "/Users/h/Library/Logs/Bloodborne", "logs folder")
+    check(Logs.folder(home: home).path == "/Users/h/Library/Logs/Bloodborne Metal Ultrawide Test", "logs folder")
 
     let game = URL(fileURLWithPath: "/Games/My CUSA03173")
     let p = packaged!.launchPlan(gameDir: game, saveDir: nil, dataDir: defaultData, env: env)

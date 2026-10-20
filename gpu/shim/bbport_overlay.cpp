@@ -642,6 +642,15 @@ int current_tab = TabDisplay;
 std::atomic<bool> gamepad_in_use{false}; // last menu input came from a pad: show L1/R1 hints
 
 void DisplayTab(BbSettings::Values& s) {
+    const char* wide = std::getenv("BB_ULTRAWIDE_RES");
+    const bool native_wide = wide && wide[0];
+    if (native_wide) {
+        BeginCard("Native ultrawide");
+        ValueRow("Resolution", wide);
+        Note("Change resolution in the launcher and restart. Upscaling is off.");
+        EndCard();
+    }
+    ImGui::BeginDisabled(native_wide);
     // The menu's choices (FSR 4 is removed from the Mac build; an ini naming it still loads).
     static constexpr int choices[] = {BbSettings::UpscalerOff, BbSettings::UpscalerFsr3,
                                       BbSettings::UpscalerTaa, BbSettings::UpscalerMetalFx};
@@ -800,6 +809,8 @@ void DisplayTab(BbSettings::Values& s) {
     }
     HintBelow("Size of the final frame and HUD.");
     EndCard();
+
+    ImGui::EndDisabled(); // startup ultrawide patch owns resolution and upscaling
 
     BeginCard("Overlay");
     Toggle("FPS counter in corner", s.show_fps);

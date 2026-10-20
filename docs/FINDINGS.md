@@ -1438,3 +1438,7 @@ VMA, Zydis, xbyak, FSR 4's tools and the `renderer` setting left the build and t
 - `build_macos.sh --test`: the same PASS lines as before minus the two MoltenVK interop runs
   (221 vs 223), the same error lines. A build against a copy of `deps/` without the loader,
   MoltenVK, VMA, Zydis and xbyak (symlink overlay) succeeds.
+
+## Local M2 ultrawide trial (2026-10-20)
+
+Branch `metal-ultrawide-test` builds the 0.5.3 Metal renderer with native 32:9/21:9 launcher options. See [METAL_ULTRAWIDE_TEST.md](METAL_ULTRAWIDE_TEST.md) for the patch/renderer boundary, isolation and validation. Game files are unchanged; fresh backups precede the test. Performance measurement is pending gameplay; no claimed improvement yet.

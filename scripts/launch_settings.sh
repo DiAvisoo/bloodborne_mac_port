@@ -19,3 +19,28 @@ bb_launch_settings() { # ini file
     if [[ $hud == 1 && -z ${MTL_HUD_ENABLED:-} ]]; then export MTL_HUD_ENABLED=1; fi
     return 0
 }
+
+# Recomputed on every launch/restart. Never append automatic patches to the inherited
+# BB_PATCHES, otherwise disabling ultrawide would leave the previous patch active.
+bb_native_ultrawide() { # a patch name validated by patches.py, or empty for 16:9
+    local wide_patch=$1
+    launch_patches=${BB_PATCHES:-}
+    unset BB_ULTRAWIDE_RES
+    if [[ ${BB_ULTRAWIDE_SESSION:-} == 1 ]]; then
+        unset BB_UPSCALER BB_ULTRAWIDE_SESSION
+    fi
+    if [[ ${BB_ULTRAWIDE_AUTO_DMEM:-} == 1 ]]; then
+        unset BB_DMEM_MB BB_ULTRAWIDE_AUTO_DMEM
+    fi
+    if [[ -n $wide_patch ]]; then
+        export BB_ULTRAWIDE_RES=${wide_patch#Resolution Patch }
+        BB_ULTRAWIDE_RES=${BB_ULTRAWIDE_RES%% *}
+        export BB_UPSCALER=none BB_ULTRAWIDE_SESSION=1
+        if [[ -z ${BB_DMEM_MB:-} ]]; then
+            export BB_DMEM_MB=9152 BB_ULTRAWIDE_AUTO_DMEM=1
+        fi
+        unset BB_RENDER_RES BB_OUTPUT_RES BB_AUTO_RENDER_RES
+        launch_patches="${launch_patches:+$launch_patches;}$wide_patch"
+        echo "Ultrawide: native $BB_ULTRAWIDE_RES; community camera/UI patch; no upscaling"
+    fi
+}
