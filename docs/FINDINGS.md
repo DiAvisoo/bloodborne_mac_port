@@ -1438,3 +1438,11 @@ VMA, Zydis, xbyak, FSR 4's tools and the `renderer` setting left the build and t
 - `build_macos.sh --test`: the same PASS lines as before minus the two MoltenVK interop runs
   (221 vs 223), the same error lines. A build against a copy of `deps/` without the loader,
   MoltenVK, VMA, Zydis and xbyak (symlink overlay) succeeds.
+
+
+2026-10-20 — launcher validation fixes (split from PR #26): the duplicate-launch
+guard now recognizes bbgpu-host-macos27 as well as bbgpu-host/bb-probe. Game-folder
+validation passes Python -B in both checkout and packaged layouts; importing prepare.py
+must not create __pycache__ inside the signed app. The combined build passed strict
+signature verification after launcher folder validation. Launcher model tests cover both
+checker commands. No renderer defaults, lifecycle or resolution changes in this split.
