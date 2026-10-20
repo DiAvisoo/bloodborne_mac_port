@@ -1,38 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
-if [[ ${1:-} == --software ]]; then
-    shift
-    if [[ -z ${VK_DRIVER_FILES:-} ]]; then
-        for candidate in /run/opengl-driver/share/vulkan/icd.d/lvp_icd*.json /usr/share/vulkan/icd.d/lvp_icd*.json; do
-            if [[ -f $candidate ]]; then export VK_DRIVER_FILES=$candidate; break; fi
-        done
-    fi
-    if [[ -z ${VK_DRIVER_FILES:-} ]]; then echo 'Lavapipe not found; set VK_DRIVER_FILES.' >&2; exit 1; fi
-    export VK_LOADER_LAYERS_DISABLE='~implicit~'
-fi
-# BB_PREBUILT=1 (packaged builds, the AppImage): out/bb-probe and its GPU library are installed
-# next to this script; nothing is built and no nix-shell is needed.
+# BB_PREBUILT=1 (packaged builds, Bloodborne.app): out/bb-probe and its GPU library are installed
+# next to this script; nothing is built.
 # BB_DATA_DIR: writable directory for the generated files (out/), saves (user/) and bbport.ini;
-# by default this directory (macOS: ~/Library/Application Support/Bloodborne).
+# by default ~/Library/Application Support/Bloodborne.
+# The game process (x86-64) runs under Rosetta 2; a native arm64 process renders with Metal.
+if [[ $OSTYPE != darwin* ]]; then echo 'This port runs on macOS (Apple Silicon) only.' >&2; exit 1; fi
 data=${BB_DATA_DIR:-.}
-# macOS: the game process (x86-64) runs under Rosetta 2; a native arm64 process renders with Metal.
-macos=0
-if [[ $(uname -s) == Darwin ]]; then
-    macos=1
-    # Data defaults to ~/Library/Application Support/Bloodborne. A checkout that already keeps
-    # saves in this directory goes on using them (moving saves is left to the player).
-    if [[ -z ${BB_DATA_DIR:-} ]]; then
-        data="$HOME/Library/Application Support/Bloodborne"
-        if [[ ! -d $data && ( -d user/savedata || -f bbport.ini ) ]]; then
-            data=.
-            echo "Saves and settings stay in $PWD (move user/ and bbport.ini to $HOME/Library/Application Support/Bloodborne to use the default)."
-        fi
-        # A "Saves" link next to this script leads to the save folder from Finder.
-        if [[ $data != . ]]; then
-            mkdir -p "$data/user/savedata"
-            [[ -e Saves || -L Saves ]] || ln -s "$data/user/savedata" Saves 2>/dev/null || true
-        fi
+# Data defaults to ~/Library/Application Support/Bloodborne. A checkout that already keeps
+# saves in this directory goes on using them (moving saves is left to the player).
+if [[ -z ${BB_DATA_DIR:-} ]]; then
+    data="$HOME/Library/Application Support/Bloodborne"
+    if [[ ! -d $data && ( -d user/savedata || -f bbport.ini ) ]]; then
+        data=.
+        echo "Saves and settings stay in $PWD (move user/ and bbport.ini to $HOME/Library/Application Support/Bloodborne to use the default)."
+    fi
+    # A "Saves" link next to this script leads to the save folder from Finder.
+    if [[ $data != . ]]; then
+        mkdir -p "$data/user/savedata"
+        [[ -e Saves || -L Saves ]] || ln -s "$data/user/savedata" Saves 2>/dev/null || true
     fi
 fi
 out=$data/out
@@ -45,18 +32,7 @@ bb_launch_settings "$BB_CONFIG"
 # library reads it while loading, in bb-probe and in the native GPU host alike.
 export BB_GPU_USER_DIR=${BB_GPU_USER_DIR:-${BB_USER_DIR:-$data/user}}
 mkdir -p "$BB_GPU_USER_DIR"
-if [[ -z ${BB_PREBUILT:-} && -z ${BB_IN_NIX_SHELL:-} ]] && ! { command -v pkg-config >/dev/null && pkg-config --exists vulkan sdl3; } && command -v nix-shell >/dev/null; then
-    args=''; if (( $# )); then args=$(printf '%q ' "$@"); fi
-    exec env BB_IN_NIX_SHELL=1 nix-shell shell.nix --run "bash run.sh $args"
-fi
-if [[ -z ${PYTHON:-} ]]; then
-    PYTHON=$(command -v python3 || true)
-    if [[ -z $PYTHON ]]; then
-        for candidate in /nix/store/*-python3-*/bin/python3; do
-            if [[ -x $candidate ]]; then PYTHON=$candidate; break; fi
-        done
-    fi
-fi
+if [[ -z ${PYTHON:-} ]]; then PYTHON=$(command -v python3 || true); fi
 if [[ -z ${PYTHON:-} ]]; then echo 'Install Python 3 or set PYTHON.' >&2; exit 1; fi
 # BB_GAME_DIR: the game's folder (eboot.bin, sce_module, ...); default next to this directory.
 game=${BB_GAME_DIR:-../CUSA03173}
@@ -98,23 +74,13 @@ fi
 live=0 above_1080=0
 if [[ -n ${scaled_output:-} ]]; then
     live=${BB_LIVE_RES:-}
-    # Bash builtins only: the AppImage's PATH has no sed/grep (a missing one ended run.sh silently).
+    # Bash builtins only (no sed/grep): a bare PATH must not end run.sh silently.
     if [[ -z $live && -f $BB_CONFIG ]]; then
         while IFS= read -r line || [[ -n $line ]]; do
             [[ $line =~ ^live_resolution=([01]|auto)$ ]] && live=${BASH_REMATCH[1]}
         done < "$BB_CONFIG"
     fi
-    # macOS: off. The Vulkan check (bb-gpu-capabilities) wanted a discrete GPU with 8 GB; Apple
-    # GPUs are integrated, so it always answered 0 on a Mac.
-    if [[ $live == auto ]] && (( macos )); then
-        live=0
-    elif [[ $live == auto ]]; then
-        if [[ -n ${BB_PROBE:-} ]]; then caps=$(dirname -- "$BB_PROBE")/bb-gpu-capabilities
-        elif [[ -n ${BB_PREBUILT:-} ]]; then caps=bin/bb-gpu-capabilities
-        else caps=out/bb-gpu-capabilities; fi
-        live=$("$caps" --live-resolution 2> >(while IFS= read -r line; do
-            [[ $line == *MANGOHUD* ]] || printf '%s\n' "$line"; done >&2)) || live=0
-    fi
+    # auto is off: the old Vulkan check wanted a discrete GPU with 8 GB, which a Mac never has.
     [[ $live == 1 ]] || live=0
     # Above 1920x1080 the startup patch breaks the scene's geometry (stretched polygons across
     # the screen, seen at 2560x1440 on macOS in both process modes): the live path keeps the
@@ -142,7 +108,7 @@ fi
 if [[ -n ${BB_PREBUILT:-} ]]; then
     probe=${BB_PROBE:-bin/bb-probe}
 else
-    if (( macos )); then bash build_macos.sh; else bash build.sh; fi
+    bash build_macos.sh
     probe=out/bb-probe
 fi
 probe_args=("$out/boot-linked.bin" --content-profile "$out/content.bin" --patches "$out/patches.bin" --app0 "$game" --user "${BB_USER_DIR:-$data/user}" --timeout "${BB_TIMEOUT:-0}" "$@")
