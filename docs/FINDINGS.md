@@ -1601,3 +1601,9 @@ FPS at 14.8 ms GPU/frame (99.7% busy), with later moving views at 76-86 FPS. The
 selects Immediate for the 90/120 caps, leaves lower caps unchanged, and preserves explicit
 BB_PRESENT_MODE overrides. A launcher note explains possible tearing. No render resolution
 or quality reduction. All diagnostics used a copy of the experimental save.
+
+User confirmed the Immediate comparison was above 60 FPS and looked good. Installed local
+`.6` after backing up `.5` and its user data. All 15 actual save files remained byte-identical
+to their pre-diagnostic hashes; temporary test progress was backed up separately. Launcher
+and shell settings tests pass; installed 120 FPS config resolves to Immediate, and signature
+verification passes after opening the launcher. The native renderer binaries are unchanged.
