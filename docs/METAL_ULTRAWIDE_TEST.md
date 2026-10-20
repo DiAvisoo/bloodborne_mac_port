@@ -29,3 +29,13 @@ travel and combat check, but varied from 24-60 FPS, with about 28 FPS in Hunter'
 Profiling shows a sustained GPU bottleneck there, with no shader compiles in the measured
 interval. It is **not ready to install or release**; Precise is not a launcher default.
 See FINDINGS for the evidence and limits of these short tests.
+
+
+## Optional shader experiment from PR #20
+
+Commit `ebaf9c7` imports upstream `4be665b` with the original author credited. Set
+`BB_SPIRV_PRECISE=invariant` only for the separate diagnostic; leave unset for original
+vertex precision. The mode invalidates incompatible shader cache entries, so initial loads
+recompile. This is not enabled by the launcher. Build and shader/Metal validation pass;
+M2 ultrawide gameplay and performance are pending. Keep `BB_READBACKS=2` for comparison with
+the visually correct trial, and compare warmed Hunter's Dream views and combat/area travel.

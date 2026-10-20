@@ -1509,3 +1509,33 @@ performance therefore has both sustained GPU cost and occasional stalls. Do not 
 all slowdown to Precise readbacks: sampled fault summaries reported zero read faults.
 Both sessions exited normally. Precise remains a diagnostic override, not a launcher default.
 All diagnostics use separate save copies; the installed `.4` and stable older apps are unchanged.
+
+
+### Upstream PR review and isolated invariant shader experiment (2026-10-20)
+
+Reviewed Wooloomooloo2/bloodborne_mac_port open PRs and related rendering issues. PR #20's
+GPU-image hash skip, draw-pipe waits, deferred copies and third-context loading fix are
+already ancestors of this branch (`b0d4557`, `44300ab`, `27a21db`, `2cb8681`). PR #11's core
+queued-command drain fix is also present (`32e7f2f`); its remaining assertion/logging changes
+are not an established FPS improvement. PR #23 concerns launcher updates, #21 keyboard/mouse,
+and #9 network support. Issue #18 reports similar missing floors/clothing on other Apple
+Silicon models and at standard resolutions; no confirmed general geometry fix is supplied.
+
+Cherry-picked only PR #20 commit `4be665b5bcae16b4f132bb73cdf52a702297904e` with author and
+provenance retained. `BB_SPIRV_PRECISE=invariant` replaces vertex-wide NoContraction with
+invariant position output and Metal preserveInvariance, allowing vertex arithmetic optimization.
+Tessellation evaluation, geometry and export retain NoContraction. The default remains vertex;
+mode-specific shader metadata versions prevent reusing incompatible cached SPIR-V. Upstream
+reported +12% on an M3 Pro at 1920x1080 in the clinic, not an M2/3840x1080 measurement.
+
+Both architecture builds pass. Existing motion-shader tests pass in default vertex mode and
+invariant mode (the latter with Metal API validation); SPIR-V validation passes for all four
+emitted variants in both modes, with Invariant present only on invariant-mode vertex outputs.
+The unwritten-fragment-inputs rendering test passes. These checks do not establish in-game
+geometry correctness across areas. The isolated test keeps BB_READBACKS=2, the bounded 1536 MiB
+pool, 6144 MiB DMEM, native 3840x1080 and no upscaling. Original apps and saves remain separate.
+First launch rebuilds affected shaders; compare only warmed views. Gameplay results pending.
+
+Sources: https://github.com/Wooloomooloo2/bloodborne_mac_port/pull/20,
+https://github.com/Wooloomooloo2/bloodborne_mac_port/pull/11,
+https://github.com/Wooloomooloo2/bloodborne_mac_port/issues/18.
