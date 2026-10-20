@@ -21,12 +21,6 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 1. Stability
 
-- **The Linux reference path no longer builds (2026-10-19).** `build.sh`, `shell.nix`,
-  `packaging/default.nix`, the GTK launcher (`launcher/*.py`, its FSR 4 asset checks) and
-  `tools/gpu_capabilities.c` (the Vulkan GPU check, still in `build.sh` and run.sh's non-Mac
-  `live_resolution=auto`) predate the Metal renderer, which needs Metal; 0.5.3 kept them only
-  as upstream reference. Delete them, or fence them off as unmaintained, when nobody needs them.
-
 - **Metal-native: world geometry missing after long play (Hemwick graveyard, user's 0.4.5 test,
   2026-10-17).** After a long session a large rock wall and the terrain behind it drew as a flat
   fog-coloured hole; quit to menu and load restored them. Suspects: a missed CPU write to guest
