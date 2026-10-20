@@ -83,7 +83,7 @@ struct LauncherView: View {
                     }
                     .pickerStyle(.segmented)
                     if model.settings.frameCap.rawValue > 60 {
-                        Text("Above 60 FPS is experimental: the game was made for 30. 120 needs a 120 Hz display.")
+                        Text("Above 60 FPS is experimental. Display sync is disabled to avoid a 60 FPS ceiling; tearing may occur. Actual FPS depends on the scene.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }

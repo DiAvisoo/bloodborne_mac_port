@@ -1,7 +1,7 @@
 # Local native Metal ultrawide test
 
 Base: Wooloomooloo2/bloodborne_mac_port `master` at `030346a09c313572e87f52fdf75f27d2b80257b3`
-(0.5.3 cleanup). Local branch: `metal-ultrawide-test`. Current local app: **0.5.3-ultrawide.5**.
+(0.5.3 cleanup). Local branch: `metal-ultrawide-test`. Current local app: **0.5.3-ultrawide.6**.
 No public release or upstream merge.
 
 ## Current tested configuration
@@ -27,6 +27,10 @@ No public release or upstream merge.
   It terminates only its retained child process; the native renderer's existing parent-watch
   path closes the renderer. Intentional stops do not open a crash report. Reopening the
   launcher from its Dock icon exposes Stop; quitting the launcher also stops its game.
+- Selecting 90/120 FPS automatically disables display sync to avoid an observed 60 FPS
+  CAMetalLayer ceiling even on a 120 Hz monitor. Lower caps keep their existing behavior.
+  Tearing is possible; explicit `BB_PRESENT_MODE` overrides win. The cap is a maximum:
+  observed gameplay can remain GPU-limited around 67-86 FPS across the tested views.
 - Separate app, identity, saves, settings and logs: **Bloodborne Metal Ultrawide Test**.
   Stable older apps remain untouched. Game files are read-only. No game assets, saves,
   UI mod files or game icons are bundled; existing UI mods are used as-is.
@@ -42,7 +46,7 @@ invalid samples and decoder/output failures if it recurs; they are off in the la
 ## Build and validation
 
 Build with `build_macos.sh`, `scripts/macos/build_launcher.sh --test`, then
-`scripts/macos/package_app.sh 0.5.3-ultrawide.5`. Bootstrap dependencies first when absent.
+`scripts/macos/package_app.sh 0.5.3-ultrawide.6`. Bootstrap dependencies first when absent.
 This machine needs `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk` because
 its linker does not support the newer default SDK.
 

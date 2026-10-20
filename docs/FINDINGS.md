@@ -1589,3 +1589,15 @@ game-folder checker imported `prepare.py` without disabling bytecode, creating a
 `Resources/port/scripts/__pycache__` file inside the signed app. The game launch path already
 disabled this; the independent folder check now passes Python `-B` too. Repackage and verify
 the signature again after opening the installed launcher and completing folder validation.
+
+
+120 FPS investigation: installed `.5` correctly loaded fps_cap=120 and the Uncap FPS++
+patch; the monitor was already 7680x2160 at 120 Hz. Nonetheless the default synchronized
+CAMetalLayer test held 60 FPS even in the title menu (GPU only about 1.1 ms/frame). Frame
+traces showed nextDrawable waits around 16.5 ms. With only BB_PRESENT_MODE=Immediate
+changed, the title menu reached about 109-112 FPS; a loaded gameplay sample reached 67.3
+FPS at 14.8 ms GPU/frame (99.7% busy), with later moving views at 76-86 FPS. The 60 ceiling is therefore presentation-related;
+120 remains a maximum, not a promise of 120 FPS gameplay. The local launch script now
+selects Immediate for the 90/120 caps, leaves lower caps unchanged, and preserves explicit
+BB_PRESENT_MODE overrides. A launcher note explains possible tearing. No render resolution
+or quality reduction. All diagnostics used a copy of the experimental save.

@@ -24,6 +24,28 @@ check $'fps_cap=45\n' "- -"                     # not a cap the launcher offers:
 check $'upscaler=off\n' "- -"                   # no keys: today's behaviour
 check $'fps_cap=40\nfullscreen=1\n' "90 1" BB_FPS_LIMIT=90
 check $'fullscreen=1\n' "- 0" BB_FULLSCREEN=0
+# High caps remove the observed 60 Hz Metal drawable wait; standard caps and external
+# choices retain their original presentation behavior. Re-evaluate after an inherited restart.
+(
+    source scripts/launch_settings.sh
+    unset BB_PRESENT_MODE BB_AUTO_PRESENT_MODE BB_FPS_LIMIT BB_FULLSCREEN
+    printf 'fps_cap=120\n' > "$ini"
+    bb_launch_settings "$ini"
+    [[ $BB_FPS_LIMIT == 120 && $BB_PRESENT_MODE == Immediate && $BB_AUTO_PRESENT_MODE == 1 ]]
+    export BB_FPS_LIMIT=60
+    bb_launch_settings "$ini"
+    [[ -z ${BB_PRESENT_MODE:-} && -z ${BB_AUTO_PRESENT_MODE:-} ]]
+    export BB_PRESENT_MODE=Mailbox BB_FPS_LIMIT=90
+    bb_launch_settings "$ini"
+    [[ $BB_PRESENT_MODE == Mailbox && -z ${BB_AUTO_PRESENT_MODE:-} ]]
+    unset BB_PRESENT_MODE
+    bb_launch_settings "$ini"
+    [[ $BB_PRESENT_MODE == Immediate && $BB_AUTO_PRESENT_MODE == 1 ]]
+    export BB_FPS_LIMIT=40
+    bb_launch_settings "$ini"
+    [[ -z ${BB_PRESENT_MODE:-} && -z ${BB_AUTO_PRESENT_MODE:-} ]]
+) || { echo 'FAIL: presentation mode for high FPS caps'; exit 1; }
+echo 'PASS: presentation mode defaults, overrides and restart'
 rm -f "$ini"
 /bin/bash -c 'source scripts/launch_settings.sh; bb_launch_settings /nonexistent/bbport.ini' ||
     { echo "FAIL: launch settings with a missing file"; exit 1; }

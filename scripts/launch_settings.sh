@@ -2,11 +2,16 @@
 # Sourced by run.sh: bbport.ini settings the launcher writes that become environment variables.
 #   fps_cap=30|40|60|90|120  the presenter lets at most that many frames through
 #                            (BB_FPS_LIMIT); the game keeps run.sh's default frame rate patch
+#   fps_cap=90|120         disable display sync to avoid a 60 Hz Metal presentation ceiling
 #   fullscreen=1             the window opens full screen (BB_FULLSCREEN=1)
 #   metal_hud=1              Apple's Metal Performance HUD (MTL_HUD_ENABLED=1)
 # Values already in the environment win. Bash 3.2 (macOS /bin/bash) compatible.
 bb_launch_settings() { # ini file
     local line cap='' full='' hud=''
+    # Restart inherits our previous automatic choice; preserve explicit external overrides.
+    if [[ ${BB_AUTO_PRESENT_MODE:-} == 1 ]]; then
+        unset BB_PRESENT_MODE BB_AUTO_PRESENT_MODE
+    fi
     [[ -f $1 ]] || return 0
     while IFS= read -r line || [[ -n $line ]]; do
         line=${line%$'\r'}
@@ -15,6 +20,11 @@ bb_launch_settings() { # ini file
         if [[ $line =~ ^metal_hud=([01])$ ]]; then hud=${BASH_REMATCH[1]}; fi
     done < "$1"
     if [[ -n $cap && -z ${BB_FPS_LIMIT:-} ]]; then export BB_FPS_LIMIT=$cap; fi
+    if [[ -z ${BB_PRESENT_MODE:-} ]]; then
+        case ${BB_FPS_LIMIT:-} in
+            90|120) export BB_PRESENT_MODE=Immediate BB_AUTO_PRESENT_MODE=1 ;;
+        esac
+    fi
     if [[ $full == 1 && -z ${BB_FULLSCREEN:-} ]]; then export BB_FULLSCREEN=1; fi
     if [[ $hud == 1 && -z ${MTL_HUD_ENABLED:-} ]]; then export MTL_HUD_ENABLED=1; fi
     return 0
