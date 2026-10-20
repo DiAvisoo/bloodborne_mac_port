@@ -77,6 +77,11 @@ public:
     /// Before a compute dispatch: the post-processing combine shader triggers the upscale.
     void OnDispatch(u64 cs_hash);
 
+    /// Finish the scene even when no HUD/movie draw triggered composition this frame.
+    /// Called before camera/frame state is cleared, with the last draw's color target.
+    void OnFrameEnd(VideoCore::ImageId color);
+    /// Scaleform's logical coordinate space (independent of guest scene allocations).
+    [[nodiscard]] std::array<u32, 2> UiSize() const;
     /// Start of a frame in the command stream (display pass).
     bool OnFrameStart();
     bool RasterScaling() const;

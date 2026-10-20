@@ -810,7 +810,7 @@ void DisplayTab(BbSettings::Values& s) {
     HintBelow("Size of the final frame and HUD.");
     EndCard();
 
-    ImGui::EndDisabled(); // startup ultrawide patch owns resolution and upscaling
+    ImGui::EndDisabled(); // wide camera/output selection is fixed until restart
 
     BeginCard("Overlay");
     Toggle("FPS counter in corner", s.show_fps);
@@ -1194,8 +1194,7 @@ void FpsCounter() {
                            : s.upscaler == BbSettings::UpscalerTaa     ? "TAA"
                            : s.upscaler == BbSettings::UpscalerMetalFx ? "MetalFX"
                                                                        : "";
-    const int output = BbSettings::FixedRenderSession() ? s.startup_output_res : s.output_res.load();
-    const int out_w = BbSettings::OutputWidths[output], out_h = BbSettings::OutputHeights[output];
+    const auto [out_w, out_h] = BbSettings::OutputSize();
     const int render_w = s.active_render_width, render_h = s.active_render_height;
     ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.82f);
     if (render_w == out_w && render_h == out_h) {

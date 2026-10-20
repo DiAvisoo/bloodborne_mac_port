@@ -70,6 +70,7 @@ fps=${BB_FPS:-uncap}
 # discrete GPUs get them); off when unset. 1080p output and TAA always use the live path.
 wide_patch=$("$PYTHON" scripts/patches.py --print-ultrawide --settings "$BB_CONFIG")
 bb_native_ultrawide "$wide_patch"
+scaled_render='' scaled_output=''
 if [[ -z $wide_patch && -z ${BB_RENDER_RES:-} ]]; then
     read -r scaled_render scaled_output < <("$PYTHON" scripts/patches.py --print-scaled --settings "$BB_CONFIG") || true
 fi

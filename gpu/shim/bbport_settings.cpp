@@ -105,6 +105,13 @@ Values& Get() {
     return values;
 }
 
+std::array<int, 2> OutputSize() {
+    const auto& v = Get();
+    if (v.ultrawide_width) return {v.ultrawide_width, v.ultrawide_height};
+    const int index = FixedRenderSession() ? v.startup_output_res : v.output_res.load();
+    return {OutputWidths[index], OutputHeights[index]};
+}
+
 void Load() {
     auto& v = Get();
     for (int e = 0; e < EffectCount; ++e) {
@@ -143,12 +150,23 @@ void Load() {
             Set(v, key, value);
         }
     }
-    // Native wide patches own the scene/UI size; the generic host resize stays neutral.
+    // Wide output uses host scene targets. The guest's heaps and viewports stay native;
+    // only its camera aspect is patched. Match the launcher's validated presets.
+    v.ultrawide_width = v.ultrawide_height = 0;
     if (const char* wide = std::getenv("BB_ULTRAWIDE_RES"); wide && wide[0]) {
-        v.output_res = OutputDefault;
-        v.live_resolution = 0;
-        v.upscaler = UpscalerOff;
-        v.preset = NativeAA;
+        constexpr std::array<int, 2> sizes[] = {
+            {2560, 720}, {3840, 1080}, {5120, 1440}, {2560, 1080}, {3440, 1440}};
+        for (const auto& size : sizes) {
+            if (wide == std::to_string(size[0]) + "x" + std::to_string(size[1])) {
+                v.ultrawide_width = size[0];
+                v.ultrawide_height = size[1];
+                v.output_res = OutputDefault;
+                v.live_resolution = 1;
+                v.upscaler = UpscalerOff;
+                v.preset = NativeAA;
+                break;
+            }
+        }
     }
     // The choice as asked for; ConfigureUpscalerSupport resolves what runs before the renderer
     // reads it.

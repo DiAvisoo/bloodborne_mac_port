@@ -180,7 +180,7 @@ struct GameSettings: Equatable {
         ini["reactive_threshold"] = String(format: "%.2f", reactiveThreshold)
         ini["reactive_max"] = String(format: "%.2f", reactiveMax)
         ini["object_motion"] = objectMotion ? "1" : "0"
-        ini["live_resolution"] = ultrawide ? "0" : liveResolution.rawValue
+        ini["live_resolution"] = ultrawide ? "1" : liveResolution.rawValue
     }
 
     /// The scene size the game renders.

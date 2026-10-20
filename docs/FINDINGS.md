@@ -1442,3 +1442,15 @@ VMA, Zydis, xbyak, FSR 4's tools and the `renderer` setting left the build and t
 ## Local M2 ultrawide trial (2026-10-20)
 
 Branch `metal-ultrawide-test` builds the 0.5.3 Metal renderer with native 32:9/21:9 launcher options. See [METAL_ULTRAWIDE_TEST.md](METAL_ULTRAWIDE_TEST.md) for the patch/renderer boundary, isolation and validation. Game files are unchanged; fresh backups precede the test. Performance measurement is pending gameplay; no claimed improvement yet.
+
+### M2 ultrawide geometry corruption correction (2026-10-20)
+
+The user observed ~55 FPS with missing character legs and progressive stretched triangles in `0.5.3-ultrawide.1`. Its full 3840×1080 community patch expanded guest heaps (9152 MiB DMEM, 10 GiB Metal arena, observed high address 7.75 GiB), the same startup path documented above as broken beyond 1080p. `BB_UPSCALER=none` also disabled the host frame-boundary/resolution tracking, leaving the FPS badge at 1920×1080. No renderer crash appeared in the log; the session exited normally.
+
+`0.5.3-ultrawide.2` instead applies only the community camera-aspect write at `0x0183A35D`. The guest stays at its retail allocation/coordinate sizes; `SceneTargets` rasterizes into the selected full-size host targets and UI composition presents at that output. Upscaling remains off, with the resolution machinery enabled. The FPS badge reads the same output selection; reported render dimensions come from actual scene-target sizing. This is a workaround for the unsafe startup path, not a proven root-cause fix of its corruption. Correct-image FPS and walking/menu stability remain to be measured.
+
+### Ultrawide UI/presentation follow-up (2026-10-20)
+
+The `.2` gameplay trial had no triangle artifacts, but no-HUD frames were squeezed into a pillarboxed 16:9 output (~36 FPS in the supplied screenshot). Opening inventory restored the full-width scene, with horizontally stretched UI. `OnFrameStart` copied `ui_phase` to `display_redirect`; no Scaleform draw meant no host display override. `.3` completes composition before clearing camera/frame state even when no UI draw occurred. It uses the current frame's last eligible color target, not a retained prior UI frame.
+
+Camera-only patching also left the UI at 1920×1080 while the compositor stretched it to 3840×1080. `.3` keeps the community logical UI viewport and lock-on/menu-coordinate writes, while excluding both guest scene MOV/NOP ranges and both heap writes. The compositor now separates wide UI coordinates (1:1 onto the wide host UI target) from guest display-copy coordinates (scaled to the host output). No `.gfx` or other game asset is changed. Correct image and menu transitions still require user gameplay validation.

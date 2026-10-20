@@ -156,6 +156,26 @@ def ultrawide_patch(settings):
     return ULTRAWIDE_PATCHES[size]
 
 
+def ultrawide_writes(xml, name, app_version, segments):
+    """Keep camera/UI coordinates, but leave guest scene allocations/heaps at retail size.
+
+    UI_WIDTH/UI_HEIGHT set Scaleform's logical viewport, not the scene allocation.
+    Keep the community screen-coordinate fixes (lock-on/enemy bars, menu layout);
+    the host compositor draws those coordinates directly into its wide UI target.
+    """
+    forbidden = [(SCENE_WIDTH, SCENE_WIDTH + 9), (SCENE_HEIGHT, SCENE_HEIGHT + 9),
+                 (0x04B36DDA - EBOOT_BASE, 0x04B36DDC - EBOOT_BASE),
+                 (0x04B36DE2 - EBOOT_BASE, 0x04B36DE4 - EBOOT_BASE)]
+    writes = [(offset, data) for offset, data in
+              compile_patches(xml, [name], app_version, segments)
+              if not any(offset < end and offset + len(data) > start
+                         for start, end in forbidden)]
+    required = {0x0183A35D - EBOOT_BASE, UI_WIDTH, UI_HEIGHT}
+    if not required.issubset(offset for offset, _ in writes):
+        raise ValueError('Ultrawide patch is missing camera/UI viewport instructions')
+    return writes
+
+
 def scaled_sizes(settings):
     """(render, output) for an output other than 1080p (above it, or 720p for the Steam Deck):
     the game renders at output / preset scale (or at the output size without upscaler) and the
@@ -344,7 +364,14 @@ def main():
             names.append(n)
     validate_patch_requirements(names,a.game_dir)
     segments=eboot_segments((a.out/'eboot.elf').read_bytes())
+    wide = ultrawide_patch(read_settings(a.settings))
+    if wide and (a.render_res or any(n.startswith('Resolution Patch ') or
+                                    n == 'Increased Graphics Heap Sizes' for n in names)):
+        raise ValueError('Native Metal ultrawide uses host targets; remove startup resolution/heap overrides')
     writes=compile_patches(a.xml,names,a.app_version,segments)
+    if wide:
+        writes += ultrawide_writes(a.xml, wide, a.app_version, segments)
+        names.append(f'Camera/UI only (retail scene/heaps): {wide}')
     size=render_size(read_settings(a.settings),a.render_res) if a.render_res else None
     # The UI keeps the game's 1920x1080 coordinates even for a larger output: the port draws
     # it into the output-size image with a viewport scaled by output / 1920

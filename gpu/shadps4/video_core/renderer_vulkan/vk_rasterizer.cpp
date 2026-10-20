@@ -1032,6 +1032,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // Object motion needs the frame boundary too (its history halves alternate per frame).
     if ((camera_motion->Enabled() || object_motion->Enabled()) && regs.color_buffers[0] &&
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
+        upscaler->OnFrameEnd(cb_descs[0].first);
         scene_started = false;
         camera_motion->OnDisplayPass(cb_descs[0].first);
         if (upscaler->OnFrameStart()) {
@@ -1057,7 +1058,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
                          mrt_mask ? cb_descs[0].first : VideoCore::ImageId{}, db_desc.first,
-                         UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
+                         UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2,
+                                                       upscaler->UiSize()));
     }
     const PreparedDraw* draw_prepared = bind_prepared;
     // bbport: vertex and index buffers are resolved while the helper binds textures (their
@@ -1279,7 +1281,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
                          mrt_mask ? cb_descs[0].first : VideoCore::ImageId{}, db_desc.first,
-                         UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
+                         UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2,
+                                                       upscaler->UiSize()));
     }
     if (!BindResources(pipeline)) {
         return;
@@ -3044,17 +3047,18 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         } else {
             state.width = redirect.width;
             state.height = redirect.height;
-            // The UI movie viewport is now 1920x1080 even when the scene is 960x540.
-            // A native viewport (or native window-space UI vertices) must not be doubled
-            // again. The final display copy still uses the guest render-size coordinates.
+            // UI coordinates are independent of guest scene allocations: 1920x1080
+            // normally, the wide logical viewport with the camera/UI patch. Do not
+            // stretch an already-wide movie again. Display copies still use guest size.
             const auto& viewport = regs.viewports[0];
             const bool native_coordinates = redirect.native_ui &&
-                (UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2) ||
+                (UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2,
+                                               upscaler->UiSize()) ||
                  (regs.IsClipDisabled() && !regs.viewport_control.xscale_enable &&
                   !regs.viewport_control.yscale_enable));
             target_scale = UiComposition::Scale(guest_extent.first, guest_extent.second,
                                                 redirect.width, redirect.height,
-                                                native_coordinates);
+                                                native_coordinates, upscaler->UiSize());
         }
     }
 

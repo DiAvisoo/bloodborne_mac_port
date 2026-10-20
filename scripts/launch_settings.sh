@@ -35,12 +35,11 @@ bb_native_ultrawide() { # a patch name validated by patches.py, or empty for 16:
     if [[ -n $wide_patch ]]; then
         export BB_ULTRAWIDE_RES=${wide_patch#Resolution Patch }
         BB_ULTRAWIDE_RES=${BB_ULTRAWIDE_RES%% *}
-        export BB_UPSCALER=none BB_ULTRAWIDE_SESSION=1
-        if [[ -z ${BB_DMEM_MB:-} ]]; then
-            export BB_DMEM_MB=9152 BB_ULTRAWIDE_AUTO_DMEM=1
-        fi
+        # "none" disables the host resolution/composition machinery as well as upscaling.
+        # "off" leaves that machinery available, with native-size scene targets.
+        export BB_UPSCALER=off BB_ULTRAWIDE_SESSION=1
         unset BB_RENDER_RES BB_OUTPUT_RES BB_AUTO_RENDER_RES
-        launch_patches="${launch_patches:+$launch_patches;}$wide_patch"
-        echo "Ultrawide: native $BB_ULTRAWIDE_RES; community camera/UI patch; no upscaling"
+        # patches.py keeps camera/UI coordinates, but excludes scene allocation/heap writes.
+        echo "Ultrawide: native $BB_ULTRAWIDE_RES host targets; camera/UI patch; retail heaps; no upscaling"
     fi
 }

@@ -67,7 +67,7 @@ do {
     var ini = IniFile()
     settings.apply(to: &ini)
     check(ini["output_res"] == "1920x1080" && ini["ultrawide_res"] == "3840x1080", "wide patch and neutral renderer")
-    check(ini["upscaler"] == "off" && ini["preset"] == "0" && ini["live_resolution"] == "0", "native wide never upscales")
+    check(ini["upscaler"] == "off" && ini["preset"] == "0" && ini["live_resolution"] == "1", "native wide uses host targets without upscaling")
     var loaded = GameSettings(ini: ini)
     check(loaded.ultrawide && loaded.renderSize == PixelSize(3840, 1080), "wide selection survives restart")
     loaded.ultrawide = false
