@@ -1449,10 +1449,16 @@ checker commands. No renderer defaults, lifecycle or resolution changes in this 
 
 2026-10-20 — launcher Stop (split from PR #26): retain this launcher's Process;
 Play becomes Stop/Stopping and settings are disabled while playing. Intentional Stop/Quit
-does not produce a crash sheet. Keep the launcher window available behind the game;
-this intentionally leaves both launcher and game Dock icons. Reopen reveals the launcher.
-Quit waits for its child to finish. This touches the same gameEnded/showWindow lifecycle
-as update PR #23; whichever merges second needs a rebase of those callbacks.
+does not produce a crash sheet. For sessions started through the launcher window, keep
+it available behind the game with both launcher and game Dock icons. Direct launch
+("Show launcher every time" off, without the Option override) keeps the window hidden
+and the launcher an accessory app, so only the game has a Dock icon. Reopen explicitly
+reveals the launcher and leaves direct mode. Quit waits for its child to finish. This
+touches the same gameEnded/showWindow lifecycle as update PR #23; rebase after #23 merges.
+
+PR #31 review follow-up: onStarted now preserves the direct path's orderOut/accessory
+behaviour instead of unconditionally showing a launcher window. Startup selection,
+Option override and the existing direct-path exit/error handling are unchanged.
 
 An additional stop test exposed SDL's SIGTERM handler in the windowless game: it only
 queues an SDL quit event, which the guest does not consume. run.sh now exports

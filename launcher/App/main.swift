@@ -22,8 +22,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         model = LauncherModel(layout: layout)
         model.onStarted = { [weak self] in
-            // Keep the launcher available behind the game, including its Stop button.
-            self?.showWindow(activate: false)
+            guard let self else { return }
+            if self.direct {
+                // Respect direct launch: only the game's window has a Dock icon.
+                self.window?.orderOut(nil)
+                NSApp.setActivationPolicy(.accessory)
+            } else {
+                // Keep the launcher available behind the game, including its Stop button.
+                self.showWindow(activate: false)
+            }
         }
         model.onExit = { [weak self] status in self?.gameEnded(status) }
         model.load()
