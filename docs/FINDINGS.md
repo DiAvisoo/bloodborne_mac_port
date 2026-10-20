@@ -1551,3 +1551,16 @@ punch/combat sounds did not. The shader commit changes no audio code. Preserve t
 log and save copy before audio investigation. Audio diagnostics were not enabled in that run;
 CoreAudio opened main and BGM ports successfully. The launch-time sound-save flag workaround
 was applied, so merely enabling that existing workaround is not a new fix.
+
+
+Audio follow-up: a new save-copy run enables existing BB_AUDIO_TRACE and BB_AUDIO_STATS.
+Main output initially supplies 938 buffers per 5 seconds (937 expected), typically 6.7 ms
+maximum gap and a non-empty SDL queue; no missing sound files or read errors appear. The
+initial AJM statuses 0x8/0x10/0x18 describe partial input/full output, not fatal decoder errors.
+However the existing 400-entry trace budget is exhausted by these normal statuses early in
+loading, so later decoder failures could be hidden. Added opt-in diagnostics to reserve a
+separate bounded budget for unexpected AJM results and report converted PCM peak/RMS,
+non-finite sample count, SDL submission failures and queue starvation before silence refill.
+Playback samples and scheduling are unchanged. A separate `out/bb-probe-audio-diagnostic`
+compiles successfully; the running original diagnostic is not replaced. No audio fix has
+yet been established, and the confirmed fast GPU library is unchanged.

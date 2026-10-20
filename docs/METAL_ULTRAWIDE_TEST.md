@@ -37,5 +37,7 @@ Commit `ebaf9c7` imports upstream `4be665b` with the original author credited. S
 `BB_SPIRV_PRECISE=invariant` only for the separate diagnostic; leave unset for original
 vertex precision. The mode invalidates incompatible shader cache entries, so initial loads
 recompile. This is not enabled by the launcher. Build and shader/Metal validation pass;
-M2 ultrawide gameplay and performance are pending. Keep `BB_READBACKS=2` for comparison with
-the visually correct trial, and compare warmed Hunter's Dream views and combat/area travel.
+The user confirmed fairly stable 60 FPS at native 3840x1080; warmed gameplay samples
+mostly measured 56-60 FPS. Keep `BB_READBACKS=2` as in that trial. Audio later lost some
+music/effects despite continuing menu sounds, so this remains a local diagnostic, not a
+release. The confirmed fast build and saves were backed up before audio investigation.
