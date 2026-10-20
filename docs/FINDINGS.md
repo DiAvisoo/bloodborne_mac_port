@@ -1475,3 +1475,37 @@ root cause of the original geometry corruption. Longer play and other resolution
 composition changes, preserves all dependent scene/UI patch instructions, and measures the
 native G-buffer depth dimensions for the FPS badge. It neither changes game assets nor
 replaces stable apps or their saves. Diagnostic saves are disposable copies.
+
+
+### M2 native ultrawide: combat texture exhaustion and remaining geometry loss (2026-10-20)
+
+The `.4` retail-heap trial crashed on the first enemy hit: a null resource dereference at
+image offset `0x2260b67`, in the PaintRT setup path. An opt-in diagnostic around resource
+creation at `0x2165f90` reproduced error **9** allocating 512x512 combat textures, followed by
+another null dereference (`0x219f874`, address 0x44). Increasing only the second graphics pool
+at guest VA `0x04B36DE0` from 886 to **1536 MiB**, with **6144 MiB DMEM**, allowed combat,
+death/respawn and area travel without those allocation errors. The first pool stays at its
+retail 2287 MiB. The Metal arena is 7 GiB; its logged high-water mark was 5 GiB. Native scene
+depth remained 3840x1080, no upscaling. This is a candidate, not a validated release.
+
+The user then reported missing legs and extensive missing ground after travel to Hunter's
+Dream (screenshot 17:17), despite initially correct legs. The log contains no GPU error,
+failed texture creation, rejected pipeline or bounced read, and the session exited normally.
+Thus the smaller pool solves the observed combat allocation failure but **does not solve
+geometry loss**. The initial correlation with expanded heaps did not establish its cause.
+Upstream's existing "Character half-rendered" / "world geometry missing" backlog describes
+similar area-load/respawn failures, including at ordinary resolutions.
+
+A diagnostic changed only readback policy to `BB_READBACKS=2` (Precise), retaining the
+1536 MiB pool, native ultrawide patch and other rendering settings. The user confirmed legs,
+ground and combat looked correct after travel, but reported 24 FPS dips, about 28 FPS in
+Hunter's Dream, and 35-60 FPS in the clinic depending on camera direction. This is short-play
+confirmation, not proof of the stale-readback hypothesis or long-session stability.
+
+A second run with `BB_FRAME_STATS=1` measured a warmed Hunter's Dream interval at 28.3 FPS,
+35.09 ms GPU busy/frame (99.4%), 1109 draws/frame and zero shader/pipeline compiles. Median
+frame time was 35.01 ms, p99 42.19 ms. Some other intervals had large protection/copy stalls;
+performance therefore has both sustained GPU cost and occasional stalls. Do not attribute
+all slowdown to Precise readbacks: sampled fault summaries reported zero read faults.
+Both sessions exited normally. Precise remains a diagnostic override, not a launcher default.
+All diagnostics use separate save copies; the installed `.4` and stable older apps are unchanged.

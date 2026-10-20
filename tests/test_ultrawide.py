@@ -7,7 +7,7 @@ from test_patches import immediate
 
 
 class UltrawideTests(unittest.TestCase):
-    def test_complete_native_patch_with_retail_heaps(self):
+    def test_complete_native_patch_with_bounded_texture_pool(self):
         for size, name in ULTRAWIDE_PATCHES.items():
             with self.subTest(size=size):
                 width, height = map(int, size.split('x'))
@@ -16,9 +16,13 @@ class UltrawideTests(unittest.TestCase):
                 writes = ultrawide_writes(xml, name, '01.09', [(0, 0x6000000)])
                 full = compile_patches(xml, [name], '01.09', [(0, 0x6000000)])
                 heaps = {0x04B36DDA - EBOOT_BASE, 0x04B36DE2 - EBOOT_BASE}
-                self.assertEqual(writes, [w for w in full if w[0] not in heaps])
-                for addr in heaps:
-                    self.assertFalse(any(a < addr + 2 and a + len(d) > addr for a, d in writes))
+                expected = [w for w in full if w[0] not in heaps]
+                if width * height > 1920 * 1080:
+                    expected.append((0x04B36DE0 - EBOOT_BASE, struct.pack('<I', 1536 * 1024 * 1024)))
+                self.assertEqual(writes, expected)
+                # Do not restore the community patch's 3952 MiB first heap.
+                addr = 0x04B36DDA - EBOOT_BASE
+                self.assertFalse(any(a < addr + 2 and a + len(d) > addr for a, d in writes))
                 # Regression: removing these MOV/NOPs while keeping the fallback
                 # globals silently allocated 640x360 and broke the entire UI.
                 for address, expected in ((SCENE_WIDTH, width), (SCENE_HEIGHT, height),

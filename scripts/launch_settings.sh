@@ -23,7 +23,7 @@ bb_launch_settings() { # ini file
 # Recomputed on every launch/restart. Never append automatic patches to the inherited
 # BB_PATCHES, otherwise disabling ultrawide would leave the previous patch active.
 bb_native_ultrawide() { # a patch name validated by patches.py, or empty for 16:9
-    local wide_patch=$1
+    local wide_patch=$1 wide_w wide_h
     launch_patches=${BB_PATCHES:-}
     unset BB_ULTRAWIDE_RES
     if [[ ${BB_ULTRAWIDE_SESSION:-} == 1 ]]; then
@@ -38,7 +38,12 @@ bb_native_ultrawide() { # a patch name validated by patches.py, or empty for 16:
         # The complete game patch owns scene/UI sizes. Do not resize/composite it again.
         export BB_UPSCALER=none BB_ULTRAWIDE_SESSION=1
         unset BB_RENDER_RES BB_OUTPUT_RES BB_AUTO_RENDER_RES
-        # Keep every resolution instruction together; omit only heap expansion.
-        echo "Ultrawide: native $BB_ULTRAWIDE_RES scene/UI patch; retail heaps; no upscaling"
+        wide_w=${BB_ULTRAWIDE_RES%x*}
+        wide_h=${BB_ULTRAWIDE_RES#*x}
+        if (( wide_w * wide_h > 1920 * 1080 )) && [[ -z ${BB_DMEM_MB:-} ]]; then
+            export BB_DMEM_MB=6144 BB_ULTRAWIDE_AUTO_DMEM=1
+        fi
+        # Complete resolution patch, retail first heap, bounded second texture pool.
+        echo "Ultrawide: native $BB_ULTRAWIDE_RES; bounded texture pool; DMEM ${BB_DMEM_MB:-5056} MiB; no upscaling"
     fi
 }

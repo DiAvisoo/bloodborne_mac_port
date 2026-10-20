@@ -157,12 +157,12 @@ def ultrawide_patch(settings):
 
 
 def ultrawide_writes(xml, name, app_version, segments):
-    """Apply the complete native scene/UI patch while retaining retail graphics heaps.
+    """Apply the complete native scene/UI patch with a bounded texture-pool increase.
 
-    The fallback globals and scene MOV/NOP overrides are a single patch: keeping the
-    640x360 globals without the overrides caused black menus and an oversized HUD.
-    Enlarged heaps correlated with missing geometry in the first Metal trial; the
-    same native resolution without those two heap writes passes the M2 gameplay test.
+    Keep the fallback globals and scene MOV/NOP overrides together. Preserve the
+    first graphics heap; increase only the smaller pool from 886 to 1536 MiB above
+    1080p pixel count. Retail capacity failed combat texture allocations (error 9).
+    launch_settings.sh supplies 6144 MiB DMEM for the extra 650 MiB.
     """
     heaps = [(0x04B36DDA - EBOOT_BASE, 0x04B36DDC - EBOOT_BASE),
              (0x04B36DE2 - EBOOT_BASE, 0x04B36DE4 - EBOOT_BASE)]
@@ -173,6 +173,11 @@ def ultrawide_writes(xml, name, app_version, segments):
     required = {0x0183A35D - EBOOT_BASE, SCENE_WIDTH, SCENE_HEIGHT, UI_WIDTH, UI_HEIGHT}
     if not required.issubset(offset for offset, _ in writes):
         raise ValueError('Ultrawide patch is missing scene/camera/UI instructions')
+    size = next(size for size, patch in ULTRAWIDE_PATCHES.items() if patch == name)
+    width, height = map(int, size.split('x'))
+    if width * height > 1920 * 1080:
+        # Full 32-bit pool size; the community's two-byte write starts two bytes later.
+        writes.append((0x04B36DE0 - EBOOT_BASE, struct.pack('<I', 1536 * 1024 * 1024)))
     return writes
 
 
@@ -371,7 +376,7 @@ def main():
     writes=compile_patches(a.xml,names,a.app_version,segments)
     if wide:
         writes += ultrawide_writes(a.xml, wide, a.app_version, segments)
-        names.append(f'Camera/UI only (retail scene/heaps): {wide}')
+        names.append(f'Native scene/UI with bounded texture pool: {wide}')
     size=render_size(read_settings(a.settings),a.render_res) if a.render_res else None
     # The UI keeps the game's 1920x1080 coordinates even for a larger output: the port draws
     # it into the output-size image with a viewport scaled by output / 1920

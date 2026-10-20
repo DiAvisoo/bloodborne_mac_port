@@ -14,4 +14,18 @@ Build with `build_macos.sh`, `scripts/macos/build_launcher.sh --test`, then `scr
 
 Validation: patch tests check complete scene/UI MOV/NOP instructions and camera aspect for every preset, with no heap expansion. Launcher/settings tests cover native rendering, persistence and disable/restart behavior. The isolated full-native/retail-heap gameplay trial displayed correctly proportioned title menus, gameplay and HUD; the user confirmed movement/menu testing looked correct with no artifacts. Observed clinic FPS varied roughly 33–54 with view; this is not a controlled performance comparison. Longer sessions and the other resolutions remain unverified.
 
-Trial history: `.1` used expanded heaps and showed missing legs/progressive triangles (~55 FPS, not a valid benchmark). `.2` used host scene proxies; no triangle artifacts, but squeezed gameplay and stretched menus (~36 FPS). `.3` combined incomplete resolution patching and live UI composition; it produced black menus and a giant HUD (actual scene 640×360). Removing just the 640×360 globals restored the title but left its placement wrong. The successful `.4` configuration returns to the complete native resolution patch with retail heaps. This narrows the geometry regression to the expanded-memory configuration; it does not establish which underlying address/buffer handling operation was faulty.
+Trial history: `.1` used expanded heaps and showed missing legs/progressive triangles (~55 FPS, not a valid benchmark). `.2` used host scene proxies; no triangle artifacts, but squeezed gameplay and stretched menus (~36 FPS). `.3` combined incomplete resolution patching and live UI composition; it produced black menus and a giant HUD (actual scene 640×360). Removing just the 640×360 globals restored the title but left its placement wrong. The `.4` configuration returns to the complete native resolution patch with retail heaps and passed the initial movement/menu check. Later combat crashed from texture-pool exhaustion; the initial test did not establish the cause of geometry corruption.
+
+
+## Unpackaged combat/geometry diagnostic
+
+Working-tree changes increase only the second graphics pool to 1536 MiB for ultrawide
+presets above 1920x1080 pixel count, with an automatic 6144 MiB DMEM setting. Explicit DMEM
+overrides are preserved; switching to 2560x720 or disabling ultrawide clears the automatic
+increase. Patch/settings tests pass and the build succeeds. This candidate allows the
+previously crashing combat, but the user still sees missing legs and terrain after area
+travel. A separate save-copy diagnostic with `BB_READBACKS=2` passed the user's visual,
+travel and combat check, but varied from 24-60 FPS, with about 28 FPS in Hunter's Dream.
+Profiling shows a sustained GPU bottleneck there, with no shader compiles in the measured
+interval. It is **not ready to install or release**; Precise is not a launcher default.
+See FINDINGS for the evidence and limits of these short tests.
