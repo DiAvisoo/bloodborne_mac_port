@@ -1583,3 +1583,9 @@ Play without a crash report, with both the guest and renderer gone. A second Pla
 successfully. Quitting the launcher during play also closes its guest and renderer; process
 inspection confirms no surviving game processes. Preserve the successful audio-test save,
 not the disposable Stop-test save, when installing this local build.
+
+Final post-launch signature verification exposed an upstream launcher packaging bug: the
+game-folder checker imported `prepare.py` without disabling bytecode, creating a new
+`Resources/port/scripts/__pycache__` file inside the signed app. The game launch path already
+disabled this; the independent folder check now passes Python `-B` too. Repackage and verify
+the signature again after opening the installed launcher and completing folder validation.

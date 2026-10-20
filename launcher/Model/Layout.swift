@@ -80,14 +80,14 @@ enum Layout: Equatable {
         return FileManager.default.fileExists(atPath: game.appendingPathComponent("eboot.bin").path) ? game : nil
     }
 
-    /// scripts/game_check.py with the Python run.sh uses (prints why a folder cannot be used).
+    /// Check without creating bytecode inside the signed app bundle.
     var gameCheckCommand: [String] {
         switch self {
         case let .packaged(contents):
-            [contents.appendingPathComponent("Resources/python/bin/python3").path,
+            [contents.appendingPathComponent("Resources/python/bin/python3").path, "-B",
              contents.appendingPathComponent("Resources/port/scripts/game_check.py").path]
         case let .checkout(repo, _):
-            ["/usr/bin/env", "python3", repo.appendingPathComponent("scripts/game_check.py").path]
+            ["/usr/bin/env", "python3", "-B", repo.appendingPathComponent("scripts/game_check.py").path]
         }
     }
 
