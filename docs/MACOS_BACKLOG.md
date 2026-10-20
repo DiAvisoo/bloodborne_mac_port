@@ -646,6 +646,13 @@ Each item: what was done for now, what the refinement is, and where it lives.
 
 ## 3. Mac GUI
 
+- **The Network Settings password shows its letters (user's 0.5.3-dev test, 2026-10-20).** The
+  text box opens in full screen, takes typing and Escape cancels, but the letters are not
+  masked. Masking depends on the game setting `OrbisImeOption` PASSWORD (bit 4,
+  `src/runtime_services.c` `ime_init`); either Bloodborne does not set it for this field or it
+  arrives elsewhere. Log `param->option` once to tell which; mask the password field by its
+  prompt if the game never asks.
+
 - **Ultrawide and quicksave (seen in DiAvisoo/bbport-mac-optimized, 2026-10-19).** 21:9 and 32:9
   output resolutions with an optional Nexus Mods UI pack (the launcher backs up and restores the
   game's menu files), and quicksave/quickload (F2/F3: snapshot the save folder; quickload
