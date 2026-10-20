@@ -53,7 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if window == nil {
             let window = NSWindow(contentRect: NSRect(origin: .zero, size: LauncherView.size),
                                   styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-            window.title = "Bloodborne Metal Ultrawide Test"
+            window.title = "Bloodborne"
             window.contentView = NSHostingView(rootView: LauncherView(model: model))
             window.isReleasedWhenClosed = false
             window.center()

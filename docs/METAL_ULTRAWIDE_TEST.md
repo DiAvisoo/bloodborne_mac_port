@@ -1,8 +1,9 @@
-# Local native Metal ultrawide test
+# Native Metal ultrawide test profile
 
 Base: Wooloomooloo2/bloodborne_mac_port `master` at `030346a09c313572e87f52fdf75f27d2b80257b3`
 (0.5.3 cleanup). Local branch: `metal-ultrawide-test`. Current local app: **0.5.3-ultrawide.6**.
-No public release or upstream merge.
+Upstream contribution branch: `metal-ultrawide-m2-pr`. The standalone community test app
+uses an isolated identity/data directory; the PR keeps upstream app names and locations.
 
 ## Current tested configuration
 
@@ -31,7 +32,10 @@ No public release or upstream merge.
   CAMetalLayer ceiling even on a 120 Hz monitor. Lower caps keep their existing behavior.
   Tearing is possible; explicit `BB_PRESENT_MODE` overrides win. The cap is a maximum:
   observed gameplay can remain GPU-limited around 67-86 FPS across the tested views.
-- Separate app, identity, saves, settings and logs: **Bloodborne Metal Ultrawide Test**.
+  **Follow-up: all above-60 FPS tests eventually stalled for several seconds, resumed,
+  then stalled again. Above 60 FPS is not currently playable on this test machine;
+  use a 60 FPS cap. The cause is not established.**
+- Standalone test download only: separate app, identity, saves, settings and logs: **Bloodborne Metal Ultrawide Test**.
   Stable older apps remain untouched. Game files are read-only. No game assets, saves,
   UI mod files or game icons are bundled; existing UI mods are used as-is.
 - This renderer trial uses the newer port's launcher/controls (`Cmd+,` / L3+R3 for settings).
@@ -43,10 +47,17 @@ reported; a subsequent session with the same audio implementation worked correct
 to the user. No audio fix is claimed. Optional audio diagnostics now report signal levels,
 invalid samples and decoder/output failures if it recurs; they are off in the launcher.
 
+Additional user observations: **5120×1440 ~45 FPS** and **2560×1440 ~90 FPS**.
+The latter has the recurring stalls described above. These are playtest observations with
+settings varied between runs, not controlled comparisons.
+
+[3840×1080 demo](https://youtu.be/yXYok0QVkys).
+
 ## Build and validation
 
 Build with `build_macos.sh`, `scripts/macos/build_launcher.sh --test`, then
-`scripts/macos/package_app.sh 0.5.3-ultrawide.6`. Bootstrap dependencies first when absent.
+`scripts/macos/package_app.sh <version>`. The published `.6` test binary comes from
+`0ea7ccc` on `metal-ultrawide-test`; this PR restores upstream branding/data paths. Bootstrap dependencies first when absent.
 This machine needs `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk` because
 its linker does not support the newer default SDK.
 

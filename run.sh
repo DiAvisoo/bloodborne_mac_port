@@ -4,17 +4,17 @@ cd -- "$(dirname -- "$0")"
 # BB_PREBUILT=1 (packaged builds, Bloodborne.app): out/bb-probe and its GPU library are installed
 # next to this script; nothing is built.
 # BB_DATA_DIR: writable directory for the generated files (out/), saves (user/) and bbport.ini;
-# by default ~/Library/Application Support/Bloodborne Metal Ultrawide Test.
+# by default ~/Library/Application Support/Bloodborne.
 # The game process (x86-64) runs under Rosetta 2; a native arm64 process renders with Metal.
 if [[ $OSTYPE != darwin* ]]; then echo 'This port runs on macOS (Apple Silicon) only.' >&2; exit 1; fi
 data=${BB_DATA_DIR:-.}
-# Data defaults to ~/Library/Application Support/Bloodborne Metal Ultrawide Test. A checkout that already keeps
+# Data defaults to ~/Library/Application Support/Bloodborne. A checkout that already keeps
 # saves in this directory goes on using them (moving saves is left to the player).
 if [[ -z ${BB_DATA_DIR:-} ]]; then
-    data="$HOME/Library/Application Support/Bloodborne Metal Ultrawide Test"
+    data="$HOME/Library/Application Support/Bloodborne"
     if [[ ! -d $data && ( -d user/savedata || -f bbport.ini ) ]]; then
         data=.
-        echo "Saves and settings stay in $PWD (move user/ and bbport.ini to $HOME/Library/Application Support/Bloodborne Metal Ultrawide Test to use the default)."
+        echo "Saves and settings stay in $PWD (move user/ and bbport.ini to $HOME/Library/Application Support/Bloodborne to use the default)."
     fi
     # A "Saves" link next to this script leads to the save folder from Finder.
     if [[ $data != . ]]; then

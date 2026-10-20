@@ -127,7 +127,7 @@ do {
 
 // Shell quoting and launch.conf (review focus 1: spaces, quotes; bash must source it).
 do {
-    let tricky = ["/Users/a/Library/Application Support/Bloodborne Metal Ultrawide Test", "/Volumes/My Drive/Hunter's saves", "/tmp/$HOME `x` \\ \"q\""]
+    let tricky = ["/Users/a/Library/Application Support/Bloodborne", "/Volumes/My Drive/Hunter's saves", "/tmp/$HOME `x` \\ \"q\""]
     for path in tricky {
         check(Shell.unquote(Shell.quote(path)) == path, "quote round trip \(path)")
     }
@@ -204,7 +204,7 @@ do {
 
 
     let home = URL(fileURLWithPath: "/Users/h")
-    let defaultData = home.appendingPathComponent("Library/Application Support/Bloodborne Metal Ultrawide Test")
+    let defaultData = home.appendingPathComponent("Library/Application Support/Bloodborne")
     let env = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
     check(packaged!.launchConfURL(env: env) == defaultData.appendingPathComponent("launch.conf"), "packaged launch.conf in the data folder")
     check(checkout!.launchConfURL(env: env) == repo.appendingPathComponent("launch.conf"), "checkout launch.conf in the repository")
@@ -212,7 +212,7 @@ do {
     check(packaged!.dataDir(env: env, config: LaunchConfig()) == defaultData, "default data folder")
     check(packaged!.dataDir(env: env.merging(["BB_DATA_DIR": "/x"]) { $1 }, config: LaunchConfig()).path == "/x", "BB_DATA_DIR")
     check(checkout!.dataDir(env: env, config: LaunchConfig(ini: IniFile(text: "BB_DATA_DIR=/y\n"))).path == "/y", "launch.conf BB_DATA_DIR")
-    check(Logs.folder(home: home).path == "/Users/h/Library/Logs/Bloodborne Metal Ultrawide Test", "logs folder")
+    check(Logs.folder(home: home).path == "/Users/h/Library/Logs/Bloodborne", "logs folder")
 
     let game = URL(fileURLWithPath: "/Games/My CUSA03173")
     let p = packaged!.launchPlan(gameDir: game, saveDir: nil, dataDir: defaultData, env: env)

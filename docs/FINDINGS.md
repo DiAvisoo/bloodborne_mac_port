@@ -1607,3 +1607,19 @@ User confirmed the Immediate comparison was above 60 FPS and looked good. Instal
 to their pre-diagnostic hashes; temporary test progress was backed up separately. Launcher
 and shell settings tests pass; installed 120 FPS config resolves to Immediate, and signature
 verification passes after opening the launcher. The native renderer binaries are unchanged.
+
+
+### Longer high-FPS playtest follow-up (2026-10-20)
+
+The user reports that every test above 60 FPS eventually paused for several seconds,
+resumed smooth play, and paused again later. This supersedes the short initial impression
+above: lifting the presentation ceiling works, but above-60 play is not currently playable
+on this Mac Studio M2 Max (64 GB). Keep a 60 FPS cap as the recommendation. No root cause
+is established and no fix for these stalls is claimed. User observations also include
+~90 FPS at 2560x1440 (with stalls) and ~45 FPS at 5120x1440; settings varied between tests.
+The 3840x1080 32:9 60 FPS demo is https://youtu.be/yXYok0QVkys.
+
+For the upstream contribution, retain upstream's Bloodborne app name, bundle identifier,
+and default data/log directories. The separate `.6` download remains built from `0ea7ccc`
+on `metal-ultrawide-test`, with isolated test-app identity and data directories. No game
+assets, saves or game icons are included in that download.
