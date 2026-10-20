@@ -98,6 +98,8 @@ if [[ ${1:-} == --test ]]; then
         gpu/shim/bbport_settings.cpp -o out/settings-keep-test
     out/settings-keep-test
     bash tests/test_launch_settings.sh
+    python3 -m unittest discover -s tests -p test_quicksave.py
+    python3 tests/test_quicksave_native.py
     bash scripts/macos/build_launcher.sh --test
     # Shared control block rings between bb-probe (x86-64) and bbgpu-host (arm64).
     /usr/bin/clang -arch x86_64 -arch arm64 -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -std=c11 -O2 -g \

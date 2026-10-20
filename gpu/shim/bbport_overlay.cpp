@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -1545,8 +1546,41 @@ bool HandleEvent(const SDL_Event& event) {
     }
 }
 
+namespace {
+std::atomic<bool> quicksave_notice{false};
+std::string quicksave_text;
+void UpdateQuicksaveNotice() {
+    static const char* path = std::getenv("BB_QUICKSAVE_STATUS");
+    static auto checked = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (!path || now - checked < std::chrono::milliseconds(250)) return;
+    checked = now;
+    long long expires = 0;
+    char message[512]{};
+    if (FILE* file = std::fopen(path, "r")) {
+        if (std::fscanf(file, "%lld\n", &expires) == 1)
+            (void)std::fgets(message, sizeof(message), file);
+        std::fclose(file);
+    }
+    message[std::strcspn(message, "\r\n")] = 0;
+    quicksave_text = message;
+    quicksave_notice = expires > std::time(nullptr) && message[0];
+}
+void QuicksaveNotice() {
+    if (!quicksave_notice) return;
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, 20),
+                            ImGuiCond_Always, ImVec2(0.5f, 0));
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    ImGui::Begin("##quicksave", nullptr, ImGuiWindowFlags_NoDecoration |
+                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::TextUnformatted(quicksave_text.c_str());
+    ImGui::End();
+}
+}
+
 bool Visible() {
-    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps);
+    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps || quicksave_notice);
 }
 
 void SetTextPrompt(bool active, const std::string& prompt, const std::string& text) {
@@ -1679,6 +1713,7 @@ void Render(void* command_buffer, void* target, u32 width, u32 height) {
         return;
     }
     std::scoped_lock lock{imgui_mutex};
+    UpdateQuicksaveNotice();
     // Save 0.3 s after the last change (a slider drag writes once), not only when the menu
     // closes: closing the window or a crash with the menu open used to lose the changes. Under
     // the lock: the window thread's SetOpen(false) saves and clears `dirty` too.
@@ -1715,6 +1750,7 @@ void Render(void* command_buffer, void* target, u32 width, u32 height) {
 
     MetalBackend::Frame(command_buffer, target, [&] {
         ImGui::NewFrame();
+        QuicksaveNotice();
         if (menu_open) {
             Menu();
         }

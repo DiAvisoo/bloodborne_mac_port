@@ -1607,3 +1607,29 @@ User confirmed the Immediate comparison was above 60 FPS and looked good. Instal
 to their pre-diagnostic hashes; temporary test progress was backed up separately. Launcher
 and shell settings tests pass; installed 120 FPS config resolves to Immediate, and signature
 verification passes after opening the launcher. The native renderer binaries are unchanged.
+
+
+Personal X/M checkpoints (2026-10-20, personal-quicksave-x-m): reuse the earlier verified
+Bloodborne 1.09 SaveRequest and checkpoint helper with the native split renderer. X requests
+a fresh character/profile save and snapshots only after both successful file commits, with
+all save mounts and file handles closed. M verifies the latest checkpoint, restarts the guest,
+and restores before loading. Every checkpoint is retained; replaced progress is backed up
+before each load. Storage follows BB_SAVE_DIR (or user/savedata), under .quicksaves/CUSA00207.
+A session lock prevents two checkpoint-enabled games sharing the same save directory.
+Fixed keys work with the controller attached; modifiers, settings/text prompts and held keys
+are excluded. The launcher enables this personal feature and displays the X/M legend.
+
+The native overlay polls a small status file so saving/loading confirmations cross the
+x86-to-arm64 process boundary, including when the FPS display is off. Correct newline
+parsing is required; a literal backslash-n had hidden the initial messages. Confirmed the
+restored-checkpoint notification visually. SDL_NO_SIGNAL_HANDLERS=1 prevents windowless
+SDL initialization from swallowing SIGTERM into an unconsumed event; the native host keeps
+its existing termination handling. Verified guest and renderer exit after a restored load.
+
+Validation: 11 helper tests cover newest-checkpoint selection, repeated restores, displaced
+progress backups, corruption, write/copy failure, interrupted-restore recovery and custom
+save roots. Five native C test groups cover fresh commits, mount/file exclusion, held keys,
+fixed X/M routing and rejected failed writes. Existing file/pad tests and Swift launcher
+tests pass; both architectures build and standalone packaging passes deep/strict signatures.
+The user confirmed live X/M restoration using a disposable save copy. The real Metal saves
+remained byte-identical during testing. This personal feature is not part of upstream PR #26.

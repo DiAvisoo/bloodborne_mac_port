@@ -6,6 +6,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include "runtime.h"
+#include "runtime_quicksave.h"
 #include "gpu/bbgpu.h"
 #include "gpu_process.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
@@ -911,6 +912,7 @@ int main(int argc, char **argv) {
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
     runtime_install_context_lock(image, size);
+    runtime_quicksave_bind(image, size);
     protect(thunks, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;

@@ -5,6 +5,7 @@
  * Paths containing ".." components are rejected rather than normalized. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_quicksave.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +34,7 @@ typedef struct {
 _Static_assert(sizeof(GuestStat)==120,"FreeBSD stat layout");
 
 typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Listing;
-typedef struct { int used, host; Listing *dir; size_t position; char path[512]; } File;
+typedef struct { int used, host, dirty, write_failed; Listing *dir; size_t position; char path[512]; } File;
 typedef struct { char guest[64]; char host[512]; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
@@ -173,6 +174,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
     char path[1024];
     int e=translate(guest,path,sizeof(path));
+    if (e) return -e;
     int host=-1;
     Listing *dir=NULL;
     struct stat s;
@@ -211,15 +213,40 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     }
     return fd;
 }
+static int save_path(const char *path) {
+    return !strncmp(path,"/savedata",9) && path[9]>='0' && path[9]<='9';
+}
+int runtime_file_savedata_idle(void) {
+    pthread_mutex_lock(&lock);
+    int idle=1;
+    for (int i=3;i<MAX_FILES;++i)
+        if (files[i].used && save_path(files[i].path)) { idle=0; break; }
+    pthread_mutex_unlock(&lock);
+    return idle;
+}
+static void note_save_write(int fd, ssize_t written, uint64_t size) {
+    pthread_mutex_lock(&lock);
+    File *f=get(fd);
+    if (f && save_path(f->path)) {
+        if (written>0) f->dirty=1;
+        if (written<0 || (uint64_t)written!=size) f->write_failed=1;
+    }
+    pthread_mutex_unlock(&lock);
+}
 static int64_t do_close(int fd) {
     if (fd>=0 && fd<3) return 0;
     pthread_mutex_lock(&lock);
     File *f=get(fd);
     if (!f) { pthread_mutex_unlock(&lock); return -EBADF; }
-    close(f->host); free_listing(f->dir);
+    int result=0;
+    const int saved=runtime_quicksave_enabled() && save_path(f->path) && f->dirty;
+    if (saved && fsync(f->host)) result=-errno;
+    if (close(f->host) && !result) result=-errno;
+    if (saved && !result && !f->write_failed) runtime_quicksave_committed(f->path);
+    free_listing(f->dir);
     *f=(File){0};
     pthread_mutex_unlock(&lock);
-    return 0;
+    return result;
 }
 static int host_fd(int fd) {
     if (fd>=0 && fd<3) return fd;
@@ -315,6 +342,7 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     ssize_t n=write(h,buffer,size);
+    note_save_write(fd,n,size);
     if (n<0) return -errno;
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
     return n;
@@ -323,6 +351,7 @@ static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset)
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     ssize_t n=pwrite(h,buffer,size,offset);
+    note_save_write(fd,n,size);
     return n<0 ? -errno : n;
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {

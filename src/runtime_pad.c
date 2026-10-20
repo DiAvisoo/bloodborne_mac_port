@@ -8,6 +8,7 @@
  *   IJKL d-pad (I up, K down, J left, L right). */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_quicksave.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,9 +100,17 @@ static void sample_host(PadData *d) {
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
     d->timestamp=now_us();
     SDL_Gamepad *g=current_gamepad();
-    if (bbgpu_overlay_captures_input()) return; /* settings menu open: neutral input */
     const bool *k=bbgpu_split_keyboard(); /* the window is in the GPU host (split) */
     if (!k) k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
+    const int captured=bbgpu_overlay_captures_input();
+    const int modified=k && (k[SDL_SCANCODE_LCTRL] || k[SDL_SCANCODE_RCTRL] ||
+        k[SDL_SCANCODE_LALT] || k[SDL_SCANCODE_RALT] || k[SDL_SCANCODE_LGUI] ||
+        k[SDL_SCANCODE_RGUI] || k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT]);
+    /* Sample even when a controller is attached, and consume blocked presses so
+     * closing a text/settings dialog cannot turn a held key into a save/load. */
+    runtime_quicksave_keys(k && k[SDL_SCANCODE_X], k && k[SDL_SCANCODE_M],
+                          captured || modified || !k);
+    if (captured) return;
     if (g) {
         static const struct { SDL_GamepadButton sdl; uint32_t ps; } map[]={
             {SDL_GAMEPAD_BUTTON_SOUTH,BTN_CROSS}, {SDL_GAMEPAD_BUTTON_EAST,BTN_CIRCLE},
@@ -307,6 +316,12 @@ static void sample(PadData *d) {
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
     touch_ids(d);
+    const int confirm=runtime_quicksave_autoconfirm();
+    if (confirm>=0) {
+        d->buttons=confirm ? BTN_CROSS : 0;
+        d->left_x=d->left_y=d->right_x=d->right_y=128;
+        d->l2=d->r2=d->touch_count=0;
+    }
 }
 
 static ABI int32_t pad_init(void) { host_lock(&lock); initialized=1; host_unlock(&lock); return 0; }

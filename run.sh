@@ -26,6 +26,9 @@ out=$data/out
 mkdir -p "$out"
 export BB_CONFIG=${BB_CONFIG:-$data/bbport.ini}
 # The launcher's fps_cap / fullscreen (bbport.ini) as BB_FPS_LIMIT / BB_FULLSCREEN.
+# The window lives in the native GPU host, which handles termination itself. The
+# windowless game process must not turn SIGTERM into an unconsumed SDL quit event.
+export SDL_NO_SIGNAL_HANDLERS=1
 source scripts/launch_settings.sh
 bb_launch_settings "$BB_CONFIG"
 # GPU caches (pipelines, shaders) next to the saves. Exported before anything starts: the GPU
@@ -34,6 +37,14 @@ export BB_GPU_USER_DIR=${BB_GPU_USER_DIR:-${BB_USER_DIR:-$data/user}}
 mkdir -p "$BB_GPU_USER_DIR"
 if [[ -z ${PYTHON:-} ]]; then PYTHON=$(command -v python3 || true); fi
 if [[ -z ${PYTHON:-} ]]; then echo 'Install Python 3 or set PYTHON.' >&2; exit 1; fi
+# Personal checkpoint controls; all helpers use the same user/save root as the guest.
+if [[ ${BB_QUICKSAVE:-0} == 1 ]]; then
+    mkdir -p "${BB_SAVE_DIR:-${BB_USER_DIR:-$data/user}/savedata}"
+    export BB_QUICKSAVE_HELPER="$PWD/scripts/quicksave.py"
+    export BB_QUICKSAVE_PYTHON="$PYTHON"
+    export BB_QUICKSAVE_STATUS="$out/quicksave-status.txt"
+    export PYTHONDONTWRITEBYTECODE=1
+fi
 # BB_GAME_DIR: the game's folder (eboot.bin, sce_module, ...); default next to this directory.
 game=${BB_GAME_DIR:-../CUSA03173}
 if [[ ! -f $game/eboot.bin ]]; then echo "No eboot.bin in $game (set BB_GAME_DIR)." >&2; exit 1; fi

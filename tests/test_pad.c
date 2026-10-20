@@ -3,6 +3,8 @@
 #include <unistd.h>
 #include "../src/runtime_pad.c"
 
+void runtime_quicksave_keys(int s,int l,int b) { (void)s;(void)l;(void)b; }
+int runtime_quicksave_autoconfirm(void) { return -1; }
 static int capture;
 int bbgpu_overlay_captures_input(void) { return capture; }
 const bool *bbgpu_split_keyboard(void) { return NULL; }

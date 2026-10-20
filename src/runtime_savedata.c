@@ -7,6 +7,7 @@
  * Metadata lives beside the directory so the guest's own files are untouched. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_quicksave.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -110,6 +111,7 @@ static void bloodborne_sound_hack(void) {
 
 void runtime_savedata_configure(const char *title) {
     if (title && *title) snprintf(title_id,sizeof(title_id),"%s",title);
+    runtime_quicksave_init(title_id);
     bloodborne_sound_hack();
 }
 
@@ -161,6 +163,19 @@ static int remove_entry(const char *path, const struct stat *st, int flag, struc
     (void)st; (void)flag; (void)ftw; return remove(path);
 }
 
+/* A checkpoint requires both the save mounts and guest file descriptors to be
+ * idle. Holding this lock prevents a new save transaction during the copy. */
+int runtime_savedata_quick_action(int load) {
+    if (!host_trylock(&lock)) return 0;
+    for (int i=0;i<SLOTS;++i) if (slots[i].used) {
+        host_unlock(&lock); return 0;
+    }
+    if (!runtime_file_savedata_idle()) { host_unlock(&lock); return 0; }
+    const int result=runtime_quicksave_execute(load);
+    host_unlock(&lock);
+    return result;
+}
+
 static ABI int32_t save_initialize(const void *param) { (void)param; initialized=1; return 0; }
 static ABI int32_t save_terminate(void) {
     host_lock(&lock);
@@ -192,6 +207,7 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     if (slot<0) { host_unlock(&lock); return ERR_MOUNT_FULL; }
     if (!exists && (make_dirs(host) || make_dirs(meta))) { host_unlock(&lock); return ERR_INTERNAL; }
     if (!exists) { Param empty={0}; write_param(meta,&empty); }
+    if (!(mode & MODE_RDONLY)) runtime_quicksave_loaded();
     slots[slot].used=1;
     snprintf(slots[slot].host,sizeof(slots[slot].host),"%s",host);
     snprintf(slots[slot].meta,sizeof(slots[slot].meta),"%s",meta);

@@ -1,6 +1,8 @@
 /* Exercise actual guest file operations on a linked overlay and writable saves. */
 #include "../src/runtime_file.c"
 #include <assert.h>
+int runtime_quicksave_enabled(void) { return 0; }
+void runtime_quicksave_committed(const char *p) { (void)p; }
 static int32_t guest_errno;
 int32_t *runtime_errno(void) { return &guest_errno; }
 int32_t runtime_guest_errno(int e) { return e; }

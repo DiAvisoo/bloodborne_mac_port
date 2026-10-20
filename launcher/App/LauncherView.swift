@@ -87,6 +87,11 @@ struct LauncherView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
+                Section("Quick save / load") {
+                    Text("X  Save checkpoint     ·     M  Load checkpoint")
+                    Text("Load restarts the game. Earlier checkpoints and replaced progress are backed up in the save folder’s .quicksaves folder.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Section("Upscaler") {
                     if model.settings.ultrawide {
                         Text("Ultrawide runs at the selected native resolution, with upscaling off.")
