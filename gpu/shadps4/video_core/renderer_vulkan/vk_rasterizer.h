@@ -88,6 +88,8 @@ public:
     void ScopedMarkerInsertColor(const std::string_view& str, const u32 color,
                                  bool from_guest = false);
 
+    /// Command-processor writes through the split host mirror do not trigger guest faults.
+    void WriteMemory(VAddr address, const void* data, u32 num_bytes);
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
@@ -173,6 +175,7 @@ public:
 #endif
 
 private:
+    void PrepareCpuWrite(VAddr address, u32 num_bytes, const char* operation);
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);

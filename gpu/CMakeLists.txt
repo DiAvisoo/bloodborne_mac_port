@@ -393,3 +393,10 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
+
+# Split-process host writes must invalidate already-uploaded guest buffers.
+add_executable(guest-buffer-coherency-test EXCLUDE_FROM_ALL ../tests/test_guest_buffer_coherency.cpp)
+target_include_directories(guest-buffer-coherency-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(guest-buffer-coherency-test PRIVATE -UNDEBUG)
+target_link_libraries(guest-buffer-coherency-test PRIVATE bbgpu)
+target_link_options(guest-buffer-coherency-test PRIVATE -Wl,-export_dynamic)

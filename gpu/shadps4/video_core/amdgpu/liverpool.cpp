@@ -466,8 +466,8 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     rasterizer.WaitDeferredSignals();
     BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
                      (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
-    std::memcpy(write_data->Address<u64*>(), write_data->data,
-                (header->type3.count.Value() - 2) * sizeof(u32));
+    rasterizer.WriteMemory(write_data->Address<VAddr>(), write_data->data,
+                           (header->type3.count.Value() - 2) * sizeof(u32));
 }
 
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
@@ -567,8 +567,13 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonConstRam);
             }
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
-            memcpy(dump_const->Address<void*>(),
-                   cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+            const auto* source = cblock.constants_heap.data() + dump_const->Offset();
+            if (rasterizer) {
+                rasterizer->WriteMemory(reinterpret_cast<VAddr>(dump_const->Address<void*>()),
+                                        source, dump_const->Size());
+            } else {
+                memcpy(dump_const->Address<void*>(), source, dump_const->Size());
+            }
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -1787,7 +1792,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                if (rasterizer) {
+                    rasterizer->WriteMemory(write_data->Address<VAddr>(), write_data->data, data_size);
+                } else {
+                    std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                }
             } else {
                 UNREACHABLE();
             }

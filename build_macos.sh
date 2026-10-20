@@ -163,6 +163,10 @@ if [[ ${1:-} == --test ]]; then
     # Metal-native M3: scene targets (scaled copies, depth resample, stencil export) through the
     # linked arm64 library; again writing stencil one bit at a time.
     if [[ -f out/gpu-arm64/libbbgpu.dylib ]]; then
+        # CPU-emulated GPU writes through the host mirror must refresh cached buffers.
+        ninja -C out/gpu-arm64 guest-buffer-coherency-test >/dev/null
+        BB_GPU_USER_DIR="$ROOT/out/coherency-test-user" out/gpu-arm64/guest-buffer-coherency-test
+        MTL_DEBUG_LAYER=1 BB_GPU_USER_DIR="$ROOT/out/coherency-test-user" out/gpu-arm64/guest-buffer-coherency-test
         ninja -C out/gpu-arm64 scene-resolution-test >/dev/null
         out/gpu-arm64/scene-resolution-test 2>&1 | grep -E 'PASS|FAIL'
         BB_SCENE_STENCIL_BITS=1 out/gpu-arm64/scene-resolution-test 2>&1 | grep -E 'PASS|FAIL'

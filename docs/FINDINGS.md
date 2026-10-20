@@ -1633,3 +1633,32 @@ fixed X/M routing and rejected failed writes. Existing file/pad tests and Swift 
 tests pass; both architectures build and standalone packaging passes deep/strict signatures.
 The user confirmed live X/M restoration using a disposable save copy. The real Metal saves
 remained byte-identical during testing. This personal feature is not part of upstream PR #26.
+
+
+## 2026-10-20 — Split host CPU writes left uploaded guest buffers stale
+
+Local branch `geometry-streaming-coherency`, based on personal build `ac5f7b7`.
+Mac Studio M2 Max, 64 GB. Investigation of progressively missing props/walls (#18).
+
+- **Reproduced correctness bug:** upload a 64 KiB guest buffer, then call the production
+  `Rasterizer::FillBuffer` or CPU `CopyBuffer` fast path on the same address. The host mirror
+  changes, but the next Metal read still returns the original bytes. Both cases fail on the
+  unchanged renderer. `!IsRegionGpuModified` does not mean "never uploaded": a clean uploaded
+  buffer is still cached. In split mode the page protections are applied only in bb-probe;
+  writes by bbgpu-host do not generate the invalidating guest write fault.
+- **Fix:** wait for queued CPU uploads before overwriting their source, then invalidate the
+  buffer/texture caches before CPU-emulated DMA fills/copies. WRITE_DATA (graphics/compute)
+  and constant-RAM dumps use the same preparation. GPU-modified neighbouring bytes are
+  downloaded before partial writes. This is targeted write coherence, not a per-frame cache
+  flush or a culling/shader-quality change. Fence publication/download paths are unchanged.
+- **Regression:** `guest-buffer-coherency-test` uses real Metal buffers and the production
+  rasterizer/cache with synthetic memory and an unprotected host view. Before: two stale-data
+  failures. After: fill/copy/WRITE_DATA reuse, earlier queued upload preservation and partial
+  writes alongside GPU output all pass; Metal validation passes. Both arm64 and x86_64
+  renderer libraries build. Included in `build_macos.sh --test`.
+- `BB_COHERENCY_LOG=1` prints at most 32 CPU writes into already-uploaded clean ranges.
+- **Limits:** the cart/cave captures have fewer recorded draws before quickload, but differing
+  counts/cameras do not identify individual missing objects. The synthetic failure establishes
+  a real bug; it does not yet establish that it causes every reported missing object. In-game
+  travel/revisit testing is pending. Test session uses copied saves/settings; installed app,
+  original saves and game assets are unchanged. No upstream PR has been opened for this fix.

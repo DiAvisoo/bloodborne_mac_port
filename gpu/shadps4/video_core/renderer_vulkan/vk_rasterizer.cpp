@@ -3150,6 +3150,32 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
     ScopeMarkerEnd();
 }
 
+void Rasterizer::PrepareCpuWrite(VAddr address, u32 num_bytes, const char* operation) {
+    if (!num_bytes) {
+        return;
+    }
+    // In split mode only the guest mapping is protected. A CPU write through the host
+    // mirror cannot fault, even when the arena already contains a clean copy of this page.
+    // Snapshot earlier reads before overwriting their source, then dirty both caches. The
+    // inline invalidation also preserves GPU-written neighbours before a partial-page write.
+    scheduler.WaitHostCopies();
+    static const bool log = std::getenv("BB_COHERENCY_LOG") != nullptr;
+    static u32 reports = 0;
+    if (log && reports < 32 && IsMapped(address, num_bytes) &&
+        !buffer_cache.IsRegionCpuModified(address, num_bytes)) {
+        std::printf("Coherency: %s invalidates uploaded guest memory %#llx + %u bytes\n",
+                    operation, static_cast<unsigned long long>(address), num_bytes);
+        ++reports;
+    }
+    InvalidateMemory(address, num_bytes, true);
+}
+
+void Rasterizer::WriteMemory(VAddr address, const void* data, u32 num_bytes) {
+    DrainDrawPipe();
+    PrepareCpuWrite(address, num_bytes, "WriteData/constant dump");
+    std::memcpy(reinterpret_cast<void*>(address), data, num_bytes);
+}
+
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
     DrainDrawPipe();
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
@@ -3157,6 +3183,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     if (!is_gds) {
         texture_cache.ClearMeta(address);
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
+            PrepareCpuWrite(address, num_bytes, "CPU DMA fill");
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;
@@ -3176,7 +3203,8 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
-            // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
+            // Neither range is GPU-modified, but either may have been uploaded already.
+            PrepareCpuWrite(dst, num_bytes, "CPU DMA copy");
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             return;
         }
