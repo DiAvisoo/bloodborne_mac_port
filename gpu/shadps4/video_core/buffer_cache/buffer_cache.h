@@ -130,6 +130,10 @@ public:
                                                              bool is_texel_buffer = false,
                                                              bool note_use = true);
 
+    /// Metal's indexed draw path truncates offsets above 4 GiB on M2 (observed).
+    /// Rebase those ranges into fence-managed staging; preserve GPU-written indices.
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainIndexBuffer(VAddr device_addr, u32 size);
+
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
 

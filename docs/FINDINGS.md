@@ -1715,3 +1715,41 @@ GPU-produced transforms, unsubmitted objects, stale CPU inputs, or shader/render
 The user quickloaded before live isolation; next step is keeping a broken process open and
 switching individual optimization groups without moving the camera or restarting. Original
 installed app and save hashes remain unchanged. No public upload or new fix claim.
+
+
+## 2026-10-21 — Live missing hanger: indexed draws wrap beyond 4 GiB on M2
+
+The 09:41 broken scene remained running. Its missing blood-bag hanger was identified as
+`o350120`, mesh 0: 11,586 16-bit indices, four instances, vertex shader `4efb29f6` /
+fragment shader `b9bb200e`. The 23,172 index bytes at guest `0x71003ba410` and 213,724
+vertex bytes match the locally loaded model exactly. Capture-time GPU comparisons also
+match. Native draw submission binds the correct bytes at arena offset **`0x1003ba410`**.
+The visible blood bags use 2,202 index bytes through the small stream buffer instead.
+
+- A standalone Metal triangle reproduces the failure without the port: offsets below
+  4 GiB render; offsets `0x100000080` and `0x1003ba410` do not. A small buffer containing
+  identical indices renders, as does a buffer view rebased above 4 GiB. Wrapped low
+  addresses deliberately contain zeros. This is consistent with 32-bit index-offset
+  truncation on the tested M2; it is not a documented limit or verified on other models.
+- **Live confirmation:** while that same broken game continued, replace only the hanger's
+  native index-buffer binding with a small buffer holding its unchanged indices. The
+  hanger reappears, without quickload, guest writes, mesh changes or a different camera.
+  Seven matching draws were overridden; the debugger then removed the override and
+  detached. A queued snapshot records the restored pole/base holding the blood bags.
+  Local evidence is under `out/geometry-test-20261021/hanger-live-0941`; it includes
+  proprietary mesh extracts and must not be committed or uploaded.
+- **Fix:** `ResolveIndexBuffer` uses `BufferCache::ObtainIndexBuffer`. Bindings wholly below
+  4 GiB keep their existing path. Higher/crossing ranges use existing fence-managed staging.
+  CPU-owned ranges use the normal sparse-memory upload; GPU-owned ranges use an ordered
+  GPU copy, preserving generated indices even when the CPU mirror is stale. No arena-wide
+  flush, shader change, culling bypass or game asset modification is needed.
+- **Regression:** real Metal indexed triangles through the production cache cover high
+  CPU-owned indices and high GPU-produced indices with a deliberately stale CPU mirror;
+  low binding reuse is checked too. Both pass, including Metal validation; the raw high
+  binding is recorded as missing. Existing coherency/audit tests pass. Both arm64 and
+  x86_64 renderer builds succeed.
+- **Scope:** this directly explains the live hanger and why large mesh bodies can disappear
+  while streamed details remain. It makes allocation-address changes after travel/reload
+  relevant, rather than missing asset loads. Other props and long-session performance
+  still need repeated travel testing with the permanent fix. The older host-write fix
+  remains a separately reproduced correctness fix, not the cause proven for this hanger.

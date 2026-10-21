@@ -395,7 +395,9 @@ target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
 
 # Split-process host writes must invalidate already-uploaded guest buffers.
-add_executable(guest-buffer-coherency-test EXCLUDE_FROM_ALL ../tests/test_guest_buffer_coherency.cpp)
+add_executable(guest-buffer-coherency-test EXCLUDE_FROM_ALL
+    ../tests/test_guest_buffer_coherency.cpp ../tests/test_index_triangle.mm)
+set_source_files_properties(../tests/test_index_triangle.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 target_include_directories(guest-buffer-coherency-test PRIVATE shim shadps4 third_party/gcn/include)
 target_compile_options(guest-buffer-coherency-test PRIVATE -UNDEBUG)
 target_link_libraries(guest-buffer-coherency-test PRIVATE bbgpu)

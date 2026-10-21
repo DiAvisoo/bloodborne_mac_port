@@ -31,9 +31,13 @@ public:
 
 namespace {
 constexpr uintptr_t Base = 0x7000000000ULL;
+constexpr uintptr_t HighBase = Base + (1ull << 32);
 constexpr size_t MappedSize = 4 * 1024 * 1024;
 constexpr u32 Size = 64 * 1024; // above the small, uncached stream-buffer threshold
-bool Covered(uintptr_t p, uint64_t n) { return p >= Base && p <= Base + MappedSize && n <= Base + MappedSize - p; }
+bool Covered(uintptr_t p, uint64_t n) {
+    return (p >= Base && p <= Base + MappedSize && n <= Base + MappedSize - p) ||
+           (p >= HighBase && p <= HighBase + MappedSize && n <= HighBase + MappedSize - p);
+}
 int failures = 0;
 void Check(bool ok, const char* message) {
     std::printf("%s: %s\n", ok ? "PASS" : "FAIL", message);
@@ -58,10 +62,11 @@ void runtime_restart() { std::abort(); }
 uint64_t runtime_memory_clamp(uintptr_t p, uint64_t n) { return Covered(p, n) ? n : 0; }
 int runtime_memory_region(uintptr_t p, uintptr_t* a, uintptr_t* b, int* mapped) {
     if (!Covered(p, 1)) return 0;
-    *a = Base; *b = Base + MappedSize; *mapped = 1; return 1;
+    *a = p >= HighBase ? HighBase : Base; *b = *a + MappedSize; *mapped = 1; return 1;
 }
 void runtime_memory_set_gpu_hooks(void (*map)(uintptr_t, uint64_t), void (*)(uintptr_t, uint64_t), void (*)(uintptr_t, uint64_t)) {
     map(Base, MappedSize);
+    map(HighBase, MappedSize);
 }
 // Production split mode protects the separate guest process, never this host mirror.
 void runtime_memory_gpu_protect(uintptr_t p, uint64_t n, int, int) { assert(Covered(p,n)); }
@@ -75,6 +80,8 @@ int runtime_memory_read_backing(uintptr_t p, void* data, uint64_t n) {
 }
 }
 #pragma GCC visibility pop
+bool RenderIndexTriangle(Metal::Device& device, Metal::BufferRef indices);
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setenv("BB_NULL_GPU", "1", 1);
@@ -84,6 +91,9 @@ int main() {
     void* mapped = mmap(reinterpret_cast<void*>(Base), MappedSize, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
     assert(mapped == reinterpret_cast<void*>(Base));
+    void* high_mapped = mmap(reinterpret_cast<void*>(HighBase), MappedSize,
+                            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    assert(high_mapped == reinterpret_cast<void*>(HighBase));
     const BbGpuConfig config = {"Coherency test", "TEST", nullptr, 0x05050031, 0, 640, 360};
     Core::Emulator::FillElfInfo(config);
     Metal::Device device;
@@ -173,6 +183,34 @@ int main() {
     runtime.FillBuffer(*owned_buffer, owned_offset, Size, 0x99999999);
     Check(!cache.QueueCpuBufferAudit(owned_buffer, owned_offset, stale, Size),
           "audit excludes GPU-owned data");
+    scheduler.Finish();
+    // Real indexed draws, with zeros at the corresponding wrapped low address.
+    // CPU-owned and GPU-produced high indices must both be rebased without losing data.
+    const uintptr_t high_indices = HighBase + 12 * Size;
+    auto* indices = reinterpret_cast<u16*>(high_indices);
+    std::fill_n(indices, Size / sizeof(u16), 0);
+    indices[0] = 0; indices[1] = 1; indices[2] = 2;
+    const auto [raw, raw_offset] = cache.ObtainBuffer(high_indices, Size, false);
+    scheduler.Finish();
+    std::printf("Diagnostic: original high-offset indexed triangle %s\n",
+                RenderIndexTriangle(device, raw->Ref(raw_offset)) ? "visible" : "MISSING");
+    const auto [safe, safe_offset] = cache.ObtainIndexBuffer(high_indices, Size);
+    scheduler.Finish();
+    Check(safe_offset + Size <= (1ull << 32), "CPU index binding stays below 4 GiB");
+    Check(RenderIndexTriangle(device, safe->Ref(safe_offset)), "high CPU-owned indices render correctly");
+    const uintptr_t high_gpu = HighBase + 13 * Size;
+    std::memset(reinterpret_cast<void*>(high_gpu), 0, Size);
+    const auto [gpu_indices, gpu_index_offset] = cache.ObtainBuffer(high_gpu, Size, true);
+    const VideoCore::BufferCopy index_copy{safe_offset, gpu_index_offset, Size};
+    runtime.CopyBuffer(*safe, *gpu_indices, std::span{&index_copy, 1});
+    const auto [safe_gpu, safe_gpu_offset] = cache.ObtainIndexBuffer(high_gpu, Size);
+    scheduler.Finish();
+    Check(reinterpret_cast<u16*>(high_gpu)[1] == 0, "GPU index test keeps the CPU mirror stale");
+    Check(safe_gpu_offset + Size <= (1ull << 32), "GPU index binding stays below 4 GiB");
+    Check(RenderIndexTriangle(device, safe_gpu->Ref(safe_gpu_offset)), "high GPU-produced indices render correctly");
+    const auto [low, low_offset] = cache.ObtainBuffer(Base + 14 * Size, Size, false);
+    const auto [low_index, low_index_offset] = cache.ObtainIndexBuffer(Base + 14 * Size, Size);
+    Check(low == low_index && low_offset == low_index_offset, "low index bindings retain the existing path");
     scheduler.Finish();
     std::printf("%d failures\n", failures);
     return failures ? 1 : 0;

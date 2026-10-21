@@ -1944,7 +1944,7 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+        buffer_cache.ObtainIndexBuffer(index_address, index_buffer_size);
     NoteRead(buffer, offset, index_buffer_size);
     buffer_cache.AuditGeometryBuffer(buffer, offset, index_address, index_buffer_size);
     if (FrameCapture::Tracing()) {
