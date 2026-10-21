@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <xxhash.h>
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include <array>
 #include <map>
 #include <unordered_map>
@@ -387,6 +389,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (note_use) {
         runtime.NoteSubmissionUse(arena, arena->Offset(device_addr), size);
     }
+    if (!is_written) {
+        AuditIfCapturing(arena, arena->Offset(device_addr), device_addr, size);
+    }
     return {arena, arena->Offset(device_addr)};
 }
 
@@ -419,6 +424,71 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     }
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
     return {staging.buffer, staging.offset};
+}
+
+std::shared_ptr<BufferCache::CpuBufferAudit> BufferCache::QueueCpuBufferAudit(
+    const Buffer* buffer, u64 offset, VAddr address, u64 size) {
+    // GPU-owned bytes need not equal the mirror. Small streamed buffers are fresh CPU copies;
+    // neither is evidence of stale cached geometry. Only inspect actual arena bindings.
+    if (!size || size > 16_MB || !buffer || buffer->cpu_addr != MacArenaBase ||
+        offset > buffer->size_bytes || size > buffer->size_bytes - offset ||
+        address != buffer->cpu_addr + offset || IsRegionCpuModified(address, size) ||
+        IsRegionGpuModified(address, size)) {
+        return {};
+    }
+    auto expected = std::make_shared<std::vector<u8>>(size);
+    memory->CopySparseMemory(address, expected->data(), size);
+    if (IsRegionCpuModified(address, size) || IsRegionGpuModified(address, size)) {
+        return {}; // a guest write raced the snapshot: no reliable comparison
+    }
+    const u64 begin = Common::AlignDown(offset, 4);
+    const u64 bytes = Common::AlignUp(offset + size, 4) - begin;
+    auto download = std::make_shared<Buffer>(device, MemoryType::HostCached, 0, bytes,
+                                            "Geometry audit (diagnostic)");
+    const BufferCopy copy{begin, 0, bytes};
+    runtime.CopyBuffer(*buffer, *download, std::span{&copy, 1});
+    auto result = std::make_shared<CpuBufferAudit>();
+    // Never Finish here: draw resources may have reserved stream memory for the pending draw.
+    // Retain this readback until its submission completes; later GPU writes are ordered after it.
+    scheduler.DeferOperation([result, expected, download, address, size, prefix = offset - begin] {
+        const u8* actual = download->mapped_data.data() + prefix;
+        result->compared_bytes = size;
+        for (u64 i = 0; i < size; ++i) {
+            if (actual[i] != (*expected)[i]) {
+                if (!result->mismatched_bytes) result->first_mismatch = address + i;
+                ++result->mismatched_bytes;
+            }
+        }
+        std::printf("Geometry audit: %s address=%#llx size=%llu different=%llu first=%#llx "
+                    "cpu=%016llx gpu=%016llx\n",
+                    result->mismatched_bytes ? "MISMATCH" : "match",
+                    (unsigned long long)address, (unsigned long long)size,
+                    (unsigned long long)result->mismatched_bytes,
+                    (unsigned long long)result->first_mismatch,
+                    (unsigned long long)XXH3_64bits(expected->data(), size),
+                    (unsigned long long)XXH3_64bits(actual, size));
+        result->complete = true;
+    });
+    return result;
+}
+
+void BufferCache::AuditIfCapturing(const Buffer* buffer, u64 offset, VAddr address, u64 size) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_GEOMETRY_AUDIT");
+        return value && value[0] == '1';
+    }();
+    if (!enabled || !Vulkan::FrameCapture::Tracing()) return;
+    const u64 capture = Vulkan::FrameCapture::Written();
+    if (capture != audit_capture) {
+        audit_capture = capture;
+        audited_ranges.clear();
+        audit_bytes = 0;
+        std::printf("Geometry audit: capture %llu (read-only, bounded to 256 MiB)\n",
+                    (unsigned long long)capture);
+    }
+    if (size > 16_MB || audit_bytes + size > 256_MB ||
+        !audited_ranges.emplace(address, size).second) return;
+    if (QueueCpuBufferAudit(buffer, offset, address, size)) audit_bytes += size;
 }
 
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {

@@ -1662,3 +1662,29 @@ Mac Studio M2 Max, 64 GB. Investigation of progressively missing props/walls (#1
   a real bug; it does not yet establish that it causes every reported missing object. In-game
   travel/revisit testing is pending. Test session uses copied saves/settings; installed app,
   original saves and game assets are unchanged. No upstream PR has been opened for this fix.
+
+
+## 2026-10-21 — Missing scenery persists; capture-time buffer audit
+
+The 08:11 captures came from the unchanged installed app, so were not a test of ca2e631.
+A separately named app was then made with that renderer, the working personal X/M guest,
+and copied latest saves/checkpoint. The running host and loaded dylib path were verified.
+The user reproduced missing stairs at 08:25; quickload restored them. Thus the host CPU-write
+fix is a reproduced correctness improvement but does not solve this geometry report.
+No `Coherency:` event was logged during the verified broken/restored session.
+
+Capture 082549 is broken, 082643 restored; 082615 was an extra capture after reload.
+Main-pass draws 296 -> 298, weighted indices 2,876,259 -> 2,947,911. Earlier original-app
+pair 081128/081202 had *fewer* main-pass draws after reload (791 -> 785). Counts and slightly
+different cameras alone do not establish which geometry is absent or prove skipped draws.
+
+Added opt-in `BB_GEOMETRY_AUDIT=1`: only while recording a frame, read actual cached arena
+buffers back in GPU command order and compare them to clean CPU-owned mirror snapshots.
+Checks are deduplicated and bounded to 256 MiB/capture, 16 MiB/binding; small stream bindings,
+CPU-dirty and GPU-owned data are excluded. Readbacks complete asynchronously and never flush
+or rewrite guest/cache data. Logs include address, size, mismatch count and CPU/GPU hashes.
+A capture changes GPU timing, so no mismatch cannot exclude an ordering race, unbound geometry,
+GPU-owned data or a missed range; a mismatch needs follow-up to identify the missed write/order.
+Real Metal regression cases cover matching buffers, deliberate untracked overwrite detection,
+non-mutation and CPU/GPU dirty exclusions; plain and Metal validation runs pass.
+This is diagnostic work, not a claimed fix. No original saves, app, or game files changed.

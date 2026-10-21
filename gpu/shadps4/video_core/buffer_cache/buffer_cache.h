@@ -8,6 +8,7 @@
 #include "bbport_copy.h"
 
 #include <deque>
+#include <set>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -42,6 +43,11 @@ class MemoryTracker;
 class PageManager;
 
 class BufferCache {
+    void AuditIfCapturing(const Buffer* buffer, u64 offset, VAddr address, u64 size);
+    u64 audit_capture = ~u64{0};
+    u64 audit_bytes = 0;
+    std::set<std::pair<VAddr, u64>> audited_ranges;
+
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
     static constexpr u64 ARENA_PAGE_BITS = 32;
     static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
@@ -93,6 +99,15 @@ public:
     u32 GetSparsePageShift() const noexcept {
         return block_shift;
     }
+
+    struct CpuBufferAudit {
+        bool complete = false;
+        u64 compared_bytes = 0, mismatched_bytes = 0, first_mismatch = 0;
+    };
+    /// Diagnostic only: compare an ordered GPU read with a snapshot of clean CPU-owned data.
+    /// Does not write guest memory or invalidate caches. Complete after Finish + PopPendingOperations.
+    std::shared_ptr<CpuBufferAudit> QueueCpuBufferAudit(const Buffer* buffer, u64 offset,
+                                                       VAddr address, u64 size);
 
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);

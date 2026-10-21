@@ -150,6 +150,30 @@ int main() {
         preserved &= words[i] == (i == 1 ? replacement : 0x66666666);
     }
     Check(preserved, "partial CPU write preserves neighbouring GPU output");
+    // Diagnostic must detect a deliberately missed invalidation, without silently repairing it.
+    const uintptr_t stale = Base + 6 * Size;
+    prime(stale);
+    const auto [stale_buffer, stale_offset] = cache.ObtainBuffer(stale, Size, false);
+    auto clean = cache.QueueCpuBufferAudit(stale_buffer, stale_offset, stale, Size);
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+    Check(clean && clean->complete && clean->compared_bytes == Size && !clean->mismatched_bytes,
+          "audit accepts a clean matching arena buffer");
+    std::fill_n(reinterpret_cast<u32*>(stale), Size/4, 0x88888888u);
+    auto stale_result = cache.QueueCpuBufferAudit(stale_buffer, stale_offset, stale, Size);
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+    Check(stale_result && stale_result->complete && stale_result->mismatched_bytes == Size &&
+          stale_result->first_mismatch == stale, "audit detects an untracked CPU overwrite");
+    Check(contents_are(stale, 0x11111111), "audit does not alter the cached GPU data");
+    rasterizer.InvalidateMemory(stale, Size, true);
+    Check(!cache.QueueCpuBufferAudit(stale_buffer, stale_offset, stale, Size),
+          "audit excludes known CPU-dirty data");
+    const auto [owned_buffer, owned_offset] = cache.ObtainBuffer(stale, Size, true);
+    runtime.FillBuffer(*owned_buffer, owned_offset, Size, 0x99999999);
+    Check(!cache.QueueCpuBufferAudit(owned_buffer, owned_offset, stale, Size),
+          "audit excludes GPU-owned data");
+    scheduler.Finish();
     std::printf("%d failures\n", failures);
     return failures ? 1 : 0;
 }
