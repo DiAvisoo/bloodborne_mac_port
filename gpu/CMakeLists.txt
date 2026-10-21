@@ -393,3 +393,12 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
+
+# Opt-in synthetic regression: no game files or runtime diagnostics required.
+add_executable(index-offset-test EXCLUDE_FROM_ALL
+    ../tests/test_index_offset.cpp ../tests/test_index_triangle.mm)
+set_source_files_properties(../tests/test_index_triangle.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+target_include_directories(index-offset-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(index-offset-test PRIVATE -UNDEBUG)
+target_link_libraries(index-offset-test PRIVATE bbgpu "-framework Metal" "-framework Foundation")
+target_link_options(index-offset-test PRIVATE -Wl,-export_dynamic)
