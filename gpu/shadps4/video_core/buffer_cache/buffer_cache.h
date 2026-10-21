@@ -8,7 +8,6 @@
 #include "bbport_copy.h"
 
 #include <deque>
-#include <set>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -43,10 +42,12 @@ class MemoryTracker;
 class PageManager;
 
 class BufferCache {
-    void AuditIfCapturing(const Buffer* buffer, u64 offset, VAddr address, u64 size);
     u64 audit_capture = ~u64{0};
-    u64 audit_bytes = 0;
-    std::set<std::pair<VAddr, u64>> audited_ranges;
+    struct AuditCoverage {
+        u64 unique = 0, queued = 0, gpu_owned = 0, cpu_dirty = 0;
+        u64 streamed = 0, budget = 0, raced = 0;
+    } audit_coverage;
+    IntervalList<Interval> audit_seen;
 
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
     static constexpr u64 ARENA_PAGE_BITS = 32;
@@ -99,6 +100,9 @@ public:
     u32 GetSparsePageShift() const noexcept {
         return block_shift;
     }
+
+    /// Opt-in, first-use vertex/index audit. Reports exclusions and deduplicates overlaps.
+    void AuditGeometryBuffer(const Buffer* buffer, u64 offset, VAddr address, u64 size);
 
     struct CpuBufferAudit {
         bool complete = false;

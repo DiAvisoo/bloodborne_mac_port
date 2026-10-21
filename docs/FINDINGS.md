@@ -1688,3 +1688,30 @@ GPU-owned data or a missed range; a mismatch needs follow-up to identify the mis
 Real Metal regression cases cover matching buffers, deliberate untracked overwrite detection,
 non-mutation and CPU/GPU dirty exclusions; plain and Metal validation runs pass.
 This is diagnostic work, not a claimed fix. No original saves, app, or game files changed.
+
+2026-10-21, 08:55 follow-up: missing candle stands/coffin with flames and details still
+visible, restored by process quickload. The old audit checked 295 overlapping ranges and hit
+its 256 MiB budget with no mismatches in the broken frame. Its single mismatch in the good
+frame (0x708fe40000, 8847360 bytes) aliases a 1920x540 R16G16B16A16Sfloat render target,
+not a clean mesh. Do not treat it as evidence for the scenery bug.
+
+The expanded audit now runs at explicit vertex/index bindings, deduplicates overlapping
+intervals, splits ownership at page boundaries and reports every exclusion. Limit 512 MiB
+of unique clean data; shader/texture aliases no longer consume its budget. Added capture-only
+Q records for CondExec decisions, GPU-owned copy-control tables, rejected graphics pipelines
+and failed resource binding. No culling or cache behaviour is changed. BB_PIPE_VERIFY=1024
+is enabled only in the isolated test wrapper. Both architecture builds and synthetic Metal
+checks (also with MTL_DEBUG_LAYER) pass.
+
+Verified 09:24:29 broken cave / 09:25:13 restored, same area/camera. The new coverage totals
+exactly match the union of all V/I trace ranges, with no duplicate G intervals:
+- Broken: 321190748 unique bytes, 320654306 compared; 156836 GPU-owned and 379606 streamed.
+- Restored: 293712932 unique bytes, 293218938 compared; 91912 GPU-owned and 402082 streamed.
+- Zero dirty, raced or budget-excluded bytes; all completed comparisons match. No CondExec,
+  graphics-pipeline/resource rejection, GPU-owned copy-control, or draw-pipe verification
+  mismatch was recorded. Main-pass draw counts 967/996 alone still do not identify the cave.
+This substantially narrows the clean bound mesh-cache hypothesis, but does not rule out
+GPU-produced transforms, unsubmitted objects, stale CPU inputs, or shader/render-state errors.
+The user quickloaded before live isolation; next step is keeping a broken process open and
+switching individual optimization groups without moving the camera or restarting. Original
+installed app and save hashes remain unchanged. No public upload or new fix claim.

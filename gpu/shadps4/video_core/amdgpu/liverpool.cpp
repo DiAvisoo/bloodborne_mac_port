@@ -40,6 +40,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
 
 // bbport: bad-packet diagnostics (DumpBadPacket). Declared here, outside namespace AmdGpu: the GPU
 // library links with -undefined dynamic_lookup, so a misplaced declaration became a null call.
@@ -1492,7 +1493,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (cond_exec->command.Value() != 0) {
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
-                const auto skip = *cond_exec->Address() == false;
+                const auto value = *cond_exec->Address();
+                const auto skip = value == false;
+                if (Vulkan::FrameCapture::Tracing()) {
+                    const auto addr = reinterpret_cast<VAddr>(cond_exec->Address());
+                    const bool gpu_owned = rasterizer &&
+                        rasterizer->GetBufferCache().IsRegionGpuModified(addr, sizeof(value));
+                    Vulkan::FrameCapture::Trace(fmt::format(
+                        "Q cond-exec {:#x} value={} words={} gpu_owned={}", addr, value,
+                        cond_exec->exec_count.Value(), gpu_owned));
+                }
                 if (skip) {
                     dcb = NextPacket(dcb,
                                      header->type3.NumWords() + 1 + cond_exec->exec_count.Value());

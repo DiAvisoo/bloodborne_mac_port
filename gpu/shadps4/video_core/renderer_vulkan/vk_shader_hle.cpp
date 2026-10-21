@@ -287,6 +287,12 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         return true;
     }
     const auto ctl_buf = reinterpret_cast<const CopyShaderControl*>(ctl_buf_sharp.base_address);
+    if (FrameCapture::Tracing()) {
+        FrameCapture::Trace(fmt::format("Q copy-control {:#x} size={} gpu_owned={}",
+            ctl_buf_sharp.base_address, u64(cs_program.dim_x) * sizeof(CopyShaderControl),
+            buffer_cache.IsRegionGpuModified(ctl_buf_sharp.base_address,
+                u64(cs_program.dim_x) * sizeof(CopyShaderControl))));
+    }
 
     static std::vector<VideoCore::BufferCopy> copies;
     copies.clear();

@@ -389,9 +389,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (note_use) {
         runtime.NoteSubmissionUse(arena, arena->Offset(device_addr), size);
     }
-    if (!is_written) {
-        AuditIfCapturing(arena, arena->Offset(device_addr), device_addr, size);
-    }
     return {arena, arena->Offset(device_addr)};
 }
 
@@ -472,23 +469,75 @@ std::shared_ptr<BufferCache::CpuBufferAudit> BufferCache::QueueCpuBufferAudit(
     return result;
 }
 
-void BufferCache::AuditIfCapturing(const Buffer* buffer, u64 offset, VAddr address, u64 size) {
+void BufferCache::AuditGeometryBuffer(const Buffer* buffer, u64 offset, VAddr address, u64 size) {
     static const bool enabled = [] {
         const char* value = std::getenv("BB_GEOMETRY_AUDIT");
         return value && value[0] == '1';
     }();
-    if (!enabled || !Vulkan::FrameCapture::Tracing()) return;
+    if (!enabled) return;
     const u64 capture = Vulkan::FrameCapture::Written();
+    if (audit_capture != ~u64{0} && capture != audit_capture) {
+        const auto& c = audit_coverage;
+        std::printf("Geometry coverage: capture=%llu unique=%llu queued=%llu gpu_owned=%llu "
+                    "cpu_dirty=%llu streamed=%llu budget=%llu raced=%llu\n",
+                    (unsigned long long)audit_capture, (unsigned long long)c.unique,
+                    (unsigned long long)c.queued, (unsigned long long)c.gpu_owned,
+                    (unsigned long long)c.cpu_dirty, (unsigned long long)c.streamed,
+                    (unsigned long long)c.budget, (unsigned long long)c.raced);
+        audit_capture = ~u64{0};
+    }
+    if (!Vulkan::FrameCapture::Tracing() || !size) return;
     if (capture != audit_capture) {
         audit_capture = capture;
-        audited_ranges.clear();
-        audit_bytes = 0;
-        std::printf("Geometry audit: capture %llu (read-only, bounded to 256 MiB)\n",
+        audit_seen.Clear();
+        audit_coverage = {};
+        std::printf("Geometry audit: capture %llu (vertex/index first use, 512 MiB unique limit)\n",
                     (unsigned long long)capture);
     }
-    if (size > 16_MB || audit_bytes + size > 256_MB ||
-        !audited_ranges.emplace(address, size).second) return;
-    if (QueueCpuBufferAudit(buffer, offset, address, size)) audit_bytes += size;
+    // A pool-sized V# often overlaps many subsequent bindings. Inspect each byte once, not
+    // once per descriptor. Small streamed bindings are already uncached CPU snapshots.
+    std::vector<Interval> gaps;
+    audit_seen.ForEachGap(address, address + size,
+                         [&](u64 a, u64 b) { gaps.push_back({a, b}); });
+    audit_seen.Add({address, address + size});
+    for (const auto [first, last] : gaps) {
+        audit_coverage.unique += last - first;
+        if (!buffer || buffer->cpu_addr != MacArenaBase) {
+            audit_coverage.streamed += last - first;
+            continue;
+        }
+        // One dirty/GPU-owned page must not exclude the rest of a large mesh pool.
+        auto at = first;
+        while (at < last) {
+            const bool gpu = IsRegionGpuModified(at, 1);
+            const bool cpu = IsRegionCpuModified(at, 1);
+            auto end = std::min(last, Common::AlignUp(at + 1, 4_KB));
+            while (end < last && end - at < 1_MB &&
+                   gpu == IsRegionGpuModified(end, 1) && cpu == IsRegionCpuModified(end, 1)) {
+                end = std::min(last, end + 4_KB);
+            }
+            const auto bytes = end - at;
+            const char* status;
+            if (gpu) {
+                audit_coverage.gpu_owned += bytes;
+                status = "gpu-owned";
+            } else if (cpu) {
+                audit_coverage.cpu_dirty += bytes;
+                status = "cpu-dirty";
+            } else if (audit_coverage.queued + bytes > 512_MB) {
+                audit_coverage.budget += bytes;
+                status = "budget";
+            } else if (QueueCpuBufferAudit(buffer, offset + at - address, at, bytes)) {
+                audit_coverage.queued += bytes;
+                status = "queued";
+            } else {
+                audit_coverage.raced += bytes;
+                status = "raced";
+            }
+            Vulkan::FrameCapture::Trace(fmt::format("G {:#x} {} {}", at, bytes, status));
+            at = end;
+        }
+    }
 }
 
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {

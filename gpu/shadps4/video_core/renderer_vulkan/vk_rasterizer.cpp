@@ -1023,6 +1023,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
                          prepared->reg_checksum == liverpool->gfx_reg_checksum);
     }
     if (!pipeline) {
+        if (FrameCapture::Tracing()) FrameCapture::Trace("Q no-graphics-pipeline");
         return;
     }
     if (pipelined && FilterDrawPasses()) {
@@ -1080,6 +1081,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const bool inputs_resolved = draw_inputs.resolved;
     draw_inputs.pending = false;
     if (!bound) {
+        if (FrameCapture::Tracing()) {
+            FrameCapture::Trace(fmt::format("Q resources vs={:08x} indices={}",
+                pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, Regs().num_indices));
+        }
         return;
     }
     const auto state = BeginRendering(pipeline);
@@ -1884,6 +1889,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
         NoteRead(range.buffer, range.offset, size);
+        buffer_cache.AuditGeometryBuffer(range.buffer, range.offset, range.base_address, size);
         if (FrameCapture::Tracing()) {
             FrameCapture::Trace(fmt::format("V {:#x} {}", range.base_address, size));
         }
@@ -1940,6 +1946,7 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     NoteRead(buffer, offset, index_buffer_size);
+    buffer_cache.AuditGeometryBuffer(buffer, offset, index_address, index_buffer_size);
     if (FrameCapture::Tracing()) {
         FrameCapture::Trace(fmt::format("I {:#x} {}", index_address, index_buffer_size));
     }
