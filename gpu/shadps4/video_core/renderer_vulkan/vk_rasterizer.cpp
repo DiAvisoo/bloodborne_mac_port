@@ -3166,7 +3166,10 @@ void Rasterizer::PrepareCpuWrite(VAddr address, u32 num_bytes, const char* opera
     // Snapshot earlier reads before overwriting their source, then dirty both caches. The
     // inline invalidation also preserves GPU-written neighbours before a partial-page write.
     scheduler.WaitHostCopies();
-    static const bool log = std::getenv("BB_COHERENCY_LOG") != nullptr;
+    static const bool log = [] {
+        const char* value = std::getenv("BB_COHERENCY_LOG");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     static u32 reports = 0;
     if (log && reports < 32 && IsMapped(address, num_bytes) &&
         !buffer_cache.IsRegionCpuModified(address, num_bytes)) {
