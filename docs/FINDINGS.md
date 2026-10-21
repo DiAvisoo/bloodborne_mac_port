@@ -1753,3 +1753,12 @@ The visible blood bags use 2,202 index bytes through the small stream buffer ins
   relevant, rather than missing asset loads. Other props and long-session performance
   still need repeated travel testing with the permanent fix. The older host-write fix
   remains a separately reproduced correctness fix, not the cause proven for this hanger.
+
+
+2026-10-21, user validation of `6ec9589` in **Bloodborne Index Fix**: after travelling
+back and forth between areas approximately ten times, the user reports that all assets
+remain rendered and the disappearance issue appears fixed. This extends the live hanger
+proof to repeated in-game travel with the permanent fix. No FPS measurement was supplied
+in this follow-up; this result establishes the observed geometry behaviour, not a new
+performance claim or validation on other hardware. The previous app and save backups
+remain preserved; this test used copied saves. The fix has not been published upstream.
