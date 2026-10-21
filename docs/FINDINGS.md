@@ -1762,3 +1762,25 @@ proof to repeated in-game travel with the permanent fix. No FPS measurement was 
 in this follow-up; this result establishes the observed geometry behaviour, not a new
 performance claim or validation on other hardware. The previous app and save backups
 remain preserved; this test used copied saves. The fix has not been published upstream.
+
+
+## 2026-10-21 — Permanent wall holes: inherited lower model-detail patch
+
+Unlike the travel-dependent index-offset bug, identical wall sections were always missing
+in the older Vulkan/KosmicKrisp build and the newer Metal build, including after reload.
+The user's `optimized_old_repo.png` and `new_repo.png` show the same holes; their
+`original_game.png` shows complete walls. Both local profiles had `model_lod=1` enabled.
+
+Changing **only** the fixed Metal test's `model_lod` from 1 (Lower) to 0 (Game default)
+removed the `Model LOD 1 (Lower)` patch from startup (262 -> 261 writes). The user revisited
+the affected area and confirmed everything renders correctly and performance remains
+perfect; no numerical FPS measurement was supplied. This isolates these permanent holes
+to the shared model-detail patch, independently of the renderer's 4 GiB index-offset bug.
+
+Keep `model_lod=0` for normal play. The Metal launcher/runtime already default to zero;
+the lower value was inherited in our personal profiles. The fixed test, installed Metal
+personal profile and older optimized profile now use zero. The older optimized launcher's
+source default was changed from 1 to 0 too. Existing user-selected values remain supported.
+Settings were backed up before migration; no game assets or saves were modified by this
+settings change. Local screenshots, capture and comparison notes are in
+`out/static-wall-lod-20261021` and are not committed or uploaded.
